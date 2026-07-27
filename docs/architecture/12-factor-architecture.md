@@ -1026,7 +1026,7 @@ logging:
 - Agent lifecycle: Session created, agent started/stopped
 - LLM API calls: Provider, model, tokens, cost, latency, TTFT
 - Tool executions: Name, success/failure, duration
-- Pattern matching: Selected patterns, confidence scores
+- Pattern loads: Reference requested, hit or miss
 - Error conditions: Stack traces with context
 
 **No Log Aggregation** (stdout/stderr only):
@@ -1443,10 +1443,10 @@ curl http://localhost:5006/v1/agents
 **Rationale**:
 - Predictable token budget (ROM + Kernel + L1 + L2 ≈ 20k tokens)
 - Balances recent context (L1) with long-term memory (L2)
-- Hot-swappable patterns without session restart (ROM layer)
+- ROM is immutable per session, so its token cost is counted once at construction
 
 **Trade-offs**:
-- ✅ Bounded tokens, long-term context, pattern hot-reload
+- ✅ Bounded tokens, long-term context
 - ❌ Complexity (four layers to manage)
 - ❌ Lossy compression (L2 summaries drop detail)
 
@@ -1565,7 +1565,7 @@ sizeof(ROM) + sizeof(Kernel) + sizeof(L1) + sizeof(L2) ≤ CONTEXT_WINDOW - OUTP
    - Rotate keys via `looms config set-key`
 
 2. **Prompt Injection Defense**:
-   - Pattern validation: Reject patterns with user-controlled system prompts
+   - Pattern bodies enter as tool-result data, never as system-prompt content
    - Input sanitization: Escape special characters in backend queries
    - Tool approval: Human-in-the-loop for destructive operations
 
