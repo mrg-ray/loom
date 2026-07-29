@@ -1387,7 +1387,9 @@ func (a *Agent) checkAndRegisterManageSkillsTool() {
 	if a.tools.IsRegistered("manage_skills") {
 		return
 	}
-	if a.skillOrchestrator == nil {
+	// Guard the library too, mirroring checkAndRegisterLoadPatternTool: load/list
+	// nil-deref GetLibrary() otherwise (an orchestrator can be wired without one).
+	if a.skillOrchestrator == nil || a.skillOrchestrator.GetLibrary() == nil {
 		return
 	}
 
@@ -3983,12 +3985,21 @@ func (a *Agent) ListSessions() []*Session {
 // DeleteSession removes a session.
 func (a *Agent) DeleteSession(sessionID string) {
 	a.memory.DeleteSession(sessionID)
+	// Drop the session's advertised-tool ledger too, or it grows unbounded on a
+	// long-running multi-session server. scopedToolNames is process-global (a
+	// name is scoped once any session scopes it) and is intentionally not pruned.
+	a.mu.Lock()
+	delete(a.sessionToolLedger, sessionID)
+	a.mu.Unlock()
 }
 
 // ClearAllSessions removes all sessions from memory.
 // Used by the benchmark server to free memory between scenarios.
 func (a *Agent) ClearAllSessions() {
 	a.memory.ClearAll()
+	a.mu.Lock()
+	a.sessionToolLedger = make(map[string]map[string]bool)
+	a.mu.Unlock()
 }
 
 // cleanupSessionReferences releases all shared memory references for a session.
@@ -4219,6 +4230,16 @@ func (a *Agent) GetAllRoleLLMs() map[loomv1.LLMRole]LLMProvider {
 // -1 = use storage.DefaultSharedMemoryThreshold, 0 = always reference, >0 = reference only if result exceeds N bytes.
 func (a *Agent) SetSharedMemoryThreshold(threshold int64) {
 	a.sharedMemoryThreshold = threshold
+	// Re-push to the executor: it captured the threshold at SetSharedMemory time,
+	// so a setter call afterwards (the registry configures it post-construction)
+	// would otherwise leave the two offload sites at different thresholds.
+	if a.executor != nil && a.sharedMemory != nil {
+		eff := int64(storage.DefaultSharedMemoryThreshold)
+		if threshold >= 0 {
+			eff = threshold
+		}
+		a.executor.SetSharedMemory(a.sharedMemory, eff)
+	}
 }
 
 // SetMaxToolResults configures how many tool results to keep in the conversation kernel.

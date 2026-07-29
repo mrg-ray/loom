@@ -95,3 +95,17 @@ func TestSetSharedMemoryThreshold_Overwrite(t *testing.T) {
 	agent.SetSharedMemoryThreshold(-1)
 	assert.Equal(t, int64(-1), agent.sharedMemoryThreshold)
 }
+
+// TestSetSharedMemoryThreshold_PropagatesToExecutor pins that a threshold set
+// AFTER shared memory is wired (the order the registry uses) reaches the
+// executor, so both offload sites agree. Before the fix the executor kept the
+// value captured at SetSharedMemory time.
+func TestSetSharedMemoryThreshold_PropagatesToExecutor(t *testing.T) {
+	agent := NewAgent(nil, nil)
+	store := storage.NewSharedMemoryStore(&storage.Config{MaxMemoryBytes: 1 << 20})
+
+	agent.SetSharedMemory(store)         // executor captures the default
+	agent.SetSharedMemoryThreshold(4096) // later reconfigure — must propagate
+	assert.Equal(t, int64(4096), agent.executor.SharedMemoryThreshold(),
+		"the executor's offload threshold tracks a post-wiring setter call")
+}

@@ -87,6 +87,12 @@ func (e *Executor) SetSharedMemory(sharedMemory *storage.SharedMemoryStore, thre
 	}
 }
 
+// SharedMemoryThreshold reports the byte threshold at or above which a result is
+// stored by reference. Exposed so callers can assert both offload sites agree.
+func (e *Executor) SharedMemoryThreshold() int64 {
+	return e.threshold
+}
+
 // SetSQLResultStore configures SQL result store for queryable large SQL results.
 func (e *Executor) SetSQLResultStore(sqlStore storage.ResultStore) {
 	e.sqlResultStore = sqlStore

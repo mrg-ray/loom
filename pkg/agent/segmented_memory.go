@@ -163,7 +163,13 @@ func NewSegmentedMemoryWithCompression(romContent string, maxContextTokens, rese
 		maxContextTokens = 200000 // Claude Sonnet 4.5 default
 	}
 	if reservedOutputTokens == 0 {
-		reservedOutputTokens = 20000 // 10% of 200K
+		reservedOutputTokens = maxContextTokens / 10 // 10% of the window, not a flat 20K
+	}
+	// Reserve must leave a positive working budget, or UsagePercentage goes
+	// negative and the compaction trigger never fires. Cap the reserve at half
+	// the window on small/misconfigured limits.
+	if reservedOutputTokens >= maxContextTokens {
+		reservedOutputTokens = maxContextTokens / 2
 	}
 
 	// Initialize token counter and budget

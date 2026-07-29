@@ -23,6 +23,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 )
 
 // mockCompressor implements MemoryCompressor for testing
@@ -64,6 +66,28 @@ func TestNewSegmentedMemory(t *testing.T) {
 
 	// Token count should be initialized with ROM content
 	assert.Greater(t, sm.GetTokenCount(), 0)
+}
+
+// TestSegmentedMemory_SmallWindowKeepsPositiveBudget guards against a
+// misconfigured small window silently losing the compaction trigger: a flat 20K
+// reserve against an 8K window drove available tokens negative, so
+// UsagePercentage went negative and compaction never fired. The reserve is now
+// capped below the window.
+func TestSegmentedMemory_SmallWindowKeepsPositiveBudget(t *testing.T) {
+	profile := ProfileDefaults[loomv1.WorkloadProfile_WORKLOAD_PROFILE_BALANCED]
+
+	// maxContext 8000, reserved 0 → resolves to 800 (10%), well below the window.
+	sm := NewSegmentedMemoryWithCompression("ROM", 8000, 0, profile)
+	_, available, total := sm.GetTokenBudgetUsage()
+	assert.Positive(t, available, "available budget stays positive on a small window")
+	assert.Positive(t, total, "total budget is positive")
+	assert.GreaterOrEqual(t, sm.tokenBudget.UsagePercentage(), 0.0,
+		"usage percentage never goes negative, so the compaction trigger can fire")
+
+	// An explicit reserve larger than the window is capped, not honoured verbatim.
+	sm2 := NewSegmentedMemoryWithCompression("ROM", 8000, 100000, profile)
+	_, available2, _ := sm2.GetTokenBudgetUsage()
+	assert.Positive(t, available2, "an over-large reserve is capped to keep budget positive")
 }
 
 func TestSegmentedMemory_AddMessage(t *testing.T) {
