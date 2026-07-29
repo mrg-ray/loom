@@ -443,6 +443,14 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 // walk for each durable load marker. A skill missing from the library is
 // logged and skipped.
 func (a *Agent) reFireSkillActivation(sessionID, skillName string) {
+	// A restore can be the FIRST thing a fresh process does, before any turn has
+	// run. Freeze the base set here too: re-firing wires the skill's required
+	// tools, and with no base snapshot yet every one of them — including tools
+	// that are base for all sessions — would be marked session-scoped and hidden
+	// from every other session for the process's lifetime. captureBaseTools is
+	// idempotent, so whichever of restore or the first turn arrives first wins,
+	// and both run after the embedder's construction-time registration.
+	a.captureBaseTools()
 	if a.skillOrchestrator == nil {
 		return
 	}
@@ -469,6 +477,9 @@ func (a *Agent) reFireSkillActivation(sessionID, skillName string) {
 // session's ledger. Called from the memory manager's restore walk for each
 // durable error (get_error_details) or large-result (query_tool_result) record.
 func (a *Agent) reFireDisclosureTool(sessionID, toolName string) {
+	// Same ordering hazard as reFireSkillActivation: a restore may precede the
+	// first turn, and this path scopes tools into a session's ledger.
+	a.captureBaseTools()
 	switch toolName {
 	case "get_error_details":
 		if a.errorStore == nil || a.isBuiltinToolSuppressed("get_error_details") {

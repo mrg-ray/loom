@@ -461,17 +461,14 @@ type StreamingLLMProvider interface {
 // 8 implementations: Anthropic, Bedrock, Ollama, OpenAI, Azure OpenAI, Gemini, Mistral, HuggingFace
 ```
 
-**Shared Backend Wrapper** (large result storage):
+**Large result storage** (one threshold, two offload sites):
 
 ```go
-// pkg/fabric/shared_backend.go
-type SharedBackendWrapper struct {
-    backend      ExecutionBackend
-    sharedMemory *storage.SharedMemoryStore
-    threshold    int64
-    autoStore    bool
-}
-// Wraps backends to auto-store large results (>100KB) in shared memory
+// pkg/shuttle/executor.go — handleLargeResult
+// pkg/agent/agent.go     — formatToolResult
+// A tool result at or above storage.DefaultSharedMemoryThreshold (64 KiB) is
+// stored in shared memory; a preview and a handle enter the conversation.
+// Exempt: manage_skills, get_tool_result, query_tool_result.
 ```
 
 **Health Checks** (via ExecutionBackend interface):

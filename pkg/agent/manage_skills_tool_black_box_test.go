@@ -133,6 +133,27 @@ tools:
   required_tools:
     - web_search
 `,
+	// base-tooled-skill requires a tool the AGENT itself registers at
+	// construction (a base tool), not a builtin the load has to disclose. It
+	// exists to prove that re-firing this skill on restore never marks a base
+	// tool as session-scoped and hides it from other sessions.
+	"base-tooled-skill.yaml": `apiVersion: loom/v1
+kind: Skill
+metadata:
+  name: base-tooled-skill
+  title: Base Tooled Skill
+  description: Declares a required tool that is part of the agent's base set.
+  domain: general
+  risk_level: LOW
+trigger:
+  mode: MANUAL
+prompt:
+  instructions: |
+    Base tooled skill instructions body.
+tools:
+  required_tools:
+    - base_probe
+`,
 	"danger-skill.yaml": `apiVersion: loom/v1
 kind: Skill
 metadata:

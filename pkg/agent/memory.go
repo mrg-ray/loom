@@ -266,11 +266,12 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 			// marker. The copy is taken under the lock so a concurrent AddMessage
 			// on this session cannot race the walk that reads it after unlock.
 			var restoreSnapshot []Message
+			var replayInto *SegmentedMemory
 			var activateSkill func(sessionID, skillName string)
 			var registerDisclosureTool func(sessionID, toolName string)
 			if needsReplay {
 				if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok {
-					segMem.ReplayMessages(ctx, session.Messages)
+					replayInto = segMem
 				}
 				restoreSnapshot = make([]Message, len(session.Messages))
 				copy(restoreSnapshot, session.Messages)
@@ -280,9 +281,17 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 			m.sessions[sessionID] = session
 			m.mu.Unlock()
 
-			// Restore re-fire runs after ReplayMessages returns and after the
-			// lock is released, reconstructing skill activations and disclosure
-			// tools from the durable snapshot.
+			// Replay runs AFTER the lock is released. It compacts, and compaction
+			// calls the LLM compressor — holding the global session lock across
+			// those network calls would block every other session's lookup for the
+			// duration of the restore.
+			if replayInto != nil {
+				replayInto.ReplayMessages(ctx, restoreSnapshot)
+			}
+
+			// Restore re-fire runs after replay and outside the lock,
+			// reconstructing skill activations and disclosure tools from the
+			// durable snapshot.
 			if activateSkill != nil || registerDisclosureTool != nil {
 				m.reFireOnRestore(sessionID, restoreSnapshot, activateSkill, registerDisclosureTool, ctxDebug)
 			}
