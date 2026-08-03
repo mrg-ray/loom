@@ -95,7 +95,8 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	// source at log time, so it is safe to wire before options finalize config.
 	a.ctxDebug = a.newContextDebug()
 
-	// Default shared memory threshold: 64 KiB (storage.DefaultSharedMemoryThreshold).
+	// Default shared memory threshold: 16384 bytes (storage.DefaultSharedMemoryThreshold —
+	// the one threshold value of HLD §5.1).
 	a.sharedMemoryThreshold = int64(storage.DefaultSharedMemoryThreshold)
 
 	// Enable self-correction by default (guardrails + circuit breakers)
