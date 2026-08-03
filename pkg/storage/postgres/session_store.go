@@ -447,6 +447,67 @@ func (s *SessionStore) LoadMessages(ctx context.Context, sessionID string) ([]ag
 	return messages, nil
 }
 
+// MarkEvicted sets evicted=TRUE on the given rows in one transaction (relief
+// operation; HLD §5.2). Flags are write-once — no code path clears them.
+func (s *SessionStore) MarkEvicted(ctx context.Context, sessionID string, seqs []int64) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.mark_evicted")
+	defer s.tracer.EndSpan(span)
+	span.SetAttribute("session_id", sessionID)
+
+	return execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		userID := UserIDFromContext(ctx)
+		if _, err := tx.Exec(ctx,
+			"UPDATE messages SET evicted = TRUE WHERE session_id = $1 AND user_id = $2 AND id = ANY($3)",
+			sessionID, userID, seqs,
+		); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to mark evicted: %w", err)
+		}
+		return nil
+	})
+}
+
+// FoldMessages writes summary version n (snapshot_type='fold', content = JSON
+// {"n","text"}) and sets the region's folded flags in ONE transaction (HLD
+// §5.4.6) — never a fold that evaporates on reload.
+func (s *SessionStore) FoldMessages(ctx context.Context, sessionID string, seqs []int64, n int, text string) error {
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.fold_messages")
+	defer s.tracer.EndSpan(span)
+	span.SetAttribute("session_id", sessionID)
+	span.SetAttribute("version", fmt.Sprintf("%d", n))
+
+	content, err := json.Marshal(map[string]interface{}{"n": n, "text": text})
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to marshal fold snapshot: %w", err)
+	}
+
+	return execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		userID := UserIDFromContext(ctx)
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO memory_snapshots (session_id, user_id, snapshot_type, content, token_count, created_at)
+			 VALUES ($1, $2, 'fold', $3, $4, $5)`,
+			sessionID, userID, string(content), (len(text)+2)/3, time.Now().UTC(),
+		); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to insert fold snapshot: %w", err)
+		}
+		if len(seqs) > 0 {
+			if _, err := tx.Exec(ctx,
+				"UPDATE messages SET folded = TRUE WHERE session_id = $1 AND user_id = $2 AND id = ANY($3)",
+				sessionID, userID, seqs,
+			); err != nil {
+				span.RecordError(err)
+				return fmt.Errorf("failed to set folded flags: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
 // ListMessagesBySeqRange is the by-seq span read backing recall (HLD §6):
 // rows lo..hi inclusive for one session, seq (messages.id) ascending. Folded
 // rows are included — a summary-cited span is exactly what recall retrieves.

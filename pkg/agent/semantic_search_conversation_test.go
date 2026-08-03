@@ -464,7 +464,6 @@ func TestSemanticSearch_RealLLMConversation(t *testing.T) {
 
 	// Now test semantic search across all topics
 	t.Logf("\n=== Testing Semantic Search ===")
-	require.True(t, segMem.IsSwapEnabled(), "Swap should be enabled")
 
 	// Test search for each topic
 	for _, topic := range topics {

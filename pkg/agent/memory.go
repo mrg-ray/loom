@@ -16,6 +16,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,7 +61,6 @@ type Memory struct {
 	reservedOutputTokens int                        // Reserved tokens for output (0 = use defaults)
 	compressionProfile   *CompressionProfile        // Optional compression profile for new sessions (nil = use defaults)
 	compressor           MemoryCompressor           // Optional LLM compressor for L2 compaction (nil = heuristic fallback)
-	maxToolResults       int                        // Max tool results in kernel (0 = use default)
 	thresholdBytes       int64                      // Offload / row / page bound in bytes (0 = default; HLD §5.1)
 
 	// Real-time observers for cross-session updates
@@ -77,6 +77,13 @@ type Memory struct {
 	// Per-mutation debug carrier, forwarded to each SegmentedMemory this manager
 	// builds and read by the restore re-fire pass. nil or off is a no-op.
 	ctxDebug *contextDebug
+
+	// skillDeactivation is forwarded to each SegmentedMemory (fold's skill
+	// deactivation path, HLD §4.5).
+	skillDeactivation func(sessionID, skillName string)
+
+	// protectedRecentTurns is K (HLD §5.1), forwarded to each SegmentedMemory.
+	protectedRecentTurns int
 }
 
 // NewMemory creates a new in-memory session manager.
@@ -161,14 +168,6 @@ func (m *Memory) SetContextDebug(cd *contextDebug) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ctxDebug = cd
-}
-
-// SetMaxToolResults configures how many tool results to keep in the conversation kernel.
-// 0 = use default (5).
-func (m *Memory) SetMaxToolResults(n int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.maxToolResults = n
 }
 
 // SetThresholdBytes sets the one threshold value (HLD §5.1: compile-time offload
@@ -258,10 +257,11 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 	reservedOut := m.reservedOutputTokens
 	compProfile := m.compressionProfile
 	compressor := m.compressor
-	maxToolRes := m.maxToolResults
 	thresholdBytes := m.thresholdBytes
 	logger := m.logger
 	ctxDebug := m.ctxDebug
+	skillDeactivation := m.skillDeactivation
+	protectedTurns := m.protectedRecentTurns
 	m.mu.RUnlock()
 
 	// Check write-lock path: existing session that needs metadata update
@@ -274,7 +274,7 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 	if session, ok := m.sessions[sessionID]; ok {
 		m.updateSessionMetadata(session, agentID, parentSessionID, store, ctx, logger)
 		m.ensureSessionMemory(session, sessionID, sysFn, compProfile, maxCtx, reservedOut,
-			sharedMem, store, tracer, llmProv, compressor, maxToolRes, ctx)
+			sharedMem, store, tracer, llmProv, compressor, ctx)
 		if session.FailureTracker == nil {
 			session.FailureTracker = newConsecutiveFailureTracker()
 		}
@@ -293,23 +293,15 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 			// tracking continue to work across restarts.
 			needsReplay := session.SegmentedMem == nil
 			m.ensureSessionMemory(session, sessionID, sysFn, compProfile, maxCtx, reservedOut,
-				sharedMem, store, tracer, llmProv, compressor, maxToolRes, ctx)
+				sharedMem, store, tracer, llmProv, compressor, ctx)
 			if session.FailureTracker == nil {
 				session.FailureTracker = newConsecutiveFailureTracker()
 			}
-			// Replay DB-loaded messages into a freshly built SegmentedMem so
-			// GetMessagesForLLM returns full history after server restart.
-			//
-			// CRITICAL: Use ReplayMessages (not AddMessage in a loop) to prevent
-			// compression from firing between an assistant tool_use and its
-			// tool_result — see ReplayMessages doc for details.
-			//
-			// On replay, also snapshot the durable session.Messages and the
-			// restore hooks for the re-fire pass below. The snapshot must be the
-			// durable list, not the compacted L1/L2: L2 compaction replaces
-			// batched messages with an opaque summary, stripping every load
-			// marker. The copy is taken under the lock so a concurrent AddMessage
-			// on this session cannot race the walk that reads it after unlock.
+			// Reload is a read (HLD §8): the rows come back already filtered
+			// folded=false and seq-ordered; ReplayMessages is a pure bulk
+			// append; the newest 'fold' snapshot is the summary. No compaction,
+			// no compressor calls on load — live and restored are the same read
+			// of the same rows.
 			var restoreSnapshot []Message
 			var replayInto *SegmentedMemory
 			var activateSkill func(sessionID, skillName string)
@@ -324,12 +316,9 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 			m.sessions[sessionID] = session
 			m.mu.Unlock()
 
-			// Replay runs AFTER the lock is released. It compacts, and compaction
-			// calls the LLM compressor — holding the global session lock across
-			// those network calls would block every other session's lookup for the
-			// duration of the restore.
 			if replayInto != nil {
 				replayInto.ReplayMessages(ctx, restoreSnapshot)
+				m.loadSummary(ctx, store, sessionID, replayInto)
 			}
 
 			// Restore re-fire runs after replay and outside the lock,
@@ -376,13 +365,14 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 	if compressor != nil {
 		segMem.SetCompressor(compressor)
 	}
-	if maxToolRes > 0 {
-		segMem.maxToolResults = maxToolRes
-	}
 	if thresholdBytes > 0 {
 		segMem.SetThreshold(thresholdBytes)
 	}
 	segMem.SetContextDebug(ctxDebug)
+	segMem.SetSkillDeactivationHook(skillDeactivation)
+	if protectedTurns > 0 {
+		segMem.SetProtectedRecentTurns(protectedTurns)
+	}
 
 	session := &Session{
 		ID:              sessionID,
@@ -428,24 +418,41 @@ func (m *Memory) reFireOnRestore(sessionID string, messages []Message,
 	activateSkill func(sessionID, skillName string),
 	ctxDebug *contextDebug,
 ) {
+	// The durable re-fire key (HLD §8, blueprint A8): an assistant row's
+	// tool_calls entry with name=manage_skills, input.action=load, paired by
+	// tool_use_id with a tool row whose content starts with "Skill loaded: " —
+	// the confirmation manage_skills already emits. This key survives cloud
+	// persistence, which never stores ToolResult metadata.
+	loadCalls := make(map[string]string) // tool_use_id → skill name
+	for i := range messages {
+		for _, c := range messages[i].ToolCalls {
+			if c.Name != "manage_skills" || c.ID == "" {
+				continue
+			}
+			if action, _ := c.Input["action"].(string); action != "load" {
+				continue
+			}
+			if name, _ := c.Input["name"].(string); name != "" {
+				loadCalls[c.ID] = name
+			}
+		}
+	}
+
 	loadsReactivated := 0
+	refired := make(map[string]bool)
 	for i := range messages {
 		msg := messages[i]
-		if msg.Role != "tool" {
+		if msg.Role != "tool" || msg.ToolUseID == "" || activateSkill == nil {
 			continue
 		}
-
-		// Load marker: a manage_skills load result carries a structured
-		// {skill, ...} marker in ToolResult.Metadata. A blocked (approval-
-		// required) load carries activated=false and never touched the active
-		// set, so it is not re-fired.
-		if activateSkill != nil && msg.ToolResult != nil && msg.ToolResult.Metadata != nil {
-			if name, ok := msg.ToolResult.Metadata["skill"].(string); ok && name != "" {
-				if activated, present := msg.ToolResult.Metadata["activated"].(bool); !present || activated {
-					activateSkill(sessionID, name)
-					loadsReactivated++
-				}
-			}
+		name := loadCalls[msg.ToolUseID]
+		if name == "" || refired[name] {
+			continue
+		}
+		if strings.HasPrefix(msg.Content, "Skill loaded: ") {
+			refired[name] = true
+			activateSkill(sessionID, name)
+			loadsReactivated++
 		}
 	}
 
@@ -456,6 +463,70 @@ func (m *Memory) reFireOnRestore(sessionID string, messages []Message,
 			zap.String("session_id", sessionID),
 			zap.Int("turn", ctxDebug.turn(sessionID)),
 			zap.Int("loads_reactivated", loadsReactivated))
+	}
+}
+
+// loadSummary installs the newest 'fold' summary version from the snapshot
+// table (HLD §4.6, §8): rows are {"n","text"} JSON under snapshot_type='fold';
+// the renderer reads max(n).
+func (m *Memory) loadSummary(ctx context.Context, store SessionStorage, sessionID string, segMem *SegmentedMemory) {
+	if store == nil || segMem == nil {
+		return
+	}
+	snapshots, err := store.LoadMemorySnapshots(ctx, sessionID, "fold", 0)
+	if err != nil {
+		m.logger.Warn("Failed to load summary versions",
+			zap.String("session_id", sessionID),
+			zap.Error(err))
+		return
+	}
+	bestN := 0
+	bestText := ""
+	for _, snap := range snapshots {
+		var v struct {
+			N    int    `json:"n"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(snap.Content), &v); err != nil {
+			continue
+		}
+		if v.N > bestN {
+			bestN = v.N
+			bestText = v.Text
+		}
+	}
+	if bestN > 0 {
+		segMem.setSummary(bestN, bestText)
+	}
+}
+
+// SetProtectedRecentTurns configures K — protected newest user turns (HLD
+// §5.1; config ProtectedRecentTurns) — for existing and future sessions.
+func (m *Memory) SetProtectedRecentTurns(k int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if k <= 0 {
+		return
+	}
+	m.protectedRecentTurns = k
+	for _, session := range m.sessions {
+		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+			segMem.SetProtectedRecentTurns(k)
+		}
+	}
+}
+
+// SetSkillDeactivationHook wires the skills orchestrator's deactivation path
+// into every session's memory (existing and future): fold deactivates skills
+// whose manage_skills load pair lies inside the folded region (HLD §4.5).
+func (m *Memory) SetSkillDeactivationHook(fn func(sessionID, skillName string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.skillDeactivation = fn
+	for _, session := range m.sessions {
+		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+			segMem.SetSkillDeactivationHook(fn)
+		}
 	}
 }
 
@@ -484,7 +555,7 @@ func (m *Memory) ensureSessionMemory(session *Session, sessionID string,
 	sysFn SystemPromptFunc, compProfile *CompressionProfile,
 	maxCtx, reservedOut int,
 	sharedMem *storage.SharedMemoryStore, store SessionStorage,
-	tracer observability.Tracer, llmProv LLMProvider, compressor MemoryCompressor, maxToolRes int,
+	tracer observability.Tracer, llmProv LLMProvider, compressor MemoryCompressor,
 	ctx context.Context,
 ) {
 	if session.SegmentedMem != nil {
@@ -518,14 +589,15 @@ func (m *Memory) ensureSessionMemory(session *Session, sessionID string,
 		if compressor != nil {
 			segMem.SetCompressor(compressor)
 		}
-		if maxToolRes > 0 {
-			segMem.maxToolResults = maxToolRes
-		}
 		// m.mu is held by the caller, so m.thresholdBytes is read safely here.
 		if m.thresholdBytes > 0 {
 			segMem.SetThreshold(m.thresholdBytes)
 		}
 		segMem.SetContextDebug(m.ctxDebug)
+		segMem.SetSkillDeactivationHook(m.skillDeactivation)
+		if m.protectedRecentTurns > 0 {
+			segMem.SetProtectedRecentTurns(m.protectedRecentTurns)
+		}
 	}
 }
 

@@ -53,8 +53,8 @@ func (sm *SegmentedMemory) inTurnPayload(messageID int64) (string, error) {
 	defer sm.mu.RUnlock()
 	t := sm.currentTurnLocked()
 	id := strconv.FormatInt(messageID, 10)
-	for i := range sm.l1Messages {
-		m := &sm.l1Messages[i]
+	for i := range sm.contextMessages {
+		m := &sm.contextMessages[i]
 		if m.Role == "tool" && m.ID == id && m.Turn == t {
 			return m.Content, nil
 		}

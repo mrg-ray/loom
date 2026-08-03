@@ -613,6 +613,11 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	// Check status code before streaming
 	if httpResp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(httpResp.Body)
+		// Positive identification of the provider's context-too-long refusal
+		// (HLD §5.2 step 12) — the only relief trigger.
+		if llm.IsAnthropicContextTooLong(httpResp.StatusCode, respBody) {
+			return nil, fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong)
+		}
 		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
 	}
 
@@ -841,6 +846,11 @@ func (c *Client) callAPI(ctx context.Context, req *MessagesRequest) (*MessagesRe
 
 	// Check status code
 	if httpResp.StatusCode != http.StatusOK {
+		// Positive identification of the provider's context-too-long refusal
+		// (HLD §5.2 step 12) — the only relief trigger.
+		if llm.IsAnthropicContextTooLong(httpResp.StatusCode, respBody) {
+			return nil, fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong)
+		}
 		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
 	}
 

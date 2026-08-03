@@ -1,0 +1,274 @@
+// Copyright 2026 Teradata
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package agent
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/teradata-labs/loom/pkg/observability"
+)
+
+// --- write rule §4.1: truncation ---------------------------------------------
+
+func TestTruncateToolRowContent_Bounds(t *testing.T) {
+	threshold := 1024
+	content := strings.Repeat("x", 5000)
+	stored := truncateToolRowContent(content, threshold)
+	require.LessOrEqual(t, len(stored), threshold,
+		"a truncated row must never itself exceed the threshold (§4.1)")
+	assert.True(t, strings.HasSuffix(stored, "Re-run the call above if this data is needed again.]"),
+		"the normative tail closes the stored row")
+	assert.Contains(t, stored, "of 5000 bytes shown")
+	// Below the bound: unchanged.
+	small := strings.Repeat("y", 100)
+	assert.Equal(t, small, truncateToolRowContent(small, threshold))
+	// At the bound exactly: unchanged (stored = threshold is legal).
+	exact := strings.Repeat("z", threshold)
+	assert.Equal(t, exact, truncateToolRowContent(exact, threshold))
+}
+
+func TestTruncateToolRowContent_RuneBoundary(t *testing.T) {
+	content := strings.Repeat("é", 4000) // 2-byte runes
+	stored := truncateToolRowContent(content, 1024)
+	require.LessOrEqual(t, len(stored), 1024)
+	core := stored[:strings.LastIndex(stored, "[truncated: ")]
+	assert.True(t, strings.HasSuffix(core, "é") || core == "",
+		"the core is cut backward to a UTF-8 rune boundary")
+}
+
+// --- §5.5: preview -----------------------------------------------------------
+
+func TestPreviewOf_CollapsesWhitespaceAndCaps(t *testing.T) {
+	content := "{\n  \"rows\": [\n    1,\n    2\n  ]\n}" + strings.Repeat(" filler", 100)
+	p := previewOf(content)
+	assert.LessOrEqual(t, len(p), 160, "preview is capped at 160 bytes")
+	assert.NotContains(t, p, "\n", "whitespace runs collapse to a single space")
+	assert.True(t, strings.HasPrefix(p, "{ \"rows\": [ 1, 2 ] }"),
+		"a structured payload previews as content, never as a lone bracket")
+}
+
+// --- §5.2 step 6: render cases -----------------------------------------------
+
+func newCompileMemory(t *testing.T) *SegmentedMemory {
+	t.Helper()
+	sm := NewSegmentedMemory("ROM-CONTENT", 200000, 20000)
+	sm.SetThreshold(1024)
+	return sm
+}
+
+func TestCompile_OffloadStubForCurrentTurnOversizeResult(t *testing.T) {
+	sm := newCompileMemory(t)
+	big := strings.Repeat("d", 5000)
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "q", Turn: 1})
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+		ToolCalls: []ToolCall{{ID: "c1", Name: "web_search", Input: map[string]interface{}{"q": "x"}}}})
+	sm.AddMessage(context.Background(), Message{Role: "tool", ID: "42", ToolUseID: "c1", Content: big, Turn: 1})
+
+	out := sm.GetMessagesForLLM()
+	var rendered string
+	for _, m := range out {
+		if m.Role == "tool" {
+			rendered = m.Content
+		}
+	}
+	want := fmt.Sprintf(offloadStubFormat, "web_search", tokenFigure(len(big)), int64(42), "", previewOf(big))
+	assert.Equal(t, want, rendered, "the §5.5 offload stub, byte-exact")
+}
+
+func TestCompile_AtThresholdRendersFull(t *testing.T) {
+	sm := newCompileMemory(t)
+	page := strings.Repeat("p", 1024) // exactly at the threshold
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "q", Turn: 1})
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+		ToolCalls: []ToolCall{{ID: "c1", Name: "query_tool_result"}}})
+	sm.AddMessage(context.Background(), Message{Role: "tool", ID: "7", ToolUseID: "c1", Content: page, Turn: 1})
+
+	out := sm.GetMessagesForLLM()
+	for _, m := range out {
+		if m.Role == "tool" {
+			assert.Equal(t, page, m.Content, "strictly over the threshold, not at it — a page must never stub itself")
+		}
+	}
+}
+
+func TestCompile_LegacyOversizePriorTurnRendersEvictedStub(t *testing.T) {
+	sm := newCompileMemory(t)
+	big := strings.Repeat("L", 5000)
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+		ToolCalls: []ToolCall{{ID: "c1", Name: "execute_sql"}}})
+	sm.AddMessage(context.Background(), Message{Role: "tool", ID: "3", ToolUseID: "c1", Content: big, Turn: 1})
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "next", Turn: 2})
+
+	out := sm.GetMessagesForLLM()
+	var rendered string
+	for _, m := range out {
+		if m.Role == "tool" {
+			rendered = m.Content
+		}
+	}
+	want := fmt.Sprintf(evictedStubFormat, "execute_sql", tokenFigure(len(big)), "", previewOf(big))
+	assert.Equal(t, want, rendered, "a legacy unbounded prior-turn row renders the evicted stub")
+}
+
+func TestCompile_EvictedFlagRendersEvictedStub(t *testing.T) {
+	sm := newCompileMemory(t)
+	content := strings.Repeat("e", 900) // under threshold, but flagged
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+		ToolCalls: []ToolCall{{ID: "c1", Name: "shell"}}})
+	sm.AddMessage(context.Background(), Message{Role: "tool", ID: "9", ToolUseID: "c1", Content: content, Turn: 1, Evicted: true})
+
+	out := sm.GetMessagesForLLM()
+	for _, m := range out {
+		if m.Role == "tool" {
+			assert.Contains(t, m.Content, "evicted from context — re-run the call above", "flag is write-once; render is permanent")
+		}
+	}
+}
+
+func TestCompile_SyntheticFailedResultForMissingPair(t *testing.T) {
+	sm := newCompileMemory(t)
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "q", Turn: 1})
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+		ToolCalls: []ToolCall{{ID: "c-dead", Name: "crashy", Input: map[string]interface{}{}}}})
+
+	out := sm.GetMessagesForLLM()
+	var got *Message
+	for i := range out {
+		if out[i].Role == "tool" && out[i].ToolUseID == "c-dead" {
+			got = &out[i]
+		}
+	}
+	require.NotNil(t, got, "a call with no matching result gets a synthetic failed result — never strip the signature")
+	assert.Equal(t, syntheticFailedResult, got.Content)
+}
+
+func TestCompile_SummaryEmittedAsSystemMessage(t *testing.T) {
+	sm := newCompileMemory(t)
+	sm.setSummary(2, "covers msg:1-9\nstate of work")
+	out := sm.GetMessagesForLLM()
+	require.GreaterOrEqual(t, len(out), 2)
+	assert.Equal(t, "system", out[0].Role)
+	assert.Equal(t, "ROM-CONTENT", out[0].Content)
+	assert.Equal(t, "system", out[1].Role)
+	assert.Equal(t, "covers msg:1-9\nstate of work", out[1].Content)
+}
+
+// --- §5.2 releasePressure over a real store ----------------------------------
+
+type foldCompressor struct{ out string }
+
+func (f *foldCompressor) CompressMessages(ctx context.Context, messages []Message) (string, error) {
+	return f.out, nil
+}
+func (f *foldCompressor) IsEnabled() bool { return true }
+
+func TestReleasePressure_EvictsThenFolds(t *testing.T) {
+	store, err := NewSessionStore(filepath.Join(t.TempDir(), "s.db"), observability.NewNoOpTracer())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	ctx := context.Background()
+	const sessionID = "sess-relief"
+	require.NoError(t, store.SaveSession(ctx, &Session{ID: sessionID, Context: map[string]interface{}{}}))
+
+	sm := NewSegmentedMemory("ROM", 2000, 200) // tiny window so target is small
+	sm.SetThreshold(512)
+	sm.SetSessionStore(store, sessionID)
+	sm.SetCompressor(&foldCompressor{out: "covers msg:1-4\nsummary of the old turns"})
+
+	// Persist + mirror seven turns so T−K and T−1 have material.
+	persist := func(role, content, toolUseID string, calls []ToolCall, turnStart bool) Message {
+		m := Message{Role: role, Content: content, ToolUseID: toolUseID, ToolCalls: calls}
+		require.NoError(t, store.SaveMessage(ctx, sessionID, &m, turnStart))
+		sm.AddMessage(ctx, m)
+		return m
+	}
+	for turn := 1; turn <= 7; turn++ {
+		persist("user", fmt.Sprintf("question %d", turn), "", nil, true)
+		callID := fmt.Sprintf("c%d", turn)
+		persist("assistant", "", "", []ToolCall{{ID: callID, Name: "bulk_scan", Input: map[string]interface{}{}}}, false)
+		persist("tool", strings.Repeat("r", 5000), callID, nil, false)
+	}
+	require.Equal(t, int64(7), sm.CurrentTurn())
+
+	estimate, target := sm.ReleasePressure(ctx)
+	assert.Greater(t, target, 0)
+	assert.Greater(t, estimate, 0)
+
+	// Rows of the current turn are never touched.
+	for _, m := range sm.GetMessages() {
+		if m.Turn == 7 {
+			assert.False(t, m.Evicted, "turn T is untouchable")
+			assert.False(t, m.Folded)
+		}
+	}
+
+	// Eviction flags landed in the store (write-once, one transaction).
+	rows, err := store.LoadMessages(ctx, sessionID)
+	require.NoError(t, err)
+	evicted := 0
+	for _, m := range rows {
+		if m.Evicted {
+			evicted++
+			assert.Equal(t, "tool", m.Role, "eviction is one-sided: only results are stubbed")
+		}
+	}
+	assert.Greater(t, evicted, 0, "evict marked prior-turn tool rows")
+
+	// If a fold ran, the summary version row exists and folded rows left the read.
+	if sm.HasL2Content() {
+		snaps, err := store.LoadMemorySnapshots(ctx, sessionID, "fold", 0)
+		require.NoError(t, err)
+		require.NotEmpty(t, snaps, "the fold's version row persisted in the same transaction")
+		assert.Contains(t, sm.GetL2Summary(), "covers msg:")
+	}
+}
+
+// --- §8: re-fire on the durable key ------------------------------------------
+
+func TestReFireOnRestore_DurableKey(t *testing.T) {
+	m := NewMemory()
+	var activated []string
+	messages := []Message{
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID: "c1", Name: "manage_skills",
+			Input: map[string]interface{}{"action": "load", "name": "alpha-skill"},
+		}}},
+		{Role: "tool", ToolUseID: "c1", Content: "Skill loaded: alpha-skill"},
+		// A list call must not re-fire.
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID: "c2", Name: "manage_skills",
+			Input: map[string]interface{}{"action": "list"},
+		}}},
+		{Role: "tool", ToolUseID: "c2", Content: "{}"},
+		// A blocked load has no "Skill loaded: " confirmation.
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID: "c3", Name: "manage_skills",
+			Input: map[string]interface{}{"action": "load", "name": "blocked-skill"},
+		}}},
+		{Role: "tool", ToolUseID: "c3", Content: "Skill load blocked: approval required"},
+	}
+	m.reFireOnRestore("sess", messages, func(sessionID, skillName string) {
+		activated = append(activated, skillName)
+	}, nil)
+	assert.Equal(t, []string{"alpha-skill"}, activated,
+		"re-fire keys on the manage_skills load call paired with a 'Skill loaded: ' confirmation")
+}

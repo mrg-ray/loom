@@ -224,14 +224,11 @@ func runSkillsCutoverS1(t *testing.T) []contextDumpRecord {
 	require.NoError(t, err)
 	require.Equal(t, 6, countToolExecutions(workResp, "fetch_data"), "the work phase produced six tool-results")
 
-	// compaction: age the earlier turns out of L1 into the L2 summary
+	// fold: install a summary version directly (compaction triggers are
+	// deleted — fold is the only writer, exercised via relief elsewhere)
 	segMem := sessionSegmentedMemory(t, rig.agent, sessionID)
-	segMem.SetCompressor(&mockCompressor{
-		enabled:    true,
-		compressFn: func(msgs []Message) string { return "S1-L2-SUMMARY" },
-	})
-	segMem.CompactMemory(context.Background())
-	require.Contains(t, segMem.GetL2Summary(), "S1-L2-SUMMARY", "compaction produced an L2 summary")
+	segMem.setSummary(1, "S1-L2-SUMMARY")
+	require.Contains(t, segMem.GetL2Summary(), "S1-L2-SUMMARY", "the summary version installed")
 
 	// grant 2
 	grantResp, err := rig.agent.Chat(context.Background(), sessionID, "load the beta skill")

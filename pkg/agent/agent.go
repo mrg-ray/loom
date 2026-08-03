@@ -16,6 +16,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -26,6 +27,7 @@ import (
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"github.com/teradata-labs/loom/pkg/communication"
 	"github.com/teradata-labs/loom/pkg/fabric"
+	"github.com/teradata-labs/loom/pkg/llm"
 	"github.com/teradata-labs/loom/pkg/memory"
 	"github.com/teradata-labs/loom/pkg/metaagent/learning"
 	"github.com/teradata-labs/loom/pkg/observability"
@@ -165,6 +167,16 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	if a.config.MaxContextTokens > 0 || a.config.ReservedOutputTokens > 0 {
 		a.memory.SetContextLimits(a.config.MaxContextTokens, a.config.ReservedOutputTokens)
 	}
+
+	// K — protected newest user turns (HLD §5.1, §9).
+	if a.config.ProtectedRecentTurns > 0 {
+		a.memory.SetProtectedRecentTurns(a.config.ProtectedRecentTurns)
+	}
+
+	// Fold deactivates every skill whose manage_skills load pair lies inside
+	// the folded region (HLD §4.5) — wired through the skills orchestrator's
+	// existing deactivation path plus the per-session tool ledger.
+	a.memory.SetSkillDeactivationHook(a.deactivateSkillForFold)
 
 	// Initialize shared memory store for large tool results (#2: Persistent Global Storage)
 	// Use global singleton so references work across agent instances and survive restarts.
@@ -769,6 +781,45 @@ func (a *Agent) enforceRequiredSkillTools(sessionID string) {
 				zap.Int("count", len(as.Skill.Tools.MCPServers)))
 		}
 	}
+}
+
+// deactivateSkillForFold is fold's skill-deactivation path (HLD §4.5): when a
+// skill's manage_skills load pair is folded, the skill is deactivated via the
+// orchestrator's existing path and its required tools leave the session's
+// advertised ledger — so they leave the provider tools parameter at the next
+// compile. Re-loading the skill is the door back. A tool still required by a
+// remaining active skill (or base) stays.
+func (a *Agent) deactivateSkillForFold(sessionID, skillName string) {
+	if a.skillOrchestrator == nil {
+		return
+	}
+	var required []string
+	for _, as := range a.skillOrchestrator.GetActiveSkills(sessionID) {
+		if as != nil && as.Skill != nil && as.Skill.Name == skillName {
+			required = as.Skill.Tools.RequiredTools
+		}
+	}
+
+	a.skillOrchestrator.DeactivateSkill(sessionID, skillName)
+
+	still := map[string]bool{}
+	for _, as := range a.skillOrchestrator.GetActiveSkills(sessionID) {
+		if as == nil || as.Skill == nil {
+			continue
+		}
+		for _, n := range as.Skill.Tools.RequiredTools {
+			still[n] = true
+		}
+	}
+	a.mu.Lock()
+	if ledger := a.sessionToolLedger[sessionID]; ledger != nil {
+		for _, n := range required {
+			if !still[n] {
+				delete(ledger, n)
+			}
+		}
+	}
+	a.mu.Unlock()
 }
 
 // applySkillExcludedTools filters the input tool slice by removing any
@@ -2167,50 +2218,9 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			"max_tool_executions": a.config.MaxToolExecutions,
 		})
 
-		// === FEATURE INTEGRATION: Token Budget Management ===
-		// Check token budget and enforce compression if needed (segmented memory only)
-		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
-			budgetInfo := checkTokenBudget(segMem)
-
-			// Log budget status
-			span.SetAttribute("token_budget.current", budgetInfo.currentTokens)
-			span.SetAttribute("token_budget.available", budgetInfo.availableTokens)
-			span.SetAttribute("token_budget.usage_pct", budgetInfo.budgetPct)
-			span.SetAttribute("token_budget.max_output", budgetInfo.maxOutputTokens)
-
-			if budgetInfo.budgetPct > 70 {
-				span.AddEvent("token_budget.warning", map[string]interface{}{
-					"usage_pct": budgetInfo.budgetPct,
-				})
-			}
-
-			// Force compression once budget usage passes enforceTokenBudget's threshold
-			compressed, err := enforceTokenBudget(ctx, segMem, budgetInfo)
-			if err != nil {
-				return nil, fmt.Errorf("token budget enforcement failed: %w", err)
-			}
-			if compressed {
-				span.AddEvent("memory.compressed", map[string]interface{}{
-					"trigger": "budget_critical",
-				})
-			}
-
-			// After compression, if still critically over budget, attempt recovery.
-			if checkTokenBudget(segMem).budgetPct > 85 {
-				if recovery != nil {
-					budgetChecker := func() float64 { return checkTokenBudget(segMem).budgetPct }
-					recovered, _ := recovery.recoverTokenBudget(ctx, session, segMem, budgetChecker)
-					if !recovered {
-						budgetErr := fmt.Errorf("token budget critically exceeded (%.1f%%) after aggressive trim", checkTokenBudget(segMem).budgetPct)
-						return nil, recovery.buildRecoverableError("token_budget_exceeded", budgetErr, "reset_context", map[string]any{"budget_pct": checkTokenBudget(segMem).budgetPct})
-					}
-				} else {
-					return nil, fmt.Errorf("token budget critically exceeded (%.1f%%) and self-healing disabled", checkTokenBudget(segMem).budgetPct)
-				}
-			}
-		}
-
-		// Build messages for LLM (will use segmented memory if configured)
+		// Build messages for LLM (will use segmented memory if configured).
+		// Nothing counts tokens on the normal path — the provider's refusal is
+		// the only relief trigger (HLD §11).
 		messages := session.GetMessages()
 
 		// === FEATURE INTEGRATION: Soft Reminders ===
@@ -2271,6 +2281,30 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 
 		// Call LLM
 		llmResp, err := a.chatWithRetry(ctx, messages, tools)
+		if err != nil && errors.Is(err, llm.ErrContextTooLong) {
+			// HLD §5.2 step 12: the provider's positively-identified refusal is
+			// the ONLY relief trigger. Run releasePressure once, recompile, and
+			// send ONCE more; a second refusal ends the turn with the
+			// recoverable error carrying {estimate, target}.
+			if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+				estimate, target := segMem.ReleasePressure(ctx)
+				zap.L().Info("context too long: relief pass complete, resending once",
+					zap.String("session_id", session.ID),
+					zap.Int("estimate_tokens", estimate),
+					zap.Int("target_tokens", target))
+				messages = session.GetMessages()
+				llmResp, err = a.chatWithRetry(ctx, messages, tools)
+				if err != nil && errors.Is(err, llm.ErrContextTooLong) {
+					zap.L().Error("context too long after relief: turn ends",
+						zap.String("session_id", session.ID),
+						zap.Int("estimate_tokens", estimate),
+						zap.Int("target_tokens", target),
+						zap.Error(err))
+					return nil, recovery.buildRecoverableError("context_exhausted", err, "",
+						map[string]any{"estimate": estimate, "target": target})
+				}
+			}
+		}
 		if err != nil {
 			span.AddEvent("turn.llm_failed", map[string]interface{}{
 				"turn":  turnCount,
@@ -2350,14 +2384,10 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 						})
 						span.RecordError(err)
 
-						// Tier 1: attempt self-healing before propagating.
+						// The output-token CB error propagates on the existing
+						// recoverable channel WITHOUT touching context — a CB
+						// trip is not a context decision (blueprint A5).
 						if recovery != nil {
-							if segMem, ok := session.SegmentedMem.(TrimableMemory); ok {
-								recovered, _ := recovery.recoverOutputTokenCB(ctx, session, segMem, failureTracker, threshold)
-								if recovered {
-									continue
-								}
-							}
 							return nil, recovery.buildRecoverableError("output_token_circuit_breaker", err, "rewind_and_retry", map[string]any{"threshold": threshold})
 						}
 						return nil, fmt.Errorf("output token circuit breaker: %w", err)
@@ -3567,15 +3597,6 @@ func (a *Agent) SetSharedMemoryThreshold(threshold int64) {
 	// offload bound, the persist-time row bound, and the retrieval page bound.
 	if a.memory != nil && threshold > 0 {
 		a.memory.SetThresholdBytes(threshold)
-	}
-}
-
-// SetMaxToolResults configures how many tool results to keep in the conversation kernel.
-// 0 = use default (5). Propagates to the memory manager for new sessions.
-func (a *Agent) SetMaxToolResults(n int) {
-	a.maxToolResults = n
-	if a.memory != nil {
-		a.memory.SetMaxToolResults(n)
 	}
 }
 

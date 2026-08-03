@@ -50,6 +50,16 @@ type SessionStorage interface {
 	// Tool executions
 	SaveToolExecution(ctx context.Context, sessionID string, exec ToolExecution) error
 
+	// Relief transactions (HLD §5.2 — write-once flags, one transaction per
+	// operation, set only inside releasePressure):
+	//
+	// MarkEvicted sets evicted=true on the given rows in one transaction.
+	MarkEvicted(ctx context.Context, sessionID string, seqs []int64) error
+	// FoldMessages writes summary version n (snapshot_type='fold', content =
+	// JSON {"n","text"}) and sets the region's folded flags in ONE transaction
+	// (HLD §5.4.6) — a fold never stands in memory without its row.
+	FoldMessages(ctx context.Context, sessionID string, seqs []int64, n int, text string) error
+
 	// Memory snapshots
 	SaveMemorySnapshot(ctx context.Context, sessionID, snapshotType, content string, tokenCount int) error
 	LoadMemorySnapshots(ctx context.Context, sessionID string, snapshotType string, limit int) ([]MemorySnapshot, error)

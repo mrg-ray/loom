@@ -1310,6 +1310,101 @@ func (s *SessionStore) ListSessions(ctx context.Context) ([]string, error) {
 	return sessionIDs, nil
 }
 
+// MarkEvicted sets evicted=1 on the given rows in one transaction (relief
+// operation; HLD §5.2). Flags are write-once — no code path clears them.
+func (s *SessionStore) MarkEvicted(ctx context.Context, sessionID string, seqs []int64) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	ctx, span := s.tracer.StartSpan(ctx, "session_store.mark_evicted")
+	defer s.tracer.EndSpan(span)
+	span.SetAttribute("session_id", sessionID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to begin evict transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	query, args := seqUpdateQuery("UPDATE messages SET evicted = 1 WHERE session_id = ? AND id IN", sessionID, seqs)
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to mark evicted: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to commit evict transaction: %w", err)
+	}
+	span.SetAttribute("rows", fmt.Sprintf("%d", len(seqs)))
+	return nil
+}
+
+// FoldMessages writes summary version n (snapshot_type='fold', content = JSON
+// {"n","text"}) and sets the region's folded flags in ONE transaction (HLD
+// §5.4.6) — never a fold that evaporates on reload.
+func (s *SessionStore) FoldMessages(ctx context.Context, sessionID string, seqs []int64, n int, text string) error {
+	ctx, span := s.tracer.StartSpan(ctx, "session_store.fold_messages")
+	defer s.tracer.EndSpan(span)
+	span.SetAttribute("session_id", sessionID)
+	span.SetAttribute("version", fmt.Sprintf("%d", n))
+
+	content, err := json.Marshal(map[string]interface{}{"n": n, "text": text})
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to marshal fold snapshot: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to begin fold transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO memory_snapshots (session_id, snapshot_type, content, token_count, created_at)
+		 VALUES (?, 'fold', ?, ?, ?)`,
+		sessionID, string(content), tokenFigure(len(text)), time.Now().Unix(),
+	); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to insert fold snapshot: %w", err)
+	}
+
+	if len(seqs) > 0 {
+		query, args := seqUpdateQuery("UPDATE messages SET folded = 1 WHERE session_id = ? AND id IN", sessionID, seqs)
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to set folded flags: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to commit fold transaction: %w", err)
+	}
+	span.SetAttribute("rows", fmt.Sprintf("%d", len(seqs)))
+	return nil
+}
+
+// seqUpdateQuery builds "prefix (?, ?, …)" with sessionID + seqs as args.
+func seqUpdateQuery(prefix, sessionID string, seqs []int64) (string, []interface{}) {
+	placeholders := make([]string, len(seqs))
+	args := make([]interface{}, 0, len(seqs)+1)
+	args = append(args, sessionID)
+	for i, seq := range seqs {
+		placeholders[i] = "?"
+		args = append(args, seq)
+	}
+	return prefix + " (" + strings.Join(placeholders, ", ") + ")", args
+}
+
 // SaveMemorySnapshot persists a memory snapshot (L2 summary) to the database.
 // This is used by the swap layer to archive L2 summaries when they exceed the token limit.
 func (s *SessionStore) SaveMemorySnapshot(ctx context.Context, sessionID, snapshotType, content string, tokenCount int) error {
