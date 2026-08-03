@@ -16,7 +16,6 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"sync"
 	"time"
 
@@ -73,8 +72,7 @@ type Memory struct {
 	// orchestrator and the per-session tool ledger). After a restart replay,
 	// the restore walk calls these to reconstruct a session's runtime state
 	// from its durable messages. nil hooks disable the corresponding re-fire.
-	restoreActivateSkill          func(sessionID, skillName string) // re-activate a loaded skill + wire its required tools
-	restoreRegisterDisclosureTool func(sessionID, toolName string)  // re-register a first-need disclosure tool
+	restoreActivateSkill func(sessionID, skillName string) // re-activate a loaded skill + wire its required tools
 
 	// Per-mutation debug carrier, forwarded to each SegmentedMemory this manager
 	// builds and read by the restore re-fire pass. nil or off is a no-op.
@@ -143,17 +141,17 @@ func (m *Memory) SetCompressionProfile(profile *CompressionProfile) {
 	m.compressionProfile = profile
 }
 
-// SetRestoreReFireHooks wires the callbacks the restore replay uses to rebuild
+// SetRestoreReFireHooks wires the callback the restore replay uses to rebuild
 // a session's runtime state from its durable messages: activateSkill re-fires a
-// load marker (no-evict activation + required-tool wiring), and
-// registerDisclosureTool re-registers a first-need disclosure tool implied by a
-// durable error/large-result record. The agent layer supplies them because they
-// touch the skill orchestrator and the per-session tool ledger.
-func (m *Memory) SetRestoreReFireHooks(activateSkill func(sessionID, skillName string), registerDisclosureTool func(sessionID, toolName string)) {
+// load marker (no-evict activation + required-tool wiring). The agent layer
+// supplies it because it touches the skill orchestrator and the per-session
+// tool ledger. Disclosure re-fire is deleted (HLD §8): refs never survive a
+// turn, so there is nothing to re-advertise on restore, and the error store is
+// gone.
+func (m *Memory) SetRestoreReFireHooks(activateSkill func(sessionID, skillName string)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.restoreActivateSkill = activateSkill
-	m.restoreRegisterDisclosureTool = registerDisclosureTool
 }
 
 // SetContextDebug injects the per-mutation debug carrier. It is forwarded to
@@ -315,7 +313,6 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 			var restoreSnapshot []Message
 			var replayInto *SegmentedMemory
 			var activateSkill func(sessionID, skillName string)
-			var registerDisclosureTool func(sessionID, toolName string)
 			if needsReplay {
 				if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok {
 					replayInto = segMem
@@ -323,7 +320,6 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 				restoreSnapshot = make([]Message, len(session.Messages))
 				copy(restoreSnapshot, session.Messages)
 				activateSkill = m.restoreActivateSkill
-				registerDisclosureTool = m.restoreRegisterDisclosureTool
 			}
 			m.sessions[sessionID] = session
 			m.mu.Unlock()
@@ -339,8 +335,8 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 			// Restore re-fire runs after replay and outside the lock,
 			// reconstructing skill activations and disclosure tools from the
 			// durable snapshot.
-			if activateSkill != nil || registerDisclosureTool != nil {
-				m.reFireOnRestore(sessionID, restoreSnapshot, activateSkill, registerDisclosureTool, ctxDebug)
+			if activateSkill != nil {
+				m.reFireOnRestore(sessionID, restoreSnapshot, activateSkill, ctxDebug)
 			}
 			return session
 		}
@@ -430,11 +426,9 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 // skills as a live one.
 func (m *Memory) reFireOnRestore(sessionID string, messages []Message,
 	activateSkill func(sessionID, skillName string),
-	registerDisclosureTool func(sessionID, toolName string),
 	ctxDebug *contextDebug,
 ) {
 	loadsReactivated := 0
-	toolsReregistered := 0
 	for i := range messages {
 		msg := messages[i]
 		if msg.Role != "tool" {
@@ -453,27 +447,6 @@ func (m *Memory) reFireOnRestore(sessionID string, messages []Message,
 				}
 			}
 		}
-
-		if registerDisclosureTool == nil {
-			continue
-		}
-
-		// Stored-error record ⇒ get_error_details. The error disclosure path
-		// names this tool in the record's rendered content exactly when it
-		// stored the error and advertised the tool live.
-		if strings.Contains(msg.Content, "get_error_details") {
-			registerDisclosureTool(sessionID, "get_error_details")
-			toolsReregistered++
-		}
-
-		// Stored large-result reference ⇒ query_tool_result: either a
-		// pre-stored DataReference, or the offload summary the large-result
-		// path renders when it stores a result in shared memory.
-		if (msg.ToolResult != nil && msg.ToolResult.DataReference != nil) ||
-			strings.Contains(msg.Content, "stored in memory") {
-			registerDisclosureTool(sessionID, "query_tool_result")
-			toolsReregistered++
-		}
 	}
 
 	// Mutation-debug: the runtime state this restore pass reconstructed.
@@ -482,8 +455,7 @@ func (m *Memory) reFireOnRestore(sessionID string, messages []Message,
 		zap.L().Debug("context mutation: restore re-fire",
 			zap.String("session_id", sessionID),
 			zap.Int("turn", ctxDebug.turn(sessionID)),
-			zap.Int("loads_reactivated", loadsReactivated),
-			zap.Int("tools_reregistered", toolsReregistered))
+			zap.Int("loads_reactivated", loadsReactivated))
 	}
 }
 

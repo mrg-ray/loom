@@ -71,7 +71,6 @@ type Registry struct {
 	onReload     ReloadCallback         // Callback when config changes
 
 	// Agent dependencies (injected by server)
-	errorStore        ErrorStore                 // For error tracking and retrieval
 	permissionChecker *shuttle.PermissionChecker // For permission validation
 	artifactStore     interface{}                // artifacts.Store for workspace tool
 
@@ -145,7 +144,6 @@ type RegistryConfig struct {
 	ToolRegistry *toolregistry.Registry // Tool search registry for dynamic tool discovery
 
 	// Agent dependencies (injected by server)
-	ErrorStore        ErrorStore                 // For error tracking and retrieval
 	PermissionChecker *shuttle.PermissionChecker // For permission validation
 	ArtifactStore     interface{}                // artifacts.Store for workspace tool
 
@@ -209,7 +207,6 @@ func NewRegistry(config RegistryConfig) (*Registry, error) {
 		tracer:            config.Tracer,
 		sessionStore:      config.SessionStore,
 		toolRegistry:      config.ToolRegistry,
-		errorStore:        config.ErrorStore,
 		permissionChecker: config.PermissionChecker,
 		artifactStore:     config.ArtifactStore,
 	}
@@ -871,10 +868,6 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 	}
 
 	// Inject server dependencies if available
-	if r.errorStore != nil {
-		opts = append(opts, WithErrorStore(r.errorStore))
-	}
-
 	if r.permissionChecker != nil {
 		opts = append(opts, WithPermissionChecker(r.permissionChecker))
 	}

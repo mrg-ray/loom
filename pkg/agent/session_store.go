@@ -785,6 +785,96 @@ func (s *SessionStore) loadMessagesLocked(ctx context.Context, sessionID string)
 	return messages, nil
 }
 
+// ListMessagesBySeqRange is the by-seq span read backing recall (HLD §6):
+// rows lo..hi inclusive for one session, seq (messages.id) ascending. Folded
+// rows are included — a summary-cited span is exactly what recall retrieves.
+func (s *SessionStore) ListMessagesBySeqRange(ctx context.Context, sessionID string, lo, hi int64) ([]Message, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "session_store.list_messages_by_seq_range")
+	defer s.tracer.EndSpan(span)
+	span.SetAttribute("session_id", sessionID)
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `
+		SELECT id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, timestamp, token_count, cost_usd, evicted, folded, turn
+		FROM messages
+		WHERE session_id = ? AND id BETWEEN ? AND ?
+		ORDER BY id ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, sessionID, lo, hi)
+	if err != nil {
+		span.RecordError(err)
+		return nil, fmt.Errorf("failed to query message span: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var messages []Message
+	for rows.Next() {
+		var msg Message
+		var msgID int64
+		var toolCallsJSON, toolUseID, toolResultJSON *string
+		var sessionContext, agentID sql.NullString
+		var timestamp int64
+		var evicted, folded int
+
+		if err := rows.Scan(
+			&msgID,
+			&msg.Role,
+			&msg.Content,
+			&toolCallsJSON,
+			&toolUseID,
+			&toolResultJSON,
+			&sessionContext,
+			&agentID,
+			&timestamp,
+			&msg.TokenCount,
+			&msg.CostUSD,
+			&evicted,
+			&folded,
+			&msg.Turn,
+		); err != nil {
+			span.RecordError(err)
+			return nil, fmt.Errorf("failed to scan message: %w", err)
+		}
+		msg.Evicted = evicted != 0
+		msg.Folded = folded != 0
+		msg.ID = fmt.Sprintf("%d", msgID)
+		msg.Timestamp = time.Unix(timestamp, 0)
+		if sessionContext.Valid {
+			msg.SessionContext = types.SessionContext(sessionContext.String)
+		} else {
+			msg.SessionContext = types.SessionContextDirect
+		}
+		if agentID.Valid {
+			msg.AgentID = agentID.String
+		}
+		if toolCallsJSON != nil {
+			if err := json.Unmarshal([]byte(*toolCallsJSON), &msg.ToolCalls); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal tool calls: %w", err)
+			}
+		}
+		if toolUseID != nil {
+			msg.ToolUseID = *toolUseID
+		}
+		if toolResultJSON != nil {
+			if err := json.Unmarshal([]byte(*toolResultJSON), &msg.ToolResult); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal tool result: %w", err)
+			}
+		}
+		messages = append(messages, msg)
+	}
+
+	if err := rows.Err(); err != nil {
+		span.RecordError(err)
+		return nil, fmt.Errorf("error iterating message span: %w", err)
+	}
+
+	span.SetAttribute("message_count", fmt.Sprintf("%d", len(messages)))
+	return messages, nil
+}
+
 // LoadAgentSessions loads all sessions for a given agent.
 // Returns sessions where agent_id matches the provided agentID.
 func (s *SessionStore) LoadAgentSessions(ctx context.Context, agentID string) ([]string, error) {

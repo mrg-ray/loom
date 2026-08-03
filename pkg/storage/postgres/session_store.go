@@ -447,6 +447,39 @@ func (s *SessionStore) LoadMessages(ctx context.Context, sessionID string) ([]ag
 	return messages, nil
 }
 
+// ListMessagesBySeqRange is the by-seq span read backing recall (HLD §6):
+// rows lo..hi inclusive for one session, seq (messages.id) ascending. Folded
+// rows are included — a summary-cited span is exactly what recall retrieves.
+func (s *SessionStore) ListMessagesBySeqRange(ctx context.Context, sessionID string, lo, hi int64) ([]agent.Message, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.list_messages_by_seq_range")
+	defer s.tracer.EndSpan(span)
+	span.SetAttribute("session_id", sessionID)
+
+	var messages []agent.Message
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		userID := UserIDFromContext(ctx)
+		rows, err := tx.Query(ctx, `
+		SELECT id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, timestamp, token_count, cost_usd, evicted, folded, turn
+		FROM messages
+		WHERE session_id = $1 AND user_id = $2 AND deleted_at IS NULL AND id BETWEEN $3 AND $4
+		ORDER BY id ASC`,
+			sessionID, userID, lo, hi,
+		)
+		if err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to query message span: %w", err)
+		}
+		defer rows.Close()
+
+		messages, err = scanMessages(rows)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
 // LoadMessagesForAgent retrieves all messages created by a specific agent.
 func (s *SessionStore) LoadMessagesForAgent(ctx context.Context, agentID string) ([]agent.Message, error) {
 	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.load_messages_for_agent")

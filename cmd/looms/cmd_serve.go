@@ -1093,7 +1093,6 @@ func runServe(cmd *cobra.Command, args []string) {
 
 	// Extract individual stores from backend
 	store := storageBackend.SessionStorage()
-	errorStore := storageBackend.ErrorStore()
 
 	// Extract graph memory store if available (optional interface)
 	var graphMemoryStore memory.GraphMemoryStore
@@ -1614,7 +1613,6 @@ func runServe(cmd *cobra.Command, args []string) {
 					agent.WithName(cfg.Name),
 					agent.WithTracer(tracer),
 					agent.WithMemory(memory),
-					agent.WithErrorStore(errorStore),
 					// Note: SharedMemory added via registry.SetSharedMemory() after it's created
 				}
 
@@ -2495,16 +2493,6 @@ func runServe(cmd *cobra.Command, args []string) {
 		logger.Info("SharedMemoryStore injected into agent", zap.String("agent", name))
 	}
 
-	// SQL Result Store for queryable large SQL results (from storage backend)
-	sqlResultStore := storageBackend.ResultStore()
-	if sqlResultStore != nil {
-		// Inject SQL result store into all agents
-		for name, ag := range agents {
-			ag.SetSQLResultStore(sqlResultStore)
-			logger.Info("SQLResultStore injected into agent", zap.String("agent", name))
-		}
-	}
-
 	// Inject MCP manager into multi-agent server if available
 	if mcpManager != nil {
 		configPath := filepath.Join(loomconfig.GetLoomDataDir(), "looms.yaml")
@@ -2999,7 +2987,6 @@ func runServe(cmd *cobra.Command, args []string) {
 			agentOpts := []agent.Option{
 				agent.WithTracer(tracer),
 				agent.WithMemory(memory),
-				agent.WithErrorStore(errorStore),
 				agent.WithSharedMemory(globalSharedMem), // Use global storage SharedMemoryStore, not communication one
 				agent.WithConfig(cfg),
 			}

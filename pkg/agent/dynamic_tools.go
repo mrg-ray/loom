@@ -49,7 +49,6 @@ type DynamicToolDiscovery struct {
 	logger       *zap.Logger
 	cache        map[string]shuttle.Tool // Intent → Tool cache
 	mu           sync.RWMutex
-	sqlStore     storage.ResultStore        // For storing large SQL results
 	sharedMemory *storage.SharedMemoryStore // For storing other large data
 }
 
@@ -63,14 +62,8 @@ func NewDynamicToolDiscovery(mcpMgr *manager.Manager, logger *zap.Logger) *Dynam
 		mcpMgr:       mcpMgr,
 		logger:       logger,
 		cache:        make(map[string]shuttle.Tool),
-		sqlStore:     nil, // Will be set by SetSQLResultStore if needed
 		sharedMemory: nil, // Will be set by SetSharedMemory if needed
 	}
-}
-
-// SetSQLResultStore configures SQL result store for dynamically discovered tools.
-func (d *DynamicToolDiscovery) SetSQLResultStore(store storage.ResultStore) {
-	d.sqlStore = store
 }
 
 // SetSharedMemory configures shared memory store for dynamically discovered tools.
@@ -129,9 +122,6 @@ func (d *DynamicToolDiscovery) Search(ctx context.Context, intent string) (shutt
 				mcpAdapter := adapter.NewMCPToolAdapter(client, tool, serverName)
 
 				// CRITICAL: Inject storage backends for progressive disclosure
-				if d.sqlStore != nil {
-					mcpAdapter.SetSQLResultStore(d.sqlStore)
-				}
 				if d.sharedMemory != nil {
 					mcpAdapter.SetSharedMemory(d.sharedMemory)
 				}
@@ -182,9 +172,6 @@ func (d *DynamicToolDiscovery) SearchMultiple(ctx context.Context, intent string
 				mcpAdapter := adapter.NewMCPToolAdapter(client, tool, serverName)
 
 				// CRITICAL: Inject storage backends for progressive disclosure
-				if d.sqlStore != nil {
-					mcpAdapter.SetSQLResultStore(d.sqlStore)
-				}
 				if d.sharedMemory != nil {
 					mcpAdapter.SetSharedMemory(d.sharedMemory)
 				}
@@ -294,9 +281,6 @@ func (a *Agent) EnableDynamicDiscovery(mcpMgr *manager.Manager) {
 
 	// CRITICAL: Inject storage backends for progressive disclosure
 	// This ensures dynamically discovered tools can detect and store SQL results properly
-	if a.sqlResultStore != nil {
-		a.dynamicDiscovery.SetSQLResultStore(a.sqlResultStore)
-	}
 	if a.sharedMemory != nil {
 		a.dynamicDiscovery.SetSharedMemory(a.sharedMemory)
 	}

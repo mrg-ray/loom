@@ -121,11 +121,6 @@ func (a *Agent) RegisterMCPTools(ctx context.Context, config MCPServerConfig) er
 		mcpAdapter := adapter.NewMCPToolAdapterWithConfig(config.Client, mcpTool, config.Name, truncationConfig)
 
 		// CRITICAL: Inject storage backends for progressive disclosure
-		// This enables SQL results to go directly to SQLResultStore (queryable)
-		// instead of SharedMemoryStore (unqueryable json_object)
-		if a.sqlResultStore != nil {
-			mcpAdapter.SetSQLResultStore(a.sqlResultStore)
-		}
 		if a.sharedMemory != nil {
 			mcpAdapter.SetSharedMemory(a.sharedMemory)
 		}
@@ -248,9 +243,6 @@ func (a *Agent) RegisterMCPServer(ctx context.Context, mcpMgr *manager.Manager, 
 		mcpAdapter := adapter.NewMCPToolAdapterWithConfig(client, tool, serverName, truncationConfig)
 
 		// CRITICAL: Inject storage backends for progressive disclosure
-		if a.sqlResultStore != nil {
-			mcpAdapter.SetSQLResultStore(a.sqlResultStore)
-		}
 		if a.sharedMemory != nil {
 			mcpAdapter.SetSharedMemory(a.sharedMemory)
 		}
@@ -319,9 +311,6 @@ func (a *Agent) RegisterMCPTool(ctx context.Context, mcpMgr *manager.Manager, se
 			mcpAdapter := adapter.NewMCPToolAdapterWithConfig(client, tool, serverName, truncationConfig)
 
 			// CRITICAL: Inject storage backends for progressive disclosure
-			if a.sqlResultStore != nil {
-				mcpAdapter.SetSQLResultStore(a.sqlResultStore)
-			}
 			if a.sharedMemory != nil {
 				mcpAdapter.SetSharedMemory(a.sharedMemory)
 			}

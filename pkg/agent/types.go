@@ -15,6 +15,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync"
 	"time"
@@ -74,9 +75,6 @@ type Agent struct {
 
 	// Memory manager for conversation history
 	memory *Memory
-
-	// Error store for tool execution errors (supports error submission channel pattern)
-	errorStore ErrorStore
 
 	// LLM provider for generating responses
 	llm LLMProvider
@@ -139,9 +137,6 @@ type Agent struct {
 	// Shared memory store for large tool results (prevents context overflow)
 	sharedMemory *storage.SharedMemoryStore
 
-	// SQL result store for queryable large SQL results
-	sqlResultStore storage.ResultStore
-
 	// Configurable shared memory threshold for large tool results.
 	// -1 = use storage.DefaultSharedMemoryThreshold; 0 = always reference; >0 = byte threshold
 	sharedMemoryThreshold int64
@@ -151,6 +146,12 @@ type Agent struct {
 
 	// Token counter for accurate token estimation
 	tokenCounter *TokenCounter
+
+	// In-turn SQLite databases backing query_tool_result's sql mode (HLD §7.1):
+	// per (session, message), lazily built, dropped at turn end. Guarded by
+	// inTurnSQLMu.
+	inTurnSQL   map[inTurnSQLKey]*sql.DB
+	inTurnSQLMu sync.Mutex
 
 	// Workflow communication context (injected dynamically for workflow agents)
 	workflowCommContext *WorkflowCommunicationContext

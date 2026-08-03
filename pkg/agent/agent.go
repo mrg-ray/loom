@@ -216,22 +216,8 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		a.executor.SetSharedMemory(a.sharedMemory, threshold)
 	}
 
-	// PROGRESSIVE DISCLOSURE: get_error_details tool is registered dynamically after first error
-	// See formatToolResult() for automatic registration when error store is used
-
 	// The findings channel is retired: neither the record_finding tool nor automatic
 	// extraction exists. Durable notes belong in the conversation or in the stores.
-
-	// Initialize SQL result store for queryable large SQL results
-	// This allows filtering/aggregating SQL results without context blowout
-	sqlResultStore, err := storage.NewSQLResultStore(&storage.SQLResultStoreConfig{
-		DBPath:     storage.GetDefaultLoomDBPath(),
-		TTLSeconds: 3600, // 1 hour TTL
-	})
-	if err == nil {
-		// Store reference for later use (e.g., when SetSharedMemory() is called)
-		a.sqlResultStore = sqlResultStore
-	}
 
 	// shell_execute is no longer auto-registered in NewAgent
 	// Agents that need shell_execute must explicitly list it in config.Tools.Builtin
@@ -240,21 +226,18 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	// Note: tool_search is registered by AgentRegistry when a global tool registry is available
 	// Individual agents don't have access to the global tool registry during construction
 
-	// get_tool_result is NOT registered: the inline summary already carries preview,
-	// schema, size and retrieval hints, and query_tool_result covers pagination and
-	// SQL filters. The type and its offload exemption remain for callers that wire it
-	// directly.
-	//
-	// v1.0.1: Now returns only metadata, accepts both memory and SQL stores
-	// if a.sharedMemory != nil || sqlResultStore != nil {
-	// 	a.tools.Register(NewGetToolResultTool(a.sharedMemory, sqlResultStore))
-	// }
-	// If SQL store fails to initialize, just log and continue without it
-	// (SQL results will fall back to shared memory)
-
-	// NOTE: conversation_memory tool uses progressive disclosure.
-	// It registers automatically after first L2 swap event.
-	// See checkAndRegisterConversationMemoryTool() for implementation.
+	// query_tool_result serves THIS TURN's memory by message_id (HLD §7.1) and
+	// recall retrieves summary-cited conversation spans (HLD §6). Both are
+	// registered always — their doors are printed by the offload stub and the
+	// summary's citations respectively.
+	queryTool := shuttle.Tool(NewQueryToolResultTool(a))
+	recallTool := shuttle.Tool(NewRecallTool(a))
+	if a.prompts != nil {
+		queryTool = shuttle.NewPromptAwareTool(queryTool, a.prompts, "tools.query_tool_result")
+		recallTool = shuttle.NewPromptAwareTool(recallTool, a.prompts, "tools.recall")
+	}
+	a.tools.Register(queryTool)
+	a.tools.Register(recallTool)
 
 	// Register graph_memory tool eagerly (not progressive disclosure).
 	// Unlike conversation_memory which depends on runtime state (L2 swap events),
@@ -402,7 +385,7 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	// implied by durable error/large-result records, so a restored session
 	// advertises the same tools and reports the same active skills as a live one.
 	if a.memory != nil {
-		a.memory.SetRestoreReFireHooks(a.reFireSkillActivation, a.reFireDisclosureTool)
+		a.memory.SetRestoreReFireHooks(a.reFireSkillActivation)
 		a.memory.SetContextDebug(a.ctxDebug)
 	}
 
@@ -441,44 +424,6 @@ func (a *Agent) reFireSkillActivation(sessionID, skillName string) {
 	}
 	a.skillOrchestrator.ActivatePinned(sessionID, skill, "restore_replay", skillName, 1.0)
 	a.enforceRequiredSkillTools(sessionID)
-}
-
-// reFireDisclosureTool re-registers a first-need disclosure tool into a session
-// during restore replay, mirroring the progressive-disclosure path in
-// formatToolResult: it registers the tool definition once when the backing
-// store is wired and the builtin is not suppressed, then advertises it into the
-// session's ledger. Called from the memory manager's restore walk for each
-// durable error (get_error_details) or large-result (query_tool_result) record.
-func (a *Agent) reFireDisclosureTool(sessionID, toolName string) {
-	// Same ordering hazard as reFireSkillActivation: a restore may precede the
-	// first turn, and this path scopes tools into a session's ledger.
-	a.captureBaseTools()
-	switch toolName {
-	case "get_error_details":
-		if a.errorStore == nil || a.isBuiltinToolSuppressed("get_error_details") {
-			return
-		}
-		if !a.tools.IsRegistered("get_error_details") {
-			errorTool := shuttle.Tool(NewGetErrorDetailsTool(a.errorStore))
-			if a.prompts != nil {
-				errorTool = shuttle.NewPromptAwareTool(errorTool, a.prompts, "tools.get_error_details")
-			}
-			a.tools.Register(errorTool)
-		}
-		a.registerSessionTool(sessionID, "get_error_details")
-	case "query_tool_result":
-		if (a.sqlResultStore == nil && a.sharedMemory == nil) || a.isBuiltinToolSuppressed("query_tool_result") {
-			return
-		}
-		if !a.tools.IsRegistered("query_tool_result") {
-			queryTool := shuttle.Tool(NewQueryToolResultTool(a.sqlResultStore, a.sharedMemory))
-			if a.prompts != nil {
-				queryTool = shuttle.NewPromptAwareTool(queryTool, a.prompts, "tools.query_tool_result")
-			}
-			a.tools.Register(queryTool)
-		}
-		a.registerSessionTool(sessionID, "query_tool_result")
-	}
 }
 
 // Option is a functional option for configuring an Agent.
@@ -617,15 +562,6 @@ func WithSystemPrompt(prompt string) Option {
 func WithDescription(description string) Option {
 	return func(a *Agent) {
 		a.config.Description = description
-	}
-}
-
-// WithErrorStore enables error submission channel for storing full error details.
-// When set, tool execution errors are stored in SQLite with only summaries sent to LLM.
-// The get_error_details built-in tool is automatically registered.
-func WithErrorStore(store ErrorStore) Option {
-	return func(a *Agent) {
-		a.errorStore = store
 	}
 }
 
@@ -1831,6 +1767,7 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
 		segMem.DropTurnPayloads()
 	}
+	a.dropInTurnSQLite(sessionID)
 
 	// Add user message to history. ContentBlocks (when present) take precedence
 	// over Content as providers build the request, so multimodal content reaches
@@ -1876,10 +1813,6 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	// Run conversation loop
 	response, err := a.runConversationLoop(agentCtx)
 
-	// Progressive disclosure: Check if conversation_memory tool should be registered
-	// (after first L2 swap event)
-	a.checkAndRegisterConversationMemoryTool(sessionID)
-	a.checkAndRegisterSessionMemoryTool(ctx)
 	a.checkAndRegisterGraphMemoryTool()
 	a.checkAndRegisterTaskBoardTool()
 
@@ -3009,93 +2942,6 @@ func (a *Agent) analyzeError(result *shuttle.Result, err error) *fabric.ErrorAna
 // formatToolResult formats a tool execution result for inclusion in conversation.
 // Uses the error submission channel pattern: stores full errors in SQLite and provides
 // error references to the LLM, allowing the agent to fetch full details on demand.
-// checkAndRegisterConversationMemoryTool implements progressive disclosure for conversation_memory tool.
-// Registers the tool after first L2 swap event, when long-term storage becomes relevant.
-func (a *Agent) checkAndRegisterConversationMemoryTool(sessionID string) {
-	if a.isBuiltinToolSuppressed("conversation_memory") {
-		return
-	}
-	// Skip if tool already registered
-	if a.tools.IsRegistered("conversation_memory") {
-		return
-	}
-
-	// Get session
-	session, exists := a.memory.GetSession(sessionID)
-	if !exists {
-		return
-	}
-
-	// Check if this session supports swap
-	segMem, ok := session.SegmentedMem.(*SegmentedMemory)
-	if !ok || !segMem.IsSwapEnabled() {
-		return
-	}
-
-	// Check if swap has occurred
-	evictions, _ := segMem.GetSwapStats()
-	if evictions == 0 {
-		return // No swap yet, tool not needed
-	}
-
-	// Progressive disclosure: Register conversation_memory tool
-	conversationMemoryTool := shuttle.Tool(NewConversationMemoryTool(a.memory))
-	if a.prompts != nil {
-		conversationMemoryTool = shuttle.NewPromptAwareTool(
-			conversationMemoryTool,
-			a.prompts,
-			"tools.memory.conversation_memory_description",
-		)
-	}
-	a.tools.Register(conversationMemoryTool)
-
-	// Tool will be available in next LLM call
-	// The tool's discovery is natural - agent sees it in tool list when needed
-}
-
-// checkAndRegisterSessionMemoryTool implements progressive disclosure for session_memory tool.
-// Registers the tool after 3+ sessions accumulate, when session management becomes relevant.
-func (a *Agent) checkAndRegisterSessionMemoryTool(ctx context.Context) {
-	if a.isBuiltinToolSuppressed("session_memory") {
-		return
-	}
-	// Skip if tool already registered
-	if a.tools.IsRegistered("session_memory") {
-		return
-	}
-
-	// Skip if no session store
-	if a.memory.store == nil {
-		return
-	}
-
-	// Get agent ID from current agent
-	agentID := a.config.Name // Use agent name as ID
-
-	// Count sessions for this agent using caller's context for proper RLS propagation
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	sessionIDs, err := a.memory.store.LoadAgentSessions(ctx, agentID)
-	if err != nil || len(sessionIDs) < 3 {
-		return // Not enough sessions yet, tool not needed
-	}
-
-	// Progressive disclosure: Register session_memory tool
-	sessionMemoryTool := shuttle.Tool(NewSessionMemoryTool(a.memory.store, a.memory))
-	if a.prompts != nil {
-		sessionMemoryTool = shuttle.NewPromptAwareTool(
-			sessionMemoryTool,
-			a.prompts,
-			"tools.memory.session_memory_description",
-		)
-	}
-	a.tools.Register(sessionMemoryTool)
-
-	// Tool will be available in next LLM call
-	// The tool's discovery is natural - agent sees it in tool list when needed
-}
-
 // checkAndRegisterGraphMemoryTool implements progressive disclosure for the graph_memory tool.
 // Registers the tool immediately if a graph memory store is configured and enabled.
 //
@@ -3758,32 +3604,6 @@ func (a *Agent) SetSharedMemory(sharedMemory *storage.SharedMemoryStore) {
 		a.memory.SetSharedMemory(sharedMemory)
 	}
 
-	// GetToolResultTool is not registered (see NewAgent), so there is nothing to
-	// re-point at the new store here. Kept for callers that wire it directly.
-	// if sharedMemory != nil && a.tools != nil {
-	// 	a.tools.Register(NewGetToolResultTool(sharedMemory, a.sqlResultStore))
-	// }
-
-	// Re-register QueryToolResultTool with the new shared memory instance if it was already registered
-	// This fixes the bug where query_tool_result was using an old singleton store while
-	// tool_search was storing data in the new multi-agent server's shared memory
-	// Note: With progressive disclosure, this tool is only registered after first large result
-	if sharedMemory != nil && a.sqlResultStore != nil && a.tools != nil {
-		if a.tools.IsRegistered("query_tool_result") {
-			// Re-register with new shared memory instance
-			queryTool := shuttle.Tool(NewQueryToolResultTool(a.sqlResultStore, sharedMemory))
-			if a.prompts != nil {
-				queryTool = shuttle.NewPromptAwareTool(queryTool, a.prompts, "tools.query_tool_result")
-			}
-			a.tools.Register(queryTool)
-		}
-	}
-}
-
-// SetSQLResultStore configures SQL result store for this agent.
-func (a *Agent) SetSQLResultStore(sqlStore storage.ResultStore) {
-	// Store reference for later use
-	a.sqlResultStore = sqlStore
 }
 
 // SetReferenceStore configures the reference store for inter-agent communication.

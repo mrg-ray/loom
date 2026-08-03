@@ -35,6 +35,11 @@ type SessionStorage interface {
 	// and turn back onto msg.
 	SaveMessage(ctx context.Context, sessionID string, msg *Message, turnStart bool) error
 	LoadMessages(ctx context.Context, sessionID string) ([]Message, error)
+
+	// ListMessagesBySeqRange is the by-seq span read backing recall (HLD §6):
+	// rows lo..hi inclusive, session-filtered, seq ascending, folded included
+	// (a summary-cited span is exactly what recall retrieves).
+	ListMessagesBySeqRange(ctx context.Context, sessionID string, lo, hi int64) ([]Message, error)
 	LoadMessagesForAgent(ctx context.Context, agentID string) ([]Message, error)
 	LoadMessagesFromParentSession(ctx context.Context, sessionID string) ([]Message, error)
 
