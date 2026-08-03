@@ -218,7 +218,7 @@ func TestSemanticSearch_RealLLMConversation(t *testing.T) {
 			Content:   agentAMessage.Content,
 			Timestamp: time.Now(),
 		}
-		err = store.SaveMessage(ctx, sessionID, dbMsg)
+		err = store.SaveMessage(ctx, sessionID, &dbMsg, false)
 		require.NoError(t, err)
 		stats.TotalMessages++
 
@@ -280,7 +280,7 @@ func TestSemanticSearch_RealLLMConversation(t *testing.T) {
 					ToolCalls: assistantResponse.ToolCalls,
 					Timestamp: time.Now(),
 				}
-				err = store.SaveMessage(ctx, sessionID, dbMsg)
+				err = store.SaveMessage(ctx, sessionID, &dbMsg, false)
 				require.NoError(t, err)
 				stats.TotalMessages++
 				stats.ToolCallCount++
@@ -331,7 +331,7 @@ func TestSemanticSearch_RealLLMConversation(t *testing.T) {
 						ToolResult: result,
 						Timestamp:  time.Now(),
 					}
-					err = store.SaveMessage(ctx, sessionID, dbToolResultMsg)
+					err = store.SaveMessage(ctx, sessionID, &dbToolResultMsg, false)
 					require.NoError(t, err)
 					stats.TotalMessages++
 				}
@@ -357,7 +357,7 @@ func TestSemanticSearch_RealLLMConversation(t *testing.T) {
 				Content:   responseWithLabel,
 				Timestamp: time.Now(),
 			}
-			err = store.SaveMessage(ctx, sessionID, dbMsg)
+			err = store.SaveMessage(ctx, sessionID, &dbMsg, false)
 			require.NoError(t, err)
 			stats.TotalMessages++
 
@@ -418,7 +418,7 @@ func TestSemanticSearch_RealLLMConversation(t *testing.T) {
 					Content:   nextMessage.Content,
 					Timestamp: time.Now(),
 				}
-				err = store.SaveMessage(ctx, sessionID, dbNextMsg)
+				err = store.SaveMessage(ctx, sessionID, &dbNextMsg, false)
 				require.NoError(t, err)
 				stats.TotalMessages++
 			}

@@ -130,7 +130,7 @@ func TestSwapLayerRetrieval(t *testing.T) {
 	}
 
 	for _, msg := range messages {
-		err := store.SaveMessage(ctx, sessionID, msg)
+		err := store.SaveMessage(ctx, sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 
@@ -191,7 +191,7 @@ func TestSwapLayerPromotion(t *testing.T) {
 	}
 
 	for _, msg := range messages {
-		err := store.SaveMessage(ctx, sessionID, msg)
+		err := store.SaveMessage(ctx, sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 

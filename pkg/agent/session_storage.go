@@ -27,7 +27,13 @@ type SessionStorage interface {
 	LoadAgentSessions(ctx context.Context, agentID string) ([]string, error)
 
 	// Messages
-	SaveMessage(ctx context.Context, sessionID string, msg Message) error
+	//
+	// SaveMessage derives the row's turn at insert (HLD §4.5): the turnStart
+	// site — the Chat()-entry user message, the only turn-incrementing event —
+	// computes turn = COALESCE(MAX(turn),0)+1 for the session; every other site
+	// uses the same subquery without the +1. The store stamps the derived seq
+	// and turn back onto msg.
+	SaveMessage(ctx context.Context, sessionID string, msg *Message, turnStart bool) error
 	LoadMessages(ctx context.Context, sessionID string) ([]Message, error)
 	LoadMessagesForAgent(ctx context.Context, agentID string) ([]Message, error)
 	LoadMessagesFromParentSession(ctx context.Context, sessionID string) ([]Message, error)

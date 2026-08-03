@@ -129,6 +129,19 @@ type Message struct {
 	// Defaults to "default-user" for SQLite backends.
 	UserID string
 
+	// Turn is the session turn this message belongs to. Derived at insert,
+	// exactly like the seq — no counter, no session state (HLD §4.5): the
+	// Chat()-entry persist site is the only turn-incrementing event.
+	Turn int64
+
+	// Evicted marks a tool row whose payload was shed under context pressure.
+	// Write-once true, set only inside releasePressure; no code path clears it.
+	Evicted bool
+
+	// Folded marks a row folded into the session summary. Write-once true, set
+	// only inside releasePressure; folded rows are filtered at the database read.
+	Folded bool
+
 	// Timestamp when the message was created
 	Timestamp time.Time
 

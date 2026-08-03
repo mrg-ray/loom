@@ -149,16 +149,18 @@ func TestSessionMemoryTool_List(t *testing.T) {
 	require.NoError(t, store.SaveSession(ctx, session3))
 
 	// Add messages to sessions
-	require.NoError(t, store.SaveMessage(ctx, "session-1", Message{
+	msg1 := Message{
 		Role:      "user",
 		Content:   "Message in session 1",
 		Timestamp: time.Now(),
-	}))
-	require.NoError(t, store.SaveMessage(ctx, "session-2", Message{
+	}
+	require.NoError(t, store.SaveMessage(ctx, "session-1", &msg1, false))
+	msg2 := Message{
 		Role:      "user",
 		Content:   "Message in session 2",
 		Timestamp: time.Now(),
-	}))
+	}
+	require.NoError(t, store.SaveMessage(ctx, "session-2", &msg2, false))
 
 	// List sessions for test-agent
 	//nolint:staticcheck // SA1029: using string key to match tool API contract

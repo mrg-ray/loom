@@ -1852,28 +1852,28 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	// Get or create session with agent metadata for proper ReferenceStore namespacing
 	session := a.memory.GetOrCreateSessionWithAgent(ctx, sessionID, a.config.Name, "")
 
+	// TURN END for the previous turn (HLD §1, §7.3): a new turn is starting —
+	// in-memory full payloads are replaced by their persisted-row form and the
+	// in-turn SQLite is dropped. Rows and summary versions are all that remains.
+	if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+		segMem.DropTurnPayloads()
+	}
+
 	// Add user message to history. ContentBlocks (when present) take precedence
 	// over Content as providers build the request, so multimodal content reaches
 	// the model; Content remains the canonical text for persistence and providers
 	// without multimodal support.
-	userMsg := Message{
+	//
+	// This is the Chat()-entry persist site — the only turn-incrementing event
+	// (HLD §4.5) — hence turnStart=true.
+	userMsg := a.appendMessage(ctx, session, Message{
 		Role:          "user",
 		Content:       userMessage,
 		ContentBlocks: p.contentBlocks,
 		AgentID:       a.id, // Track which agent received this message
 		Timestamp:     time.Now(),
-	}
-	session.AddMessage(ctx, userMsg)
-
-	// Persist message if storage configured
-	if err := a.memory.PersistMessage(ctx, sessionID, userMsg); err != nil {
-		// Log error but don't fail the request
-		zap.L().Warn("Failed to persist message",
-			zap.String("session_id", sessionID),
-			zap.String("role", userMsg.Role),
-			zap.Error(err))
-		span.RecordError(err)
-	}
+	}, true)
+	_ = userMsg
 
 	// Fire graph memory extraction on the incoming user message immediately,
 	// in parallel with the LLM processing it. The user message is where the
@@ -1942,24 +1942,16 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	}
 
 	// Add assistant response to history
-	assistantMsg := Message{
+	a.appendMessage(ctx, session, Message{
 		Role:       "assistant",
 		Content:    response.Content,
 		AgentID:    a.id, // Track which agent generated this response
 		Timestamp:  time.Now(),
 		TokenCount: response.Usage.TotalTokens,
 		CostUSD:    response.Usage.CostUSD,
-	}
-	session.AddMessage(ctx, assistantMsg)
+	}, false)
 
-	// Persist final message and session
-	if err := a.memory.PersistMessage(ctx, sessionID, assistantMsg); err != nil {
-		zap.L().Warn("Failed to persist message",
-			zap.String("session_id", sessionID),
-			zap.String("role", assistantMsg.Role),
-			zap.Error(err))
-		span.RecordError(err)
-	}
+	// Persist session
 	if err := a.memory.PersistSession(ctx, session); err != nil {
 		zap.L().Warn("Failed to persist session",
 			zap.String("session_id", sessionID),
@@ -2031,6 +2023,32 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	})
 
 	return response, nil
+}
+
+// appendMessage is the arrival seam (HLD §1): it stamps the message's turn,
+// persists its durable row once (write rules §4; the store's RETURNING-derived
+// seq and turn override the stamp), and appends the message to the session in
+// full natural form. Nothing is examined, sized, flagged, or transformed at
+// arrival. turnStart is true only at the Chat() entry — the only
+// turn-incrementing event (HLD §4.5). Persist failures are logged, never fatal.
+func (a *Agent) appendMessage(ctx context.Context, session *Session, msg Message, turnStart bool) Message {
+	// In-memory derivation, identical arithmetic to the store's subquery — the
+	// only derivation for storeless sessions and unpersisted rows.
+	t := sessionCurrentTurn(session)
+	if turnStart {
+		t++
+	}
+	msg.Turn = t
+
+	if err := a.memory.PersistMessage(ctx, session.ID, &msg, turnStart); err != nil {
+		zap.L().Warn("Failed to persist message",
+			zap.String("session_id", session.ID),
+			zap.String("role", msg.Role),
+			zap.Error(err))
+	}
+
+	session.AddMessage(ctx, msg)
+	return msg
 }
 
 // Response represents the agent's response to a user message.
@@ -2475,18 +2493,12 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			if strings.TrimSpace(llmResp.Content) == "" && !emptyRetried {
 				// One-shot retry: nudge the LLM to produce a response.
 				emptyRetried = true
-				nudgeMsg := Message{
+				a.appendMessage(ctx, session, Message{
 					Role:      "user",
 					Content:   "Your previous response was empty. Please provide a response summarizing what you found or explaining what went wrong.",
 					AgentID:   a.id,
 					Timestamp: time.Now(),
-				}
-				session.AddMessage(ctx, nudgeMsg)
-				if err := a.memory.PersistMessage(ctx, session.ID, nudgeMsg); err != nil {
-					zap.L().Warn("Failed to persist empty-response nudge",
-						zap.String("session_id", session.ID),
-						zap.Error(err))
-				}
+				}, false)
 				continue // re-enter conversation loop for one more LLM call
 			}
 
@@ -2551,7 +2563,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		}
 
 		// Add assistant message with tool calls to history FIRST (required by Anthropic API)
-		assistantMsg := Message{
+		a.appendMessage(ctx, session, Message{
 			Role:       "assistant",
 			Content:    llmResp.Content,
 			ToolCalls:  llmResp.ToolCalls,
@@ -2559,18 +2571,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			TokenCount: llmResp.Usage.TotalTokens,
 			CostUSD:    llmResp.Usage.CostUSD,
 			Timestamp:  time.Now(),
-		}
-		session.AddMessage(ctx, assistantMsg)
-
-		// Persist assistant message with tool calls (critical for observability)
-		if err := a.memory.PersistMessage(ctx, session.ID, assistantMsg); err != nil {
-			// Log error but don't fail the request
-			zap.L().Warn("Failed to persist message",
-				zap.String("session_id", session.ID),
-				zap.String("role", assistantMsg.Role),
-				zap.Error(err))
-			span.RecordError(err)
-		}
+		}, false)
 
 		// Execute tool calls with per-turn cap and deduplication.
 		// MaxIterations limits how many tool calls are executed from a single
@@ -2598,7 +2599,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 
 			// Per-turn cap: skip remaining calls with an error result
 			if turnToolCount >= maxPerTurn {
-				skipMsg := Message{
+				a.appendMessage(ctx, session, Message{
 					Role:      "tool",
 					Content:   fmt.Sprintf("turn_limit_exceeded — per-turn tool call limit (%d) reached. Synthesize a response from the results you have.", maxPerTurn),
 					ToolUseID: toolCall.ID,
@@ -2611,13 +2612,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 					},
 					AgentID:   a.id,
 					Timestamp: time.Now(),
-				}
-				session.AddMessage(ctx, skipMsg)
-				if persistErr := a.memory.PersistMessage(ctx, session.ID, skipMsg); persistErr != nil {
-					zap.L().Warn("Failed to persist turn-limit skip message",
-						zap.String("session_id", session.ID),
-						zap.Error(persistErr))
-				}
+				}, false)
 				toolExecutionCount++
 				continue
 			}
@@ -2625,20 +2620,14 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			// Deduplication: compute canonical key from tool name + sorted JSON input
 			dedupKey := toolCall.Name + "|" + canonicalJSON(toolCall.Input)
 			if cachedResult, ok := turnDedup[dedupKey]; ok {
-				dedupMsg := Message{
+				a.appendMessage(ctx, session, Message{
 					Role:       "tool",
 					Content:    a.formatToolResult(ctx, session.ID, toolCall.Name, cachedResult, nil) + "\n(deduplicated — reused result from identical call in this turn)",
 					ToolUseID:  toolCall.ID,
 					ToolResult: cachedResult,
 					AgentID:    a.id,
 					Timestamp:  time.Now(),
-				}
-				session.AddMessage(ctx, dedupMsg)
-				if persistErr := a.memory.PersistMessage(ctx, session.ID, dedupMsg); persistErr != nil {
-					zap.L().Warn("Failed to persist dedup message",
-						zap.String("session_id", session.ID),
-						zap.Error(persistErr))
-				}
+				}, false)
 				allToolExecutions = append(allToolExecutions, ToolExecution{
 					ToolName: toolCall.Name,
 					Input:    toolCall.Input,
@@ -2816,25 +2805,14 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			}
 
 			// Add tool result to conversation
-			toolMsg := Message{
+			a.appendMessage(ctx, session, Message{
 				Role:       "tool",
 				Content:    formattedResult,
 				ToolUseID:  toolCall.ID, // Store ID for Bedrock/Anthropic format conversion
 				ToolResult: result,
 				AgentID:    a.id, // Track which agent executed this tool
 				Timestamp:  time.Now(),
-			}
-			session.AddMessage(ctx, toolMsg)
-
-			// Persist message
-			if persistErr := a.memory.PersistMessage(ctx, session.ID, toolMsg); persistErr != nil {
-				// Log but don't fail
-				zap.L().Warn("Failed to persist message",
-					zap.String("session_id", session.ID),
-					zap.String("role", toolMsg.Role),
-					zap.Error(persistErr))
-				toolSpan.RecordError(persistErr)
-			}
+			}, false)
 
 			// If the tool signaled a text_body sidecar (e.g. manage_skills(load)
 			// — the skill body belongs under the user-instruction slot, not the
@@ -2873,13 +2851,9 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// multi-load turn (rare but possible) still stamps its bodies in
 		// call order.
 		for _, sidecar := range pendingSidecars {
-			session.AddMessage(ctx, sidecar)
-			if persistErr := a.memory.PersistMessage(ctx, session.ID, sidecar); persistErr != nil {
-				zap.L().Warn("Failed to persist text_body sidecar message",
-					zap.String("session_id", session.ID),
-					zap.String("role", sidecar.Role),
-					zap.Error(persistErr))
-			}
+			// Sidecars never advance the turn and hold no special status beyond
+			// that (HLD §4.5).
+			a.appendMessage(ctx, session, sidecar, false)
 		}
 	}
 
@@ -2890,23 +2864,12 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 	// Add a synthesis request to the conversation
 	// Include explicit format instructions since they may have been compressed in context
 	synthesisPrompt := "You must provide your final answer NOW with whatever information you have gathered so far. Summarize your findings: what actions were taken, what results were produced, and any remaining steps the user would need to complete manually. Be concise and actionable. You MUST respond with text — do not return an empty response."
-	synthesisMsg := Message{
+	a.appendMessage(ctx, session, Message{
 		Role:      "user",
 		Content:   synthesisPrompt,
 		AgentID:   a.id, // Track which agent created this synthesis request
 		Timestamp: time.Now(),
-	}
-	session.AddMessage(ctx, synthesisMsg)
-
-	// Persist synthesis message for observability
-	if err := a.memory.PersistMessage(ctx, session.ID, synthesisMsg); err != nil {
-		// Log error but don't fail the request
-		zap.L().Warn("Failed to persist message",
-			zap.String("session_id", session.ID),
-			zap.String("role", synthesisMsg.Role),
-			zap.Error(err))
-		span.RecordError(err)
-	}
+	}, false)
 
 	// Make final LLM call WITHOUT tools to force synthesis
 	finalResp, err := a.chatWithRetry(ctx, session.GetMessages(), nil)
@@ -4239,6 +4202,11 @@ func (a *Agent) SetSharedMemoryThreshold(threshold int64) {
 			eff = threshold
 		}
 		a.executor.SetSharedMemory(a.sharedMemory, eff)
+	}
+	// One value, three roles (HLD §5.1): the same bound is the compile-time
+	// offload bound, the persist-time row bound, and the retrieval page bound.
+	if a.memory != nil && threshold > 0 {
+		a.memory.SetThresholdBytes(threshold)
 	}
 }
 

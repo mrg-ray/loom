@@ -102,6 +102,10 @@ type SegmentedMemory struct {
 	// Shared memory for large data
 	sharedMemory *storage.SharedMemoryStore // Shared memory store for large tool results (optional)
 
+	// threshold is the one threshold value (HLD §5.1): compile-time offload
+	// bound, persist-time row bound, retrieval page bound. Bytes.
+	threshold int
+
 	// Observability
 	tracer observability.Tracer // Tracer for error logging and metrics (optional)
 
@@ -199,6 +203,7 @@ func NewSegmentedMemoryWithCompression(romContent string, maxContextTokens, rese
 		minL1Messages:      profile.MinL1Messages,         // Use profile value (minimum for recency)
 		maxToolResults:     5,                             // Keep last 5 tool results in kernel for richer context
 		compressionProfile: profile,                       // Store profile for adaptive compression
+		threshold:          int(storage.DefaultSharedMemoryThreshold),
 	}
 
 	// Initialize all per-layer token caches
@@ -284,6 +289,69 @@ func (sm *SegmentedMemory) SetMaxL2Tokens(maxTokens int) {
 	defer sm.mu.Unlock()
 	if maxTokens > 0 {
 		sm.maxL2Tokens = maxTokens
+	}
+}
+
+// SetThreshold sets the one threshold value in bytes (HLD §5.1: one value,
+// three roles — compile-time offload bound, persist-time row bound, retrieval
+// page bound). Non-positive values keep the current threshold.
+func (sm *SegmentedMemory) SetThreshold(bytes int64) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if bytes > 0 {
+		sm.threshold = int(bytes)
+	}
+}
+
+// Threshold returns the configured threshold in bytes.
+func (sm *SegmentedMemory) Threshold() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.threshold
+}
+
+// CurrentTurn returns T — the session's current turn number: max(Turn) over L1
+// (HLD §5.1). Derived, never counted.
+func (sm *SegmentedMemory) CurrentTurn() int64 {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.currentTurnLocked()
+}
+
+// currentTurnLocked computes max(Turn) over L1. Must hold lock.
+func (sm *SegmentedMemory) currentTurnLocked() int64 {
+	var t int64
+	for i := range sm.l1Messages {
+		if sm.l1Messages[i].Turn > t {
+			t = sm.l1Messages[i].Turn
+		}
+	}
+	return t
+}
+
+// DropTurnPayloads is the TURN END drop (HLD §1, §7.3; blueprint A1), run when
+// a new turn starts: every prior-turn tool message's in-memory content is
+// replaced by its persisted-row form (truncated core + tail), so a long-lived
+// loom agent does not grow by one payload set per turn. Cloud gets this for
+// free by being stateless.
+func (sm *SegmentedMemory) DropTurnPayloads() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.threshold <= 0 {
+		return
+	}
+	changed := false
+	for i := range sm.l1Messages {
+		m := &sm.l1Messages[i]
+		if m.Role == "tool" && len(m.Content) > sm.threshold {
+			m.Content = truncateToolRowContent(m.Content, sm.threshold)
+			changed = true
+		}
+	}
+	if changed {
+		sm.l1Dirty = true
+		sm.updateTokenCount()
+		sm.tokenCountDirty = false
 	}
 }
 

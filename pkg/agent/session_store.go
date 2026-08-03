@@ -119,6 +119,9 @@ func (s *SessionStore) initSchema() error {
 		timestamp INTEGER NOT NULL,
 		token_count INTEGER DEFAULT 0,
 		cost_usd REAL DEFAULT 0,
+		evicted INTEGER NOT NULL DEFAULT 0,
+		folded INTEGER NOT NULL DEFAULT 0,
+		turn INTEGER NOT NULL DEFAULT 0,
 		FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 	);
 
@@ -269,12 +272,19 @@ func (s *SessionStore) initSchema() error {
 		"parent_session_id": "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL",
 		"session_context":   "ALTER TABLE messages ADD COLUMN session_context TEXT DEFAULT 'direct'",
 		"message_agent_id":  "ALTER TABLE messages ADD COLUMN agent_id TEXT", // Track which agent created each message
+		// Context-compilation columns (HLD §4.5): seq is the existing
+		// messages.id; evicted/folded are the write-once relief flags; turn is
+		// derived at insert. Legacy rows keep turn = 0 (uniformly old).
+		"evicted": "ALTER TABLE messages ADD COLUMN evicted INTEGER NOT NULL DEFAULT 0",
+		"folded":  "ALTER TABLE messages ADD COLUMN folded INTEGER NOT NULL DEFAULT 0",
+		"turn":    "ALTER TABLE messages ADD COLUMN turn INTEGER NOT NULL DEFAULT 0",
 	}
 
 	for columnName, migration := range agentMemoryMigrations {
 		// Check if column exists
 		var table string
-		if columnName == "session_context" || columnName == "message_agent_id" {
+		if columnName == "session_context" || columnName == "message_agent_id" ||
+			columnName == "evicted" || columnName == "folded" || columnName == "turn" {
 			table = "messages"
 		} else {
 			table = "sessions"
@@ -536,7 +546,11 @@ func (s *SessionStore) LoadSession(ctx context.Context, sessionID string) (*Sess
 }
 
 // SaveMessage persists a message to the database.
-func (s *SessionStore) SaveMessage(ctx context.Context, sessionID string, msg Message) error {
+// The row's turn is derived at insert (HLD §4.5): turnStart — passed only by
+// the Chat()-entry persist site, the only turn-incrementing event — adds 1 to
+// the session's MAX(turn); every other site stamps MAX(turn) unchanged. The
+// derived seq (messages.id) and turn are stamped back onto msg.
+func (s *SessionStore) SaveMessage(ctx context.Context, sessionID string, msg *Message, turnStart bool) error {
 	ctx, span := s.tracer.StartSpan(ctx, "session_store.save_message")
 	defer s.tracer.EndSpan(span)
 	span.SetAttribute("session_id", sessionID)
@@ -587,12 +601,27 @@ func (s *SessionStore) SaveMessage(ctx context.Context, sessionID string, msg Me
 		agentID = &msg.AgentID
 	}
 
+	// turn is derived at insert — no counter, no session state (HLD §4.5).
+	turnIncrement := 0
+	if turnStart {
+		turnIncrement = 1
+	}
+	evicted := 0
+	if msg.Evicted {
+		evicted = 1
+	}
+	folded := 0
+	if msg.Folded {
+		folded = 1
+	}
+
 	query := `
-		INSERT INTO messages (session_id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, timestamp, token_count, cost_usd)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO messages (session_id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, timestamp, token_count, cost_usd, evicted, folded, turn)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			(SELECT COALESCE(MAX(turn), 0) + ? FROM messages WHERE session_id = ?))
 	`
 
-	_, err := s.db.ExecContext(ctx, query,
+	res, err := s.db.ExecContext(ctx, query,
 		sessionID,
 		msg.Role,
 		msg.Content,
@@ -604,12 +633,33 @@ func (s *SessionStore) SaveMessage(ctx context.Context, sessionID string, msg Me
 		msg.Timestamp.Unix(),
 		msg.TokenCount,
 		msg.CostUSD,
+		evicted,
+		folded,
+		turnIncrement,
+		sessionID,
 	)
 
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to save message: %w", err)
 	}
+
+	// Stamp the derived seq and turn onto the in-memory message — wiring needed
+	// anyway so the offload stub can print its message_id (HLD §4.5). The
+	// read-back runs under the store lock; a session is single-writer and
+	// messages persist sequentially (the bundled SQLite predates RETURNING).
+	seq, err := res.LastInsertId()
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to read message seq: %w", err)
+	}
+	var turn int64
+	if err := s.db.QueryRowContext(ctx, "SELECT turn FROM messages WHERE id = ?", seq).Scan(&turn); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to read message turn: %w", err)
+	}
+	msg.ID = fmt.Sprintf("%d", seq)
+	msg.Turn = turn
 
 	span.SetAttribute("tokens", fmt.Sprintf("%d", msg.TokenCount))
 	span.SetAttribute("cost_usd", fmt.Sprintf("%.4f", msg.CostUSD))
@@ -640,11 +690,15 @@ func (s *SessionStore) LoadMessages(ctx context.Context, sessionID string) ([]Me
 // This avoids re-entrant RLock deadlocks when called from methods that already hold the lock
 // (e.g., LoadSession).
 func (s *SessionStore) loadMessagesLocked(ctx context.Context, sessionID string) ([]Message, error) {
+	// Folded rows are filtered at the database read (HLD §5.2 step 4) — they
+	// are never loaded into memory at all; the summary stands in for them.
+	// Replay order is the seq (messages.id), which also removes the old
+	// equal-timestamp nondeterminism of timestamp ordering.
 	query := `
-		SELECT id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, timestamp, token_count, cost_usd
+		SELECT id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, timestamp, token_count, cost_usd, evicted, folded, turn
 		FROM messages
-		WHERE session_id = ?
-		ORDER BY timestamp ASC
+		WHERE session_id = ? AND folded = 0
+		ORDER BY id ASC
 	`
 
 	rows, err := s.db.QueryContext(ctx, query, sessionID)
@@ -660,6 +714,7 @@ func (s *SessionStore) loadMessagesLocked(ctx context.Context, sessionID string)
 		var toolCallsJSON, toolUseID, toolResultJSON *string
 		var sessionContext, agentID sql.NullString
 		var timestamp int64
+		var evicted, folded int
 
 		err := rows.Scan(
 			&msgID,
@@ -673,7 +728,12 @@ func (s *SessionStore) loadMessagesLocked(ctx context.Context, sessionID string)
 			&timestamp,
 			&msg.TokenCount,
 			&msg.CostUSD,
+			&evicted,
+			&folded,
+			&msg.Turn,
 		)
+		msg.Evicted = evicted != 0
+		msg.Folded = folded != 0
 
 		// Populate session_context from nullable database value
 		if sessionContext.Valid {

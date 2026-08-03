@@ -149,7 +149,7 @@ func TestConversationMemoryTool_RecallAction(t *testing.T) {
 			Timestamp: time.Now(),
 		}
 		segMem.AddMessage(context.Background(), msg)
-		err := store.SaveMessage(context.Background(), sessionID, msg)
+		err := store.SaveMessage(context.Background(), sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 
@@ -303,7 +303,7 @@ func TestConversationMemoryTool_RecallLimits(t *testing.T) {
 			Timestamp: time.Now(),
 		}
 		segMem.AddMessage(context.Background(), msg)
-		err := store.SaveMessage(context.Background(), sessionID, msg)
+		err := store.SaveMessage(context.Background(), sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 
@@ -373,7 +373,7 @@ func TestConversationMemoryTool_SearchAction(t *testing.T) {
 			Timestamp: time.Now(),
 		}
 		segMem.AddMessage(context.Background(), msg)
-		err := store.SaveMessage(context.Background(), sessionID, msg)
+		err := store.SaveMessage(context.Background(), sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 
@@ -503,7 +503,7 @@ func TestConversationMemoryTool_SearchAgentScope(t *testing.T) {
 				Timestamp: time.Now(),
 			}
 			segMem.AddMessage(context.Background(), msg)
-			err := store.SaveMessage(context.Background(), sessionID, msg)
+			err := store.SaveMessage(context.Background(), sessionID, &msg, false)
 			require.NoError(t, err)
 		}
 	}
@@ -567,7 +567,7 @@ func TestConversationMemoryTool_SearchAllScope(t *testing.T) {
 			Timestamp: time.Now(),
 		}
 		segMem.AddMessage(context.Background(), msg)
-		err := store.SaveMessage(context.Background(), sessionID, msg)
+		err := store.SaveMessage(context.Background(), sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 
@@ -628,7 +628,7 @@ func TestConversationMemoryTool_ClearAction(t *testing.T) {
 			Timestamp: time.Now(),
 		}
 		segMem.AddMessage(context.Background(), msg)
-		err := store.SaveMessage(context.Background(), sessionID, msg)
+		err := store.SaveMessage(context.Background(), sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 
@@ -800,7 +800,7 @@ func TestConversationMemoryTool_Integration(t *testing.T) {
 			Timestamp: time.Now(),
 		}
 		segMem.AddMessage(context.Background(), msg)
-		err := store.SaveMessage(context.Background(), sessionID, msg)
+		err := store.SaveMessage(context.Background(), sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 
@@ -888,7 +888,7 @@ func TestConversationMemoryTool_SearchLimitEnforcement(t *testing.T) {
 			Timestamp: time.Now(),
 		}
 		segMem.AddMessage(context.Background(), msg)
-		err := store.SaveMessage(context.Background(), sessionID, msg)
+		err := store.SaveMessage(context.Background(), sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 

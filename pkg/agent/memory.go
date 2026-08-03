@@ -60,6 +60,7 @@ type Memory struct {
 	compressionProfile   *CompressionProfile        // Optional compression profile for new sessions (nil = use defaults)
 	compressor           MemoryCompressor           // Optional LLM compressor for L2 compaction (nil = heuristic fallback)
 	maxToolResults       int                        // Max tool results in kernel (0 = use default)
+	thresholdBytes       int64                      // Offload / row / page bound in bytes (0 = default; HLD §5.1)
 
 	// Real-time observers for cross-session updates
 	// Map of agentID -> list of observers
@@ -170,6 +171,49 @@ func (m *Memory) SetMaxToolResults(n int) {
 	m.maxToolResults = n
 }
 
+// SetThresholdBytes sets the one threshold value (HLD §5.1: compile-time offload
+// bound, persist-time row bound, retrieval page bound) for existing and future
+// sessions.
+func (m *Memory) SetThresholdBytes(bytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if bytes <= 0 {
+		return
+	}
+	m.thresholdBytes = bytes
+	for _, session := range m.sessions {
+		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+			segMem.SetThreshold(bytes)
+		}
+	}
+}
+
+// thresholdOrDefault returns the configured threshold, else the default bound.
+func (m *Memory) thresholdOrDefault() int {
+	if m.thresholdBytes > 0 {
+		return int(m.thresholdBytes)
+	}
+	return int(storage.DefaultSharedMemoryThreshold)
+}
+
+// sessionCurrentTurn returns T — the session's current turn number — derived as
+// max(Turn) over the session's messages (HLD §5.1; no counter, no session state).
+func sessionCurrentTurn(session *Session) int64 {
+	if session == nil {
+		return 0
+	}
+	if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+		return segMem.CurrentTurn()
+	}
+	var t int64
+	for _, m := range session.GetMessages() {
+		if m.Turn > t {
+			t = m.Turn
+		}
+	}
+	return t
+}
+
 // GetOrCreateSession gets an existing session or creates a new one.
 // If persistent storage is configured, attempts to load from database first.
 // ctx is threaded through to storage operations to enable RLS user isolation.
@@ -215,6 +259,7 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 	compProfile := m.compressionProfile
 	compressor := m.compressor
 	maxToolRes := m.maxToolResults
+	thresholdBytes := m.thresholdBytes
 	logger := m.logger
 	ctxDebug := m.ctxDebug
 	m.mu.RUnlock()
@@ -335,6 +380,9 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 	}
 	if maxToolRes > 0 {
 		segMem.maxToolResults = maxToolRes
+	}
+	if thresholdBytes > 0 {
+		segMem.SetThreshold(thresholdBytes)
 	}
 	segMem.SetContextDebug(ctxDebug)
 
@@ -499,7 +547,10 @@ func (m *Memory) ensureSessionMemory(session *Session, sessionID string,
 		if maxToolRes > 0 {
 			segMem.maxToolResults = maxToolRes
 		}
-		// m.mu is held by the caller, so m.ctxDebug is read safely here.
+		// m.mu is held by the caller, so m.thresholdBytes is read safely here.
+		if m.thresholdBytes > 0 {
+			segMem.SetThreshold(m.thresholdBytes)
+		}
 		segMem.SetContextDebug(m.ctxDebug)
 	}
 }
@@ -558,12 +609,15 @@ func (m *Memory) PersistSession(ctx context.Context, session *Session) error {
 	return m.store.SaveSession(ctx, session)
 }
 
-// PersistMessage saves a message to persistent storage if configured.
-func (m *Memory) PersistMessage(ctx context.Context, sessionID string, msg Message) error {
+// PersistMessage saves a message's durable row, once, if storage is configured
+// (write rules, HLD §4). The store derives the row's seq and turn at insert and
+// stamps both back onto msg; turnStart is passed only by the Chat()-entry
+// persist site — the only turn-incrementing event.
+func (m *Memory) PersistMessage(ctx context.Context, sessionID string, msg *Message, turnStart bool) error {
 	if m.store == nil {
 		return nil // No-op if no store configured
 	}
-	return m.store.SaveMessage(ctx, sessionID, msg)
+	return m.store.SaveMessage(ctx, sessionID, msg, turnStart)
 }
 
 // PersistToolExecution saves a tool execution to persistent storage if configured.
@@ -670,18 +724,21 @@ func (m *Memory) AddMessage(ctx context.Context, sessionID string, msg Message) 
 		return
 	}
 
-	// Add message to session (this handles SegmentedMem if configured)
-	session.AddMessage(ctx, msg)
-
-	// Persist to store if configured
+	// Stamp the turn (derived, never counted — HLD §4.5) and persist BEFORE the
+	// in-memory append so the store's RETURNING-derived seq and turn land on the
+	// copy that enters L1.
+	msg.Turn = sessionCurrentTurn(session)
 	if m.store != nil {
-		if err := m.store.SaveMessage(ctx, sessionID, msg); err != nil {
+		if err := m.store.SaveMessage(ctx, sessionID, &msg, false); err != nil {
 			m.logger.Warn("Failed to persist message to storage",
 				zap.String("session_id", sessionID),
 				zap.String("role", msg.Role),
 				zap.Error(err))
 		}
 	}
+
+	// Add message to session (this handles SegmentedMem if configured)
+	session.AddMessage(ctx, msg)
 
 	// Notify observers if session has an agent_id
 	if session.AgentID != "" {

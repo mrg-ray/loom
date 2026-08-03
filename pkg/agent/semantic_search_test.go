@@ -59,7 +59,7 @@ func TestSearchMessages_BasicQuery(t *testing.T) {
 	}
 
 	for _, msg := range messages {
-		err := store.SaveMessage(ctx, sessionID, msg)
+		err := store.SaveMessage(ctx, sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 
@@ -116,10 +116,10 @@ func TestSearchMessages_SessionFiltering(t *testing.T) {
 	msg1 := Message{Role: "user", Content: "Database query optimization techniques", Timestamp: time.Now()}
 	msg2 := Message{Role: "user", Content: "Database performance tuning guide", Timestamp: time.Now()}
 
-	err = store.SaveMessage(ctx, session1, msg1)
+	err = store.SaveMessage(ctx, session1, &msg1, false)
 	require.NoError(t, err)
 
-	err = store.SaveMessage(ctx, session2, msg2)
+	err = store.SaveMessage(ctx, session2, &msg2, false)
 	require.NoError(t, err)
 
 	// Search in session1 only
@@ -160,7 +160,7 @@ func TestSearchMessages_BM25Ranking(t *testing.T) {
 	}
 
 	for _, msg := range messages {
-		err := store.SaveMessage(ctx, sessionID, msg)
+		err := store.SaveMessage(ctx, sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 
@@ -225,7 +225,7 @@ func TestSearchMessages_NoResults(t *testing.T) {
 
 	// Add a message
 	msg := Message{Role: "user", Content: "Database optimization techniques", Timestamp: time.Now()}
-	err = store.SaveMessage(ctx, sessionID, msg)
+	err = store.SaveMessage(ctx, sessionID, &msg, false)
 	require.NoError(t, err)
 
 	// Search for unrelated content
@@ -399,7 +399,7 @@ func TestSearchMessages_Integration(t *testing.T) {
 	}
 
 	for _, msg := range messages {
-		err := store.SaveMessage(ctx, sessionID, msg)
+		err := store.SaveMessage(ctx, sessionID, &msg, false)
 		require.NoError(t, err)
 	}
 
@@ -451,7 +451,7 @@ func TestSearchMessages_TokenBudget(t *testing.T) {
 		Content:   "This is a very long message that will exceed the token budget when promoted." + string(make([]byte, 2000)),
 		Timestamp: time.Now(),
 	}
-	err = store.SaveMessage(ctx, sessionID, largeMsg)
+	err = store.SaveMessage(ctx, sessionID, &largeMsg, false)
 	require.NoError(t, err)
 
 	// Search and attempt to promote
