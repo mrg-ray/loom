@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -263,48 +262,6 @@ func TestContextDebug_AC2_SkillLoadEmitsDebugLogOn(t *testing.T) {
 		"log carries the active-set delta of the load")
 }
 
-// --- AC3: large-result storage emits a debug log with the switch on ----------
-
-// TestContextDebug_AC3_LargeResultOffloadEmitsDebugLogOn drives the agent offload
-// site (formatToolResult) with a payload above the 64 KiB threshold and the switch
-// on, and asserts the debug log carries the session id + turn, the reference id the
-// result was stored under, and the payload size against the offload threshold. A
-// warm-up provider call advances the per-session turn so the log carries a live
-// turn number rather than the pre-conversation zero.
-func TestContextDebug_AC3_LargeResultOffloadEmitsDebugLogOn(t *testing.T) {
-	const sessionID = "sess-di-ac3"
-	redirectCtxDumpSink(t)
-
-	ag, _ := newDebugRenderAgent(t, true)
-
-	// Warm up the per-session turn counter with one provider call.
-	_, err := ag.Chat(context.Background(), sessionID, "warm up the turn counter")
-	require.NoError(t, err)
-
-	payload := "DI_AC3_START\n" + strings.Repeat("large-result filler line\n", 4000) + "DI_AC3_END"
-	require.Greater(t, len(payload), agentKiB64, "payload is above the 64 KiB threshold")
-
-	logs, restore := captureZap(t)
-	defer restore()
-
-	ctx := newCtxDumpContext(sessionID, observability.NewNoOpTracer(), nil)
-	rendered := ag.formatToolResult(ctx, sessionID, "web_search",
-		&shuttle.Result{Success: true, Data: payload}, nil)
-	require.Contains(t, rendered, "stored in memory", "the large result was stored by reference")
-
-	rec := onlyMutationRecord(t, logs, msgLargeResult)
-
-	assert.Equal(t, sessionID, strField(t, rec, "session_id"), "log carries the session id")
-	assert.GreaterOrEqual(t, intField(t, rec, "turn"), int64(1),
-		"log carries the in-flight turn (>=1 after the warm-up provider call)")
-	assert.NotEmpty(t, strField(t, rec, "reference_id"), "log carries the stored reference id")
-
-	threshold := intField(t, rec, "threshold_bytes")
-	assert.Equal(t, int64(agentKiB64), threshold, "log carries the 64 KiB offload threshold")
-	assert.GreaterOrEqual(t, intField(t, rec, "size_bytes"), threshold,
-		"log carries the payload size, at or above the threshold that triggered offload")
-}
-
 // --- AC4: per-session tool assembly emits a debug log with the switch on ------
 
 // TestContextDebug_AC4_ToolAssemblyEmitsDebugLogOn drives one Chat turn with the
@@ -410,24 +367,6 @@ func TestContextDebug_AC6_SwitchOffEmitsNoDebugLogs(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, activeSkillNames(rig.orch, sessionID), "the skill load still happened")
 		assert.Zero(t, logs.FilterMessage(msgSkillLoad).Len(), "no skill-load log with the switch off")
-	})
-
-	t.Run("large_result", func(t *testing.T) {
-		forceEnvDumpOff(t)
-		const sessionID = "sess-di-ac6-large"
-		ag, _ := newDebugRenderAgent(t, false)
-
-		payload := "AC6_LARGE_START\n" + strings.Repeat("large-result filler line\n", 4000) + "AC6_LARGE_END"
-		require.Greater(t, len(payload), agentKiB64, "payload is above the 64 KiB threshold")
-
-		logs, restore := captureZap(t)
-		defer restore()
-
-		ctx := newCtxDumpContext(sessionID, observability.NewNoOpTracer(), nil)
-		rendered := ag.formatToolResult(ctx, sessionID, "web_search",
-			&shuttle.Result{Success: true, Data: payload}, nil)
-		require.Contains(t, rendered, "stored in memory", "the offload still happened")
-		assert.Zero(t, logs.FilterMessage(msgLargeResult).Len(), "no large-result log with the switch off")
 	})
 
 	t.Run("tool_assembly", func(t *testing.T) {

@@ -149,11 +149,6 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	// Note: Pass instrumented executor via SetExecutor() if you want tool tracing
 	a.executor = shuttle.NewExecutor(a.tools)
 
-	// Wire the executor's large-result offload debug log to this agent's
-	// context-dump switch and turn source. The closures read at log time, so
-	// ordering against config-setting options does not matter.
-	a.executor.SetContextDebug(a.contextDebugEnabled, a.contextDebugTurn)
-
 	// Set permission checker on executor if provided
 	if a.permissionChecker != nil {
 		a.executor.SetPermissionChecker(a.permissionChecker)
@@ -236,14 +231,6 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	if err == nil {
 		// Store reference for later use (e.g., when SetSharedMemory() is called)
 		a.sqlResultStore = sqlResultStore
-
-		// Set on executor so SQL results go to queryable tables
-		if a.executor != nil {
-			a.executor.SetSQLResultStore(sqlResultStore)
-		}
-
-		// PROGRESSIVE DISCLOSURE: query_tool_result tool is registered dynamically after first large result
-		// See formatToolResult() for automatic registration when large results are stored
 	}
 
 	// shell_execute is no longer auto-registered in NewAgent
@@ -264,21 +251,6 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	// }
 	// If SQL store fails to initialize, just log and continue without it
 	// (SQL results will fall back to shared memory)
-
-	// Initialize reference tracker for automatic cleanup (#1: Session-Scoped Reference Pinning)
-	// When sessions end, this ensures all SharedMemory references are released (RefCount decremented).
-	// Without this, references accumulate indefinitely causing memory leaks.
-	if a.sharedMemory != nil {
-		a.refTracker = storage.NewSessionReferenceTracker(a.sharedMemory)
-
-		// Register cleanup hook with SessionStore if persistence is enabled
-		// This decouples reference cleanup from session deletion logic
-		if a.memory != nil {
-			if store := a.memory.GetStore(); store != nil {
-				store.RegisterCleanupHook(a.cleanupSessionReferences)
-			}
-		}
-	}
 
 	// NOTE: conversation_memory tool uses progressive disclosure.
 	// It registers automatically after first L2 swap event.
@@ -3467,473 +3439,42 @@ func (a *Agent) extractSearchQuery(ctx context.Context, userMessage string) stri
 }
 
 func (a *Agent) formatToolResult(ctx Context, sessionID string, toolName string, result *shuttle.Result, err error) string {
-	// Handle execution errors (tool didn't run)
+	// Arrival appends (HLD §1): the result enters the in-memory message WHOLE.
+	// Nothing is examined, sized, flagged, or transformed at arrival — bounding
+	// happens once, at persist (write rules §4), and large-result offload is a
+	// pure render condition of ContextCompilation (§5.2), not an arrival event.
+	_ = ctx
+	_ = sessionID
+	_ = toolName
+
+	// An error result is a result that failed — same rule, no separate error
+	// store (HLD §4.1).
 	if err != nil {
-		errMsg := fmt.Sprintf("%v", err)
-		summary := extractFirstLine(errMsg, 100)
-
-		// Store full error if error store is available
-		if a.errorStore != nil {
-			errorID, storeErr := a.errorStore.Store(ctx, &StoredError{
-				SessionID:    sessionID,
-				ToolName:     toolName,
-				RawError:     json.RawMessage(fmt.Sprintf(`{"message": %q}`, errMsg)),
-				ShortSummary: summary,
-			})
-
-			if storeErr == nil {
-				// Progressive disclosure: advertise get_error_details after the
-				// first error into THIS session, unless the server suppressed it
-				// (tools.none). Register the definition once; the ledger scopes
-				// the advertisement per session.
-				if !a.isBuiltinToolSuppressed("get_error_details") {
-					if !a.tools.IsRegistered("get_error_details") {
-						errorTool := shuttle.Tool(NewGetErrorDetailsTool(a.errorStore))
-						if a.prompts != nil {
-							errorTool = shuttle.NewPromptAwareTool(errorTool, a.prompts, "tools.get_error_details")
-						}
-						a.tools.Register(errorTool)
-					}
-					a.registerSessionTool(sessionID, "get_error_details")
-				}
-
-				// Successfully stored - return reference
-				return fmt.Sprintf(`Tool '%s' failed: %s
-[Error ID: %s]
-📋 Use get_error_details("%s") for complete error information`,
-					toolName,
-					summary,
-					errorID,
-					errorID)
-			}
-			// If storage failed, fall through to truncation
-		}
-
-		// Fallback: truncate if error store unavailable or storage failed
-		return fmt.Sprintf("Error: %s", truncateErrorMessage(errMsg, 500))
+		return fmt.Sprintf("Error: %v", err)
 	}
 
-	// Handle tool execution errors (tool ran but failed)
 	if !result.Success {
 		if result.Error != nil {
-			// Marshal raw error preserving original structure
-			rawError, _ := json.Marshal(result.Error)
-			summary := extractErrorSummary(result.Error)
-
-			// Store full error if error store is available
-			if a.errorStore != nil {
-				errorID, storeErr := a.errorStore.Store(ctx, &StoredError{
-					SessionID:    sessionID,
-					ToolName:     toolName,
-					RawError:     rawError,
-					ShortSummary: summary,
-				})
-
-				if storeErr == nil {
-					// Progressive disclosure: advertise get_error_details after the
-					// first error into THIS session, unless the server suppressed it
-					// (tools.none). Register the definition once; the ledger scopes
-					// the advertisement per session.
-					if !a.isBuiltinToolSuppressed("get_error_details") {
-						if !a.tools.IsRegistered("get_error_details") {
-							errorTool := shuttle.Tool(NewGetErrorDetailsTool(a.errorStore))
-							if a.prompts != nil {
-								errorTool = shuttle.NewPromptAwareTool(errorTool, a.prompts, "tools.get_error_details")
-							}
-							a.tools.Register(errorTool)
-						}
-						a.registerSessionTool(sessionID, "get_error_details")
-					}
-
-					// Successfully stored - return reference
-					return fmt.Sprintf(`Tool '%s' failed: %s
-[Error ID: %s]
-📋 Use get_error_details tool with error_id="%s" for complete error information`,
-						toolName,
-						summary,
-						errorID,
-						errorID)
-				}
-				// If storage failed, fall through to truncation
-			}
-
-			// Fallback: truncate if error store unavailable or storage failed
-			truncatedMsg := truncateErrorMessage(result.Error.Message, 500)
-			return fmt.Sprintf("Tool error: %s - %s", result.Error.Code, truncatedMsg)
+			return fmt.Sprintf("Tool error: %s - %s", result.Error.Code, result.Error.Message)
 		}
 		return "Tool execution failed"
 	}
 
-	// CRITICAL FIX: Pin DataReferences returned by tools (like tool_search)
-	// Tools may create their own references in SharedMemoryStore, and we need to pin them
-	// to prevent LRU eviction while the session is active
-	if result.DataReference != nil && a.refTracker != nil {
-		a.refTracker.PinForSession(sessionID, result.DataReference.Id)
-	}
-
-	// Progressive disclosure: a tool returned a STORED REFERENCE (e.g. an MCP tool
-	// like dbwrite:query that pre-stores a large {columns, rows} result and tells
-	// the model to use query_tool_result). The agent's own large-result path
-	// advertises query_tool_result in formatToolResult, but a pre-stored reference
-	// bypasses that — so advertise it here too, the moment any tool hands back a
-	// reference. Scoped to THIS session's ledger so it appears only where there's
-	// something to page.
-	// query_tool_result reads from EITHER the SQL result store or shared memory,
-	// so advertise it when either is wired. Requiring only the SQL store missed
-	// shared-memory references (e.g. web_search results stored by the executor) —
-	// the agent saw the reference but had no tool to page it.
-	if result.DataReference != nil && (a.sqlResultStore != nil || a.sharedMemory != nil) &&
-		!a.isBuiltinToolSuppressed("query_tool_result") {
-		if !a.tools.IsRegistered("query_tool_result") {
-			queryTool := shuttle.Tool(NewQueryToolResultTool(a.sqlResultStore, a.sharedMemory))
-			if a.prompts != nil {
-				queryTool = shuttle.NewPromptAwareTool(queryTool, a.prompts, "tools.query_tool_result")
-			}
-			a.tools.Register(queryTool)
-		}
-		a.registerSessionTool(sessionID, "query_tool_result")
-	}
-
-	// Format successful result with smart truncation
 	if result.Data != nil {
 		// Render a string result verbatim; marshal a composite result as JSON.
 		// A Go map must never be rendered with %v.
-		var dataStr string
 		switch v := result.Data.(type) {
 		case string:
-			dataStr = v
+			return v
 		default:
 			if b, marshalErr := json.Marshal(v); marshalErr == nil {
-				dataStr = string(b)
-			} else {
-				dataStr = fmt.Sprintf("[unserializable result: %v]", marshalErr)
+				return string(b)
 			}
+			return fmt.Sprintf("[unserializable result: %v]", result.Data)
 		}
-
-		tokenCount := a.tokenCounter.CountTokens(dataStr)
-
-		// Skip reference creation if MCP tool already truncated (#1: Stop Double-Truncation)
-		// MCP tools handle truncation intelligently at 4096 bytes, creating another
-		// reference would fail since the reference system expects full data
-		if result.Metadata != nil {
-			if truncated, ok := result.Metadata["truncated"].(bool); ok && truncated {
-				// MCP tool already handled truncation - return as-is
-				return dataStr
-			}
-		}
-
-		// Offload is byte-thresholded only, matching the executor's handleLargeResult:
-		// a result strictly below the configured byte threshold stays inline; one at or
-		// above it is stored by reference. Both offload sites share this single threshold.
-		byteThreshold := int64(storage.DefaultSharedMemoryThreshold) // 0 = always reference
-		if a.sharedMemoryThreshold >= 0 {
-			byteThreshold = a.sharedMemoryThreshold
-		}
-		dataBytes := int64(len(dataStr))
-		if byteThreshold > 0 && dataBytes < byteThreshold {
-			// Strictly below the configured byte threshold — keep inline
-			return dataStr
-		}
-
-		// Larger than the byte threshold: store by reference EXCEPT for the exempt set,
-		// whose outputs must enter whole. Recall tools already retrieve stored data, so
-		// re-wrapping them recurses: query_tool_result → DataRef A → query_tool_result(A) → ...
-		// manage_skills delivers the skill body as its own message, so its result must
-		// enter whole rather than be stored by reference regardless of size.
-		// Exempt tools: get_tool_result, query_tool_result, manage_skills.
-		if toolName != "get_tool_result" && toolName != "query_tool_result" && toolName != "manage_skills" {
-			// Large result - store reference and provide summary
-
-			// Try shared memory first (fastest, in-process)
-			if a.sharedMemory != nil {
-				// Generate unique ID for this result
-				refID := fmt.Sprintf("ref_%s_%d", toolName, time.Now().UnixNano())
-
-				// Determine content type
-				contentType := "text/plain"
-				if result.Metadata != nil {
-					if ct, ok := result.Metadata["content_type"].(string); ok {
-						contentType = ct
-					}
-				}
-
-				// Convert result metadata to string map for storage
-				storageMeta := make(map[string]string)
-				if result.Metadata != nil {
-					for k, v := range result.Metadata {
-						storageMeta[k] = fmt.Sprintf("%v", v)
-					}
-				}
-				storageMeta["tool_name"] = toolName
-				storageMeta["session_id"] = sessionID
-
-				// Store in shared memory
-				dataRef, storeErr := a.sharedMemory.Store(refID, []byte(dataStr), contentType, storageMeta, sessionID)
-				if storeErr == nil {
-					// Mutation-debug: a large result was offloaded by reference.
-					// No-op unless the context-dump switch is on.
-					if a.contextDebugEnabled() {
-						zap.L().Debug("context mutation: large-result offload",
-							zap.String("session_id", sessionID),
-							zap.Int("turn", a.contextDebugTurn(sessionID)),
-							zap.String("reference_id", dataRef.Id),
-							zap.Int64("size_bytes", dataBytes),
-							zap.Int64("threshold_bytes", byteThreshold))
-					}
-					// Pin reference for session (auto-cleanup on session end)
-					// This prevents LRU eviction while session is active and ensures cleanup when session ends
-					if a.refTracker != nil {
-						a.refTracker.PinForSession(sessionID, dataRef.Id)
-					}
-
-					// Progressive disclosure: advertise query_tool_result after the
-					// first large result into THIS session, unless the server
-					// suppressed it (tools.none). We're inside `a.sharedMemory !=
-					// nil` and just stored there, so the tool has a backing store
-					// regardless of whether the SQL store is wired.
-					if !a.isBuiltinToolSuppressed("query_tool_result") {
-						if !a.tools.IsRegistered("query_tool_result") {
-							queryTool := shuttle.Tool(NewQueryToolResultTool(a.sqlResultStore, a.sharedMemory))
-							if a.prompts != nil {
-								queryTool = shuttle.NewPromptAwareTool(queryTool, a.prompts, "tools.query_tool_result")
-							}
-							a.tools.Register(queryTool)
-						}
-						a.registerSessionTool(sessionID, "query_tool_result")
-					}
-
-					// Get metadata to create rich inline summary (eliminates need for get_tool_result call)
-					meta, metaErr := a.sharedMemory.GetMetadata(dataRef, sessionID)
-					if metaErr == nil && meta != nil {
-						// Format rich metadata inline (same as executor.go does)
-						richSummary := formatAgentSharedMemoryResult(meta, dataRef.Id, toolName)
-						return richSummary
-					}
-
-					// Fallback to basic summary if metadata unavailable
-					summary := extractDataSummary(result.Data, result.Metadata)
-					return fmt.Sprintf(`✓ %s
-
-%s
-
-📎 Full result stored in memory (ID: %s)
-💡 Use get_tool_result(reference_id="%s") to retrieve complete data
-
-Token efficiency: %d tokens → ~50 tokens (%.1f%% reduction)`,
-						toolName,
-						summary,
-						dataRef.Id,
-						dataRef.Id,
-						tokenCount,
-						(float64(tokenCount-50)/float64(tokenCount))*100)
-				}
-			}
-
-			// Fallback: Smart truncation with structure preservation
-			return truncateWithStructure(dataStr, 800, result.Metadata)
-		}
-
-		// Exempt tool (recall tools / manage_skills) over the threshold: return whole.
-		return dataStr
 	}
 
 	return "Success"
-}
-
-// formatAgentSharedMemoryResult creates a rich inline summary with metadata for agent context.
-// Similar to executor.formatSharedMemoryResultSummary but includes tool name context.
-// This eliminates the need for a separate get_tool_result call - agents get all context immediately.
-func formatAgentSharedMemoryResult(meta *storage.DataMetadata, id string, toolName string) string {
-	var summary strings.Builder
-
-	// Header with tool name, data type and size
-	summary.WriteString(fmt.Sprintf("✓ %s completed: Large %s stored in memory (%d bytes, ~%d tokens)\n\n",
-		toolName, meta.DataType, meta.SizeBytes, meta.EstimatedTokens))
-
-	// Preview section
-	if meta.Preview != nil && (len(meta.Preview.First5) > 0 || len(meta.Preview.Last5) > 0) {
-		summary.WriteString("📋 Preview:\n")
-		if len(meta.Preview.First5) > 0 {
-			previewJSON, _ := json.MarshalIndent(meta.Preview.First5, "", "  ")
-			summary.WriteString(fmt.Sprintf("First 5 items:\n%s\n", string(previewJSON)))
-		}
-		if len(meta.Preview.Last5) > 0 && meta.DataType == "json_array" {
-			previewJSON, _ := json.MarshalIndent(meta.Preview.Last5, "", "  ")
-			summary.WriteString(fmt.Sprintf("\nLast 5 items:\n%s\n", string(previewJSON)))
-		}
-		summary.WriteString("\n")
-	}
-
-	// Schema section (if available)
-	if meta.Schema != nil {
-		switch meta.DataType {
-		case "json_object":
-			if len(meta.Schema.Fields) > 0 {
-				fieldNames := make([]string, 0, len(meta.Schema.Fields))
-				for _, field := range meta.Schema.Fields {
-					fieldNames = append(fieldNames, fmt.Sprintf("%s (%s)", field.Name, field.Type))
-				}
-				summary.WriteString(fmt.Sprintf("📊 Schema: %d fields\n%s\n\n",
-					len(meta.Schema.Fields), strings.Join(fieldNames, ", ")))
-			}
-		case "json_array":
-			summary.WriteString(fmt.Sprintf("📊 Array: %d items\n", meta.Schema.ItemCount))
-			if len(meta.Schema.Fields) > 0 {
-				fieldNames := make([]string, 0, len(meta.Schema.Fields))
-				for _, field := range meta.Schema.Fields {
-					fieldNames = append(fieldNames, fmt.Sprintf("%s (%s)", field.Name, field.Type))
-				}
-				summary.WriteString(fmt.Sprintf("Item schema: %s\n\n", strings.Join(fieldNames, ", ")))
-			}
-		case "text":
-			summary.WriteString(fmt.Sprintf("📊 Text: %d lines\n\n", meta.Schema.ItemCount))
-		}
-	}
-
-	// Retrieval hints - how to access this data
-	summary.WriteString("💡 How to retrieve:\n")
-	switch meta.DataType {
-	case "json_object":
-		// Surface the reference_id + a working call. Previously this branch told
-		// the model the object was "too large for direct retrieval" and gave NO
-		// id — so it could see a result existed (web_search, http_request, ...)
-		// but had no way to read it and would guess wrong ids. Pagination windows
-		// the object as text, so the full content is retrievable.
-		summary.WriteString(fmt.Sprintf("query_tool_result(reference_id='%s', offset=0, limit=100)  # read the object (paginated)\n", id))
-		summary.WriteString(fmt.Sprintf("query_tool_result(reference_id='%s', sql='SELECT * FROM results WHERE ...')  # if it wraps a 'results' array\n", id))
-		if meta.Schema != nil && len(meta.Schema.Fields) > 0 {
-			summary.WriteString("Use the schema above to pick the fields you need.\n")
-		}
-
-	case "json_array":
-		summary.WriteString(fmt.Sprintf("query_tool_result(reference_id='%s', offset=0, limit=100)\n", id))
-		summary.WriteString(fmt.Sprintf("query_tool_result(reference_id='%s', sql='SELECT * FROM results WHERE ...')\n", id))
-		if meta.Schema != nil && meta.Schema.ItemCount > 1000 {
-			summary.WriteString("⚠️ Large dataset - use filtering to avoid context overload\n")
-		}
-
-	case "text":
-		summary.WriteString(fmt.Sprintf("query_tool_result(reference_id='%s', offset=0, limit=100)\n", id))
-		if meta.Schema != nil && meta.Schema.ItemCount > 1000 {
-			summary.WriteString(fmt.Sprintf("⚠️ Large file (%d lines) - paginate to avoid loading all at once\n", meta.Schema.ItemCount))
-		}
-
-	case "csv":
-		summary.WriteString(fmt.Sprintf("query_tool_result(reference_id='%s', sql='SELECT * FROM results WHERE ...')\n", id))
-		summary.WriteString("💡 CSV auto-converts to queryable SQLite table\n")
-	}
-
-	return summary.String()
-}
-
-func extractDataSummary(data interface{}, metadata map[string]interface{}) string {
-	var parts []string
-
-	// Check metadata for structured info (common in database tools)
-	if metadata != nil {
-		if rows, ok := metadata["rows"].(int); ok {
-			parts = append(parts, fmt.Sprintf("📊 %d rows returned", rows))
-		} else if rows, ok := metadata["row_count"].(int); ok {
-			parts = append(parts, fmt.Sprintf("📊 %d rows returned", rows))
-		}
-
-		if cols, ok := metadata["columns"].([]interface{}); ok {
-			parts = append(parts, fmt.Sprintf("📋 %d columns", len(cols)))
-		} else if cols, ok := metadata["column_count"].(int); ok {
-			parts = append(parts, fmt.Sprintf("📋 %d columns", cols))
-		}
-
-		if execTime, ok := metadata["execution_time_ms"].(int64); ok {
-			parts = append(parts, fmt.Sprintf("⏱️  %dms", execTime))
-		}
-	}
-
-	// Try to extract structural info from data itself
-	switch v := data.(type) {
-	case map[string]interface{}:
-		if rows, ok := v["rows"].([]interface{}); ok {
-			parts = append(parts, fmt.Sprintf("📊 %d rows", len(rows)))
-		}
-		if cols, ok := v["columns"].([]interface{}); ok {
-			parts = append(parts, fmt.Sprintf("📋 Columns: %v", cols))
-		}
-	case []interface{}:
-		parts = append(parts, fmt.Sprintf("📊 %d items returned", len(v)))
-	case string:
-		if len(v) > 100 {
-			parts = append(parts, fmt.Sprintf("📄 Text result (%d chars)", len(v)))
-		}
-	}
-
-	if len(parts) == 0 {
-		return "Result available (details stored)"
-	}
-
-	return strings.Join(parts, " • ")
-}
-
-// truncateWithStructure intelligently truncates data while preserving structure.
-// For JSON/tabular data, shows sample rows + summary instead of raw truncation.
-func truncateWithStructure(dataStr string, maxChars int, metadata map[string]interface{}) string {
-	if len(dataStr) <= maxChars {
-		return dataStr
-	}
-
-	// Try to parse as JSON for smart truncation
-	var jsonData interface{}
-	if err := json.Unmarshal([]byte(dataStr), &jsonData); err == nil {
-		// Successfully parsed as JSON
-		switch v := jsonData.(type) {
-		case map[string]interface{}:
-			// Likely table data with rows/columns
-			if rows, ok := v["rows"].([]interface{}); ok {
-				sampleSize := 3
-				if len(rows) > sampleSize {
-					v["rows"] = rows[:sampleSize]
-					sampleJSON, _ := json.MarshalIndent(v, "", "  ")
-					return fmt.Sprintf("%s\n\n... [showing %d of %d rows. Result truncated due to size.]",
-						string(sampleJSON), sampleSize, len(rows))
-				}
-			}
-		case []interface{}:
-			// Array of items
-			sampleSize := 5
-			if len(v) > sampleSize {
-				sample, _ := json.MarshalIndent(v[:sampleSize], "", "  ")
-				return fmt.Sprintf("%s\n\n... [showing %d of %d items]", string(sample), sampleSize, len(v))
-			}
-		}
-	}
-
-	// Fallback: Simple truncation at clean break point
-	truncateAt := maxChars
-	if idx := strings.LastIndex(dataStr[:maxChars], "\n"); idx > 0 {
-		truncateAt = idx
-	}
-
-	return dataStr[:truncateAt] + fmt.Sprintf("\n\n... [truncated %d → %d chars, %.1f%% reduction]",
-		len(dataStr), truncateAt, (float64(len(dataStr)-truncateAt)/float64(len(dataStr)))*100)
-}
-
-// truncateErrorMessage truncates error messages to a maximum length while preserving readability.
-// This prevents massive Go stack traces from MCP tools from breaking LLM API calls.
-func truncateErrorMessage(msg string, maxLen int) string {
-	if len(msg) <= maxLen {
-		return msg
-	}
-
-	// Try to find a clean break point (newline) near the limit
-	// This helps preserve the first line of multi-line errors
-	truncateAt := maxLen
-	for i := 0; i < maxLen && i < len(msg); i++ {
-		if msg[i] == '\n' {
-			// Found a newline within limit - use it as break point
-			truncateAt = i
-			break
-		}
-	}
-
-	return msg[:truncateAt] + fmt.Sprintf("... [truncated %d chars]", len(msg)-truncateAt)
 }
 
 // GetSession retrieves a session by ID.
@@ -3964,34 +3505,6 @@ func (a *Agent) ClearAllSessions() {
 	a.mu.Lock()
 	a.sessionToolLedger = make(map[string]map[string]bool)
 	a.mu.Unlock()
-}
-
-// cleanupSessionReferences releases all shared memory references for a session.
-// Called automatically when sessions are deleted (via cleanup hook).
-// This prevents reference leaks by decrementing RefCount on all pinned references.
-func (a *Agent) cleanupSessionReferences(ctx context.Context, sessionID string) {
-	if a.refTracker == nil {
-		return
-	}
-
-	// Start Hawk span for observability
-	_, span := a.tracer.StartSpan(ctx, "agent.cleanup_session_references")
-	defer a.tracer.EndSpan(span)
-
-	span.SetAttribute("session_id", sessionID)
-
-	// Release all references for this session
-	releasedCount := a.refTracker.UnpinSession(sessionID)
-
-	// Record metrics
-	span.SetAttribute("references_released", fmt.Sprintf("%d", releasedCount))
-
-	// Log if references were released
-	if releasedCount > 0 {
-		span.SetAttribute("status", "cleaned")
-	} else {
-		span.SetAttribute("status", "no_refs")
-	}
 }
 
 // CreateSession creates a new session without sending a message to the LLM.
@@ -4265,29 +3778,12 @@ func (a *Agent) SetSharedMemory(sharedMemory *storage.SharedMemoryStore) {
 			a.tools.Register(queryTool)
 		}
 	}
-
-	// Update reference tracker with new store
-	if sharedMemory != nil {
-		a.refTracker = storage.NewSessionReferenceTracker(sharedMemory)
-	}
 }
 
 // SetSQLResultStore configures SQL result store for this agent.
-// This enables queryable storage for large SQL results, preventing context blowout.
 func (a *Agent) SetSQLResultStore(sqlStore storage.ResultStore) {
 	// Store reference for later use
 	a.sqlResultStore = sqlStore
-
-	// Inject into tool executor so SQL results go to queryable tables. The store
-	// is wired regardless so large results are stored; the query_tool_result TOOL
-	// itself is NOT registered here — it is progressively disclosed (registered
-	// only after the first large result is stored; see formatToolResult /
-	// agent.go:3753). Registering it eagerly whenever a store existed put it in the
-	// model's tool list every turn even with nothing to query, defeating the
-	// progressive-disclosure design.
-	if a.executor != nil {
-		a.executor.SetSQLResultStore(sqlStore)
-	}
 }
 
 // SetReferenceStore configures the reference store for inter-agent communication.

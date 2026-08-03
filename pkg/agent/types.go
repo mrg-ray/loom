@@ -139,9 +139,6 @@ type Agent struct {
 	// Shared memory store for large tool results (prevents context overflow)
 	sharedMemory *storage.SharedMemoryStore
 
-	// Reference tracker for automatic cleanup of shared memory references when sessions end
-	refTracker *storage.SessionReferenceTracker
-
 	// SQL result store for queryable large SQL results
 	sqlResultStore storage.ResultStore
 

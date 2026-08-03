@@ -15,12 +15,14 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/storage"
+	"github.com/teradata-labs/loom/pkg/types"
 	"go.uber.org/zap"
 )
 
@@ -609,15 +611,110 @@ func (m *Memory) PersistSession(ctx context.Context, session *Session) error {
 	return m.store.SaveSession(ctx, session)
 }
 
-// PersistMessage saves a message's durable row, once, if storage is configured
-// (write rules, HLD §4). The store derives the row's seq and turn at insert and
-// stamps both back onto msg; turnStart is passed only by the Chat()-entry
-// persist site — the only turn-incrementing event.
+// PersistMessage saves a message's durable row, once, applying the fixed write
+// rules of HLD §4 to the stored copy — the in-memory message stays whole. The
+// store derives the row's seq and turn at insert and stamps both back onto msg;
+// turnStart is passed only by the Chat()-entry persist site — the only
+// turn-incrementing event.
+//
+// Write rules applied here (loom's single persist seam):
+//   - §4.1 truncation: every tool result row is bounded at the threshold,
+//     tail included (core cut backward to a rune boundary + normative tail).
+//   - §4.3 retrieval pairs are not persisted: query_tool_result entries are
+//     filtered from an assistant row's calls; tool rows whose tool_use_id
+//     matches a filtered entry are not persisted; an assistant message left
+//     with no text and no calls is not persisted. Both sides always — an
+//     orphaned pair breaks replay at the API.
 func (m *Memory) PersistMessage(ctx context.Context, sessionID string, msg *Message, turnStart bool) error {
 	if m.store == nil {
 		return nil // No-op if no store configured
 	}
-	return m.store.SaveMessage(ctx, sessionID, msg, turnStart)
+
+	threshold := m.thresholdOrDefault()
+
+	switch msg.Role {
+	case "assistant":
+		filtered := make([]types.ToolCall, 0, len(msg.ToolCalls))
+		for _, c := range msg.ToolCalls {
+			if c.Name == "query_tool_result" {
+				continue
+			}
+			filtered = append(filtered, c)
+		}
+		if msg.Content == "" && len(filtered) == 0 && len(msg.ContentBlocks) == 0 {
+			// §4.3: an assistant message left with no text and no calls is not
+			// persisted. In memory the message stays intact for the turn.
+			return nil
+		}
+		stored := *msg
+		stored.ToolCalls = filtered
+		if err := m.store.SaveMessage(ctx, sessionID, &stored, turnStart); err != nil {
+			return err
+		}
+		msg.ID = stored.ID
+		msg.Turn = stored.Turn
+		return nil
+
+	case "tool":
+		if m.isRetrievalPairResult(sessionID, msg.ToolUseID) {
+			// §4.3: the result side of a filtered query_tool_result pair is not
+			// persisted; in memory the pair stays intact for the producing turn.
+			return nil
+		}
+		stored := *msg
+		stored.Content = truncateToolRowContent(stored.Content, threshold)
+		// The raw ToolResult record rides the row as tool_result_json; a payload
+		// copy above the threshold would defeat the §4.1 row bound, so it is
+		// dropped from the stored copy (content already carries the rendered
+		// form; recovery is re-run).
+		if stored.ToolResult != nil {
+			if raw, err := json.Marshal(stored.ToolResult); err != nil || len(raw) > threshold {
+				stored.ToolResult = nil
+			}
+		}
+		if err := m.store.SaveMessage(ctx, sessionID, &stored, turnStart); err != nil {
+			return err
+		}
+		msg.ID = stored.ID
+		msg.Turn = stored.Turn
+		return nil
+
+	default:
+		return m.store.SaveMessage(ctx, sessionID, msg, turnStart)
+	}
+}
+
+// isRetrievalPairResult reports whether the tool row identified by toolUseID is
+// the result side of a query_tool_result pair (§4.3). The pairing assistant
+// message is already in the session's in-memory history — calls persist after
+// their assistant row and within the producing turn.
+func (m *Memory) isRetrievalPairResult(sessionID, toolUseID string) bool {
+	if toolUseID == "" {
+		return false
+	}
+	m.mu.RLock()
+	session := m.sessions[sessionID]
+	m.mu.RUnlock()
+	if session == nil {
+		return false
+	}
+	var msgs []Message
+	if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+		msgs = segMem.GetMessages()
+	} else {
+		msgs = session.GetMessages()
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != "assistant" {
+			continue
+		}
+		for _, c := range msgs[i].ToolCalls {
+			if c.ID == toolUseID {
+				return c.Name == "query_tool_result"
+			}
+		}
+	}
+	return false
 }
 
 // PersistToolExecution saves a tool execution to persistent storage if configured.
@@ -725,16 +822,14 @@ func (m *Memory) AddMessage(ctx context.Context, sessionID string, msg Message) 
 	}
 
 	// Stamp the turn (derived, never counted — HLD §4.5) and persist BEFORE the
-	// in-memory append so the store's RETURNING-derived seq and turn land on the
-	// copy that enters L1.
+	// in-memory append so the store-derived seq and turn land on the copy that
+	// enters L1. PersistMessage applies the §4 write rules.
 	msg.Turn = sessionCurrentTurn(session)
-	if m.store != nil {
-		if err := m.store.SaveMessage(ctx, sessionID, &msg, false); err != nil {
-			m.logger.Warn("Failed to persist message to storage",
-				zap.String("session_id", sessionID),
-				zap.String("role", msg.Role),
-				zap.Error(err))
-		}
+	if err := m.PersistMessage(ctx, sessionID, &msg, false); err != nil {
+		m.logger.Warn("Failed to persist message to storage",
+			zap.String("session_id", sessionID),
+			zap.String("role", msg.Role),
+			zap.Error(err))
 	}
 
 	// Add message to session (this handles SegmentedMem if configured)

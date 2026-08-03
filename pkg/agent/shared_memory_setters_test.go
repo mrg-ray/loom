@@ -87,8 +87,6 @@ func TestAgent_SetSharedMemory_UpdatesAllReferences(t *testing.T) {
 	require.True(t, exists2, "QueryToolResultTool should still be registered after SetSharedMemory")
 	require.NotNil(t, tool2, "QueryToolResultTool should not be nil after SetSharedMemory")
 
-	// Verify refTracker was updated
-	assert.NotNil(t, agent.refTracker, "Reference tracker should be initialized after SetSharedMemory")
 }
 
 // TestAgent_SetSharedMemory_NilSafety verifies that SetSharedMemory handles nil gracefully
