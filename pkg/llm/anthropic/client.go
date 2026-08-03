@@ -235,7 +235,41 @@ func (c *Client) convertMessages(messages []llmtypes.Message) ([]TextBlockParam,
 	var systemPrompts []string
 	var apiMessages []Message
 
-	for _, msg := range messages {
+	// Cache breakpoints (HLD §5.2 step 8; blueprint A6): beyond the system
+	// block and last-tool breakpoints, mark the last message with turn = T−2
+	// (when one exists) and the tip. The turn rides on the message, so the
+	// boundary is computed here rather than passed down.
+	var maxTurn int64
+	for i := range messages {
+		if messages[i].Turn > maxTurn {
+			maxTurn = messages[i].Turn
+		}
+	}
+	boundaryIdx := -1
+	if maxTurn >= 2 {
+		for i := range messages {
+			if messages[i].Turn == maxTurn-2 {
+				boundaryIdx = i
+			}
+		}
+	}
+	tipIdx := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "system" {
+			tipIdx = i
+			break
+		}
+	}
+	markLast := func() {
+		if n := len(apiMessages); n > 0 {
+			blocks := apiMessages[n-1].Content
+			if len(blocks) > 0 {
+				blocks[len(blocks)-1].CacheControl = &CacheControl{Type: "ephemeral"}
+			}
+		}
+	}
+
+	for msgIdx, msg := range messages {
 		switch msg.Role {
 		case "system":
 			// Extract system messages - they'll be combined and sent separately
@@ -322,6 +356,12 @@ func (c *Client) convertMessages(messages []llmtypes.Message) ([]TextBlockParam,
 					Content:   msg.Content,
 				},
 			})
+		}
+
+		// Third breakpoint at the last message with turn = T−2, and the tip
+		// breakpoint on the final message (HLD §5.2 step 8).
+		if msgIdx == boundaryIdx || msgIdx == tipIdx {
+			markLast()
 		}
 	}
 

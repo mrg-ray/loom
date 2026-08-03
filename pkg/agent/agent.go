@@ -2265,6 +2265,14 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		tools := a.advertisedTools(session)
 		tools = recovery.activeTools(tools)
 
+		// KERNEL accounting (HLD §2; blueprint A6): the serialized bytes of the
+		// advertised tool schemas — the provider tools parameter as built — are
+		// part of the compiled artifact and feed releasePressure's estimate.
+		// Recomputed per provider call, which covers every registration change.
+		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+			segMem.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
+		}
+
 		// Mutation-debug: the per-session tool projection about to be advertised
 		// on this provider call. No-op unless the context-dump switch is on.
 		if a.contextDebugEnabled() {
@@ -2845,6 +2853,22 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			"synthesized":     true,
 		},
 	}, nil
+}
+
+// advertisedToolsBytes measures the serialized bytes of the advertised tool
+// schemas as they ride the provider tools parameter (name + description +
+// input schema JSON).
+func advertisedToolsBytes(tools []shuttle.Tool) int {
+	bytes := 0
+	for _, t := range tools {
+		bytes += len(t.Name()) + len(t.Description())
+		if schema := t.InputSchema(); schema != nil {
+			if b, err := json.Marshal(schema); err == nil {
+				bytes += len(b)
+			}
+		}
+	}
+	return bytes
 }
 
 // canonicalJSON serializes a map to a deterministic JSON string for deduplication.
