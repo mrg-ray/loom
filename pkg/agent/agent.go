@@ -2300,7 +2300,15 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 					zap.String("session_id", session.ID),
 					zap.Int("estimate_tokens", estimate),
 					zap.Int("target_tokens", target))
+				// Relief can deactivate a skill whose load pair was folded
+				// (HLD §4.5): its tools leave KERNEL. The resend is a recompile,
+				// so recompute BOTH messages and the advertised tool set — else a
+				// deactivated skill's tools linger for one more provider call.
 				messages = session.GetMessages()
+				tools = a.advertisedTools(session)
+				if segMem2, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem2 != nil {
+					segMem2.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
+				}
 				llmResp, err = a.chatWithRetry(ctx, messages, tools)
 				if err != nil && errors.Is(err, llm.ErrContextTooLong) {
 					zap.L().Error("context too long after relief: turn ends",

@@ -23,7 +23,8 @@ import (
 // ErrContextTooLong marks a provider refusal positively identified as
 // "context too long" (HLD §5.2 step 12). It is the ONLY relief trigger:
 // identification is positive, per provider — anthropic: status 400,
-// error.type="invalid_request_error", message containing "prompt is too long";
+// error.type="invalid_request_error", message containing "prompt is too long"
+// OR "exceed context limit";
 // OpenAI-shaped (LiteLLM): status 400, error.code="context_length_exceeded".
 // An error not positively identified is NOT context-too-long and propagates as
 // today.
@@ -44,8 +45,15 @@ func IsAnthropicContextTooLong(statusCode int, body []byte) bool {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return false
 	}
+	// Anthropic emits two distinct messages for this refusal; both must match.
+	// "prompt is too long" — prompt alone over the window.
+	// "exceed context limit" — prompt + max_tokens over it (the common case with
+	// any real output reservation: it fires first, while the prompt is still
+	// under the window). A matcher carrying only the first never triggers relief
+	// in normal operation, and fails silently (releasePressure never runs).
 	return resp.Error.Type == "invalid_request_error" &&
-		strings.Contains(resp.Error.Message, "prompt is too long")
+		(strings.Contains(resp.Error.Message, "prompt is too long") ||
+			strings.Contains(resp.Error.Message, "exceed context limit"))
 }
 
 // IsOpenAIContextTooLong positively identifies the OpenAI-shaped (LiteLLM)
