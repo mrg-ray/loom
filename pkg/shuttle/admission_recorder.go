@@ -26,7 +26,7 @@ type recorder struct {
 	stateKey   string              // approved-set partition the identities are recorded under
 	stmtParam  string              // param name the shared Canonicalize keys a statement on
 	resultPath string              // dotted path to the statement list within Result.Data
-	state      ApprovedSetAccessor // the set this recorder writes; the read side reads the same store
+	state      ApprovedSetAccessor // build-time fallback accessor, used when req.State is nil
 }
 
 // Observe records the rendered statements when the trusted render tool completes
@@ -34,13 +34,20 @@ type recorder struct {
 // identities are written, so nothing but a genuine render populates the set.
 // Each produced statement is normalized through the SAME Canonicalize the read
 // side compares on, so a rendered statement matches its re-emitted
-// whitespace-different form at execute time. It never gates: a Record error
-// cannot fail a tool call that already completed.
+// whitespace-different form at execute time. The accessor is resolved from
+// req.State first with the build-time state as fallback — the same order the
+// gated read side uses — so the recorder writes the very set that read checks;
+// with neither wired it is a no-op. It never gates: a Record error cannot fail a
+// tool call that already completed.
 func (r *recorder) Observe(req AdmissionRequest, result *Result) {
 	if req.ToolName != r.sourceTool || result == nil || !result.Success {
 		return
 	}
-	if r.state == nil {
+	state := req.State
+	if state == nil {
+		state = r.state
+	}
+	if state == nil {
 		return
 	}
 
@@ -54,7 +61,7 @@ func (r *recorder) Observe(req AdmissionRequest, result *Result) {
 		ids = append(ids, Canonicalize(r.sourceTool, map[string]interface{}{r.stmtParam: stmt}, r.stmtParam))
 	}
 
-	_ = r.state.Record(req.Ctx, r.stateKey, ids)
+	_ = state.Record(req.Ctx, r.stateKey, ids)
 }
 
 // extractStatements walks resultPath through the render Result's data to the

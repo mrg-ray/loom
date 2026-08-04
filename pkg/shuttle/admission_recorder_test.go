@@ -64,6 +64,20 @@ func recorderExec(t *testing.T, acc ApprovedSetAccessor, resultPath string, tool
 	return exec
 }
 
+// serveWiredExec builds an executor the way serve wires it: the chain is built
+// with NO ApprovedSet in ChainDeps (createAdmissionChain passes only Perm), and
+// the per-agent accessor reaches both the recorder and the gated read side solely
+// as AdmissionRequest.State via SetApprovedSet — the runtime injection path
+// production uses.
+func serveWiredExec(t *testing.T, acc ApprovedSetAccessor, resultPath string, tools ...*MockTool) *Executor {
+	t.Helper()
+	chain, err := BuildChainFromConfig(hooksFromYAML(t, recorderFixture(resultPath)), ChainDeps{})
+	require.NoError(t, err)
+	exec := execFor(chain, tools...)
+	exec.SetApprovedSet(acc)
+	return exec
+}
+
 // renderResult is a successful tool Result carrying data as the render tool's
 // output payload.
 func renderResult(data interface{}) *Result {
@@ -249,6 +263,40 @@ func TestRecorder_AC2_RenderedAdmits_UnrenderedDenied(t *testing.T) {
 	require.Equal(t, "permission_denied", res.Error.Code)
 	require.Equal(t, "call not in approved set", res.Error.Message)
 	require.Equal(t, 1, execTool.ExecuteCount, "the un-rendered write body must not run")
+}
+
+// AC2 (serve wiring): the recorder writes to the SAME accessor the gated read side
+// reads at serve, where the per-agent accessor is present only as
+// AdmissionRequest.State (SetApprovedSet) and absent from build-time ChainDeps —
+// the runtime injection path production uses. A rendered statement is recorded via
+// req.State and later admits; an un-rendered self-GRANT finds no entry and is
+// denied. (SC-002, C-011)
+func TestRecorder_AC2_RecordsViaRequestStateAtServeWiring(t *testing.T) {
+	ctx := sessionCtx("user-A")
+	acc := storeAccessor()
+	const rendered = "GRANT SELECT ON t TO alice"
+	rt := renderTool("sql_render", renderResult(map[string]interface{}{
+		"statements": []interface{}{rendered},
+	}))
+	execTool := countingTool("sql_execute")
+	exec := serveWiredExec(t, acc, "statements", rt, execTool)
+
+	// Render establishes the approved set through the runtime req.State accessor.
+	_, err := exec.Execute(ctx, "sql_render", nil)
+	require.NoError(t, err)
+
+	// The rendered statement admits and its body runs.
+	res, err := exec.Execute(ctx, "sql_execute", map[string]interface{}{"sql": rendered})
+	require.NoError(t, err)
+	require.True(t, res.Success, "a rendered statement admits at serve wiring")
+	require.Equal(t, 1, execTool.ExecuteCount, "the admitted body runs exactly once")
+
+	// An un-rendered self-GRANT finds no entry and is hard-denied, body skipped.
+	res, err = exec.Execute(ctx, "sql_execute", map[string]interface{}{"sql": "GRANT ALL PRIVILEGES ON db TO current_user"})
+	require.NoError(t, err)
+	require.Equal(t, "permission_denied", res.Error.Code)
+	require.Equal(t, "call not in approved set", res.Error.Message)
+	require.Equal(t, 1, execTool.ExecuteCount, "the un-rendered self-GRANT body must not run")
 }
 
 // AC3: a dangerous write (self-GRANT) is denied even when the render/approval step
