@@ -73,11 +73,12 @@ func TestMech_EvictionFloor(t *testing.T) {
 
 	// a tiny result (well under 2× a stub) in an early turn
 	drive(t, r, sid, "tiny", callTools(emit("tiny", 250, "string")), sayText("noted"))
-	// large results to build pressure
+	// large results to build pressure past the proactive limit, so relief runs
+	// on loom's own accounting (no injected refusal — a forced refusal after a
+	// proactive shed would trigger a second, fold-escalating pass that is not
+	// what this route tests).
 	drive(t, r, sid, "big1", callTools(emit("b1", 40000, "string")), sayText("ok"))
 	drive(t, r, sid, "big2", callTools(emit("b2", 40000, "string")), sayText("ok"))
-	// force relief
-	r.llm.refuse(1)
 	if err := drive(t, r, sid, "status", sayText("proceeding")); err != nil {
 		t.Fatal(err)
 	}

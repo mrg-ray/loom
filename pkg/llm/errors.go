@@ -64,12 +64,25 @@ func IsOpenAIContextTooLong(statusCode int, body []byte) bool {
 	}
 	var resp struct {
 		Error struct {
-			Code interface{} `json:"code"`
+			Code    interface{} `json:"code"`
+			Message string      `json:"message"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return false
 	}
-	code, _ := resp.Error.Code.(string)
-	return code == "context_length_exceeded"
+	if code, _ := resp.Error.Code.(string); code == "context_length_exceeded" {
+		return true
+	}
+	// LiteLLM proxying a non-OpenAI upstream (Anthropic via Vertex on the company
+	// gateway) does NOT normalise to context_length_exceeded: it returns a generic
+	// 400 with the upstream provider's own message passed through verbatim
+	// ("litellm.BadRequestError: ... prompt is too long: N tokens > M maximum").
+	// Matching only the OpenAI code leaves relief blind to that gateway — the
+	// refusal fires, the matcher misses it, and the turn hard-fails instead of
+	// shedding. Match the passed-through wording too.
+	msg := resp.Error.Message
+	return strings.Contains(msg, "prompt is too long") ||
+		strings.Contains(msg, "exceed context limit") ||
+		strings.Contains(msg, "context_length_exceeded")
 }

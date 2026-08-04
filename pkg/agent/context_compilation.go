@@ -252,6 +252,47 @@ func (sm *SegmentedMemory) targetLocked() int {
 	return pct * (sm.tokenBudget.MaxTokens - sm.tokenBudget.ReservedTokens) / 100
 }
 
+// proactiveReliefPercent is the self-imposed relief limit as a percentage of the
+// model window: loom sheds when its own estimate reaches this, so the context
+// stays off the provider's hard window and relief never depends on catching a
+// provider refusal. The 10% headroom absorbs the output reservation and the
+// estimate's error; the provider-refusal path stays only as a backstop.
+const proactiveReliefPercent = 90
+
+// proactiveLimitLocked returns proactiveReliefPercent% of the window. Must hold
+// lock. Sits above targetLocked (75% of usable) so a shed does not immediately
+// re-trigger.
+func (sm *SegmentedMemory) proactiveLimitLocked() int {
+	return proactiveReliefPercent * sm.tokenBudget.MaxTokens / 100
+}
+
+// MaybeReleaseProactively runs one relief pass IFF the compiled-context estimate
+// is at or above the proactive limit (§5.1). This is the primary relief trigger:
+// loom's own accounting, evaluated at compile before every send — not the
+// provider's refusal. Safe to call every provider call; it is a cheap estimate
+// unless the limit is crossed.
+//
+// Returns:
+//   - shed:     a relief pass ran.
+//   - terminal: after shedding everything sheddable the estimate still exceeds
+//     the window — the current turn alone overflows loom's window, so the turn
+//     cannot proceed (§5.2). loom enforces its own window here rather than
+//     waiting for the provider, since a deployment's window may sit below the
+//     provider's real ceiling.
+//   - estimate,target: post-pass figures for logging / the terminal error.
+func (sm *SegmentedMemory) MaybeReleaseProactively(ctx context.Context) (shed, terminal bool, estimate, target int) {
+	sm.mu.Lock()
+	over := sm.estimateLocked() >= sm.proactiveLimitLocked()
+	window := sm.tokenBudget.MaxTokens
+	sm.mu.Unlock()
+	if !over {
+		return false, false, 0, 0
+	}
+	// ReleasePressure takes the lock itself; its returned estimate is post-pass.
+	estimate, target = sm.ReleasePressure(ctx)
+	return true, estimate >= window, estimate, target
+}
+
 // --- releasePressure (HLD §5.2) ----------------------------------------------
 
 // ReleasePressure is one complete relief pass, no sends inside it, entered only
