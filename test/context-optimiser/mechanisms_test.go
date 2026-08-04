@@ -156,6 +156,16 @@ func TestMech_SkillDeactivatedOnFold(t *testing.T) {
 	if toolAdvertised(final, requiredToolName) {
 		t.Errorf("§4.5: %s still advertised after its skill's load pair was folded — skill not deactivated", requiredToolName)
 	}
+	// §4.5: the fold summary must PIN a note naming the deactivated skill, so the
+	// model can see the capability went out with the fold and reload it if still
+	// in use — a silent deactivation leaves the model unable to tell.
+	joined := ""
+	for _, m := range final.Messages {
+		joined += m.Content + "\n"
+	}
+	if !strings.Contains(joined, "Folded active skill") || !strings.Contains(joined, skillAuditTrail) {
+		t.Errorf("§4.5: fold summary does not pin the folded-skill note naming %q", skillAuditTrail)
+	}
 }
 
 // TestMech_RecallConversationOnly — §6: recall returns the span's user and

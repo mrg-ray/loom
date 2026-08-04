@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -558,6 +559,29 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 		}
 	}
 
+	// Skills whose load pair folds are deactivated (§4.5). Accumulate them on the
+	// memory and re-pin the FULL set as a note at the END of the summary, so the
+	// model sees which capability went out with the folded conversation and can
+	// reload it if still in use. Tracking it as state (not just this fold's text)
+	// keeps the note alive when a later fold's compressor paraphrases the summary.
+	newlyFolded := foldedSkillLoads(region)
+	if len(newlyFolded) > 0 && sm.foldedSkills == nil {
+		sm.foldedSkills = make(map[string]bool)
+	}
+	for _, name := range newlyFolded {
+		sm.foldedSkills[name] = true
+	}
+	if len(sm.foldedSkills) > 0 {
+		names := make([]string, 0, len(sm.foldedSkills))
+		for n := range sm.foldedSkills {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		newText = strings.TrimRight(newText, "\n") +
+			fmt.Sprintf("\n\n[Folded active skill(s): %s — reload with manage_skills if still in use.]",
+				strings.Join(names, ", "))
+	}
+
 	n1 := sm.summary.n + 1
 
 	// One transaction: the version insert and the region's folded flags
@@ -578,7 +602,7 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 	// region (HLD §4.5) — its tools leave KERNEL at the next compile;
 	// re-loading the skill is the door back.
 	if sm.skillDeactivation != nil {
-		for _, name := range foldedSkillLoads(region) {
+		for _, name := range newlyFolded {
 			sm.skillDeactivation(sm.sessionID, name)
 		}
 	}

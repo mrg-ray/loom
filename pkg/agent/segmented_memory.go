@@ -66,6 +66,12 @@ type SegmentedMemory struct {
 	// versioned; HLD §2).
 	summary summaryState
 
+	// foldedSkills accumulates skills deactivated by fold (§4.5) and not yet
+	// reloaded. Re-pinned as a note at the end of every summary version so the
+	// note survives a later fold whose compressor would otherwise paraphrase it
+	// away — the note is STATE, not compressor output. Keyed by skill name.
+	foldedSkills map[string]bool
+
 	// Store binding for relief transactions and reload (optional).
 	sessionStore SessionStorage
 	sessionID    string
