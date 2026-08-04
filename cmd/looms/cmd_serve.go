@@ -64,6 +64,7 @@ import (
 	skillindex "github.com/teradata-labs/loom/pkg/skills/index"
 	"github.com/teradata-labs/loom/pkg/storage"
 	"github.com/teradata-labs/loom/pkg/storage/backend"
+	"github.com/teradata-labs/loom/pkg/storage/postgres"
 	"github.com/teradata-labs/loom/pkg/task"
 	"github.com/teradata-labs/loom/pkg/tls"
 	toolregistry "github.com/teradata-labs/loom/pkg/tools/registry"
@@ -290,6 +291,42 @@ func createPermissionChecker(config *Config, logger *zap.Logger) *shuttle.Permis
 		})
 	}
 	return nil
+}
+
+// createAdmissionChain builds the admission chain from the permission checker
+// and the tools.hooks bindings. It returns nil (a pure pass-through) when there
+// is neither a permission checker nor any binding. Each built binding is logged
+// once (kind, scope, matcher) so a governed write/dispatch path is visible in
+// the serve log and an uncovered one is detectable (L-Cfg-2). A malformed
+// binding is an error, aborting serve (fail-closed, L-Cfg-1).
+func createAdmissionChain(config *Config, deps shuttle.ChainDeps, logger *zap.Logger) (*shuttle.Chain, error) {
+	bindings := config.Tools.Hooks.Bindings
+	if deps.Perm == nil && len(bindings) == 0 {
+		return nil, nil
+	}
+
+	for i, b := range bindings {
+		logger.Info("Admission hook binding",
+			zap.Int("index", i),
+			zap.String("kind", b.Kind),
+			zap.String("scope", b.Scope),
+			zap.String("matcher", describeMatcher(b.Matcher)))
+	}
+
+	chain, err := shuttle.BuildChainFromConfig(config.Tools.Hooks, deps)
+	if err != nil {
+		return nil, err
+	}
+	return chain, nil
+}
+
+// describeMatcher renders a binding's matcher for the coverage log. An empty
+// matcher governs every call to the scoped tool and is shown as "*".
+func describeMatcher(m shuttle.MatcherSpec) string {
+	if m.ParamPath == "" && m.Op == "" && m.Value == "" {
+		return "*"
+	}
+	return fmt.Sprintf("%s %s %q", m.ParamPath, m.Op, m.Value)
 }
 
 // createPromptRegistry creates a PromptRegistry based on configuration.
@@ -1509,6 +1546,14 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Create PermissionChecker (if configured)
 	permissionChecker := createPermissionChecker(config, logger)
 
+	// Build the admission chain: the name-level permission check folded in as the
+	// first hook, then the library policies from tools.hooks. A malformed binding
+	// aborts startup so a path is never left silently ungoverned (fail-closed).
+	admissionChain, err := createAdmissionChain(config, shuttle.ChainDeps{Perm: permissionChecker}, logger)
+	if err != nil {
+		logger.Fatal("Failed to build admission chain", zap.Error(err))
+	}
+
 	// Initialize empty agents map - all agents loaded from $LOOM_DATA_DIR/agents/ via registry below
 	agents := initializeAgentsMap()
 	logger.Info("Agents will be loaded from $LOOM_DATA_DIR/agents/ directory via registry system")
@@ -1744,6 +1789,12 @@ func runServe(cmd *cobra.Command, args []string) {
 				if permissionChecker != nil {
 					agentOpts = append(agentOpts, agent.WithPermissionChecker(permissionChecker))
 				}
+
+				// Attach the admission chain and, unconditionally, the identity
+				// resolver so AdmissionRequest.UserID is populated for every
+				// deployment. A nil chain leaves tool execution a pass-through.
+				agentOpts = append(agentOpts, agent.WithAdmissionHooks(admissionChain))
+				agentOpts = append(agentOpts, agent.WithIdentityResolver(postgres.UserIDFromContext))
 
 				// Determine LLM provider for this agent
 				// If agent has specific LLM config, use it; otherwise use server default
@@ -3039,6 +3090,12 @@ func runServe(cmd *cobra.Command, args []string) {
 			if permissionChecker != nil {
 				agentOpts = append(agentOpts, agent.WithPermissionChecker(permissionChecker))
 			}
+
+			// Attach the admission chain and, unconditionally, the identity
+			// resolver so AdmissionRequest.UserID is populated for every
+			// deployment. A nil chain leaves tool execution a pass-through.
+			agentOpts = append(agentOpts, agent.WithAdmissionHooks(admissionChain))
+			agentOpts = append(agentOpts, agent.WithIdentityResolver(postgres.UserIDFromContext))
 
 			// Wrap LLM provider with instrumentation for observability
 			if tracer != nil {

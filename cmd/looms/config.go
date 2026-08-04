@@ -23,6 +23,7 @@ import (
 	"github.com/spf13/viper"
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	loomconfig "github.com/teradata-labs/loom/pkg/config"
+	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/zalando/go-keyring"
 	"gopkg.in/yaml.v3"
 )
@@ -709,6 +710,9 @@ type ToolsConfig struct {
 
 	// Permissions holds tool permission configuration
 	Permissions ToolPermissionsConfig `mapstructure:"permissions"`
+
+	// Hooks holds the library admission-policy bindings (tools.hooks)
+	Hooks shuttle.HooksConfig `mapstructure:"hooks"`
 
 	// Executor holds tool executor configuration
 	Executor ToolExecutorConfig `mapstructure:"executor"`
