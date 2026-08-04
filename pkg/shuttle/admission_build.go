@@ -87,7 +87,7 @@ func buildHook(b HookBinding, deps ChainDeps) (Hook, error) {
 
 	switch b.Kind {
 	case "denylist":
-		return denylistHook(scope, matcher), nil
+		return denylist{scope: scope, matcher: matcher}, nil
 	case "gated-allowlist":
 		return gatedAllowlistHook(b, scope, matcher, deps)
 	case "audit":
@@ -117,19 +117,6 @@ func (h libraryHook) Matches(req AdmissionRequest) bool {
 // Evaluate returns the policy's verdict for a governed call.
 func (h libraryHook) Evaluate(req AdmissionRequest) Decision {
 	return h.eval(req)
-}
-
-// denylistHook denies any governed call. Because Matches already gates on the
-// matcher, a governed call is by definition one whose params match the deny
-// selector.
-func denylistHook(scope ToolScope, matcher Matcher) libraryHook {
-	return libraryHook{
-		scope:   scope,
-		matcher: matcher,
-		eval: func(req AdmissionRequest) Decision {
-			return Decision{Kind: Deny, Reason: "denied by denylist"}
-		},
-	}
 }
 
 // gatedAllowlistHook admits a governed write only when its call identity is in
