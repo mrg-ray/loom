@@ -265,7 +265,7 @@ func TestSkillsCutover_AC1_ROMContainsBoundSkillMenuAtSessionCreation(t *testing
 	require.NoError(t, err)
 	require.Len(t, resolved, len(skillsCutoverBoundBindings), "resolver resolves the bound set")
 
-	assert.Contains(t, rom, "AVAILABLE SKILLS", "ROM carries the skill menu header")
+	assert.Contains(t, rom, "# Available skills", "ROM carries the skill menu header")
 	for _, rb := range resolved {
 		line := fmt.Sprintf("- %s — %s", rb.Skill.Name, rb.Skill.Description)
 		assert.Contains(t, rom, line,
@@ -297,7 +297,7 @@ func TestSkillsCutover_AC2_ROMByteIdenticalEveryTurnWithStaticSkillList(t *testi
 
 	rom0 := firstSystemMessage(t, recs[0])
 	// The static skill list is part of the byte-stable ROM being compared.
-	require.Contains(t, rom0, "AVAILABLE SKILLS", "turn-1 ROM carries the static skill menu")
+	require.Contains(t, rom0, "# Available skills", "turn-1 ROM carries the static skill menu")
 	require.Contains(t, rom0, "- alpha-skill — First plain test skill.",
 		"turn-1 ROM carries the bound-skill menu list")
 
