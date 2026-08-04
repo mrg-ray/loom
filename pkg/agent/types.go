@@ -73,6 +73,9 @@ type Agent struct {
 	// Permission checker for tool execution
 	permissionChecker *shuttle.PermissionChecker
 
+	// Admission hook chain consulted before every tool body runs
+	admissionChain *shuttle.Chain
+
 	// Memory manager for conversation history
 	memory *Memory
 

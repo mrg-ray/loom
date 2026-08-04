@@ -51,9 +51,12 @@ type Executor struct {
 	sharedMemory        *storage.SharedMemoryStore
 	threshold           int64 // Threshold for using shared memory (bytes)
 	permissionChecker   *PermissionChecker
-	toolRegistry        ToolRegistry        // Tool registry for dynamic tool discovery
-	mcpManager          MCPManager          // MCP manager for dynamic MCP tool registration
-	builtinToolProvider BuiltinToolProvider // Builtin tool provider for dynamic builtin tool registration
+	admissionChain      *Chain                       // Admission hook chain; nil is a pure pass-through
+	approvedSet         ApprovedSetAccessor          // Approved-set accessor threaded to hooks; nil until wired (D-3)
+	identityResolver    func(context.Context) string // Resolves AdmissionRequest.UserID from ctx; nil yields ""
+	toolRegistry        ToolRegistry                 // Tool registry for dynamic tool discovery
+	mcpManager          MCPManager                   // MCP manager for dynamic MCP tool registration
+	builtinToolProvider BuiltinToolProvider          // Builtin tool provider for dynamic builtin tool registration
 
 	// Metrics for large parameter optimization
 	largeParamStores      atomic.Int64 // Count of parameters stored
@@ -90,6 +93,20 @@ func (e *Executor) SetPermissionChecker(checker *PermissionChecker) {
 	e.permissionChecker = checker
 }
 
+// SetAdmissionChain configures the admission hook chain consulted before every
+// tool body runs. A nil chain leaves execution as a pure pass-through.
+func (e *Executor) SetAdmissionChain(chain *Chain) {
+	e.admissionChain = chain
+}
+
+// SetIdentityResolver configures how AdmissionRequest.UserID is read from the
+// call context. pkg/shuttle cannot import the storage layer that owns the
+// user-id context key without an import cycle, so the composition layer injects
+// the resolver here. A nil resolver yields an empty UserID.
+func (e *Executor) SetIdentityResolver(resolver func(context.Context) string) {
+	e.identityResolver = resolver
+}
+
 // SetToolRegistry configures the tool registry for dynamic tool discovery.
 // When a tool is not found in the local registry, the executor will check
 // the tool registry and dynamically register MCP tools if found.
@@ -107,6 +124,55 @@ func (e *Executor) SetBuiltinToolProvider(provider BuiltinToolProvider) {
 	e.builtinToolProvider = provider
 }
 
+// admit runs the admission chain for a tool call. It returns the request handed
+// to the hooks, the admission result, and — when the decision is Deny — a ready
+// permission_denied Result to return in place of running the tool. A nil chain
+// is a pure pass-through: no request is built, no decision is reached, and the
+// tool runs exactly as if no chain were attached.
+func (e *Executor) admit(ctx context.Context, toolName string, params map[string]interface{}) (AdmissionRequest, AdmissionResult, *Result) {
+	if e.admissionChain == nil {
+		return AdmissionRequest{}, AdmissionResult{Decision: Decision{Kind: NoDecision}}, nil
+	}
+
+	userID := ""
+	if e.identityResolver != nil {
+		userID = e.identityResolver(ctx)
+	}
+
+	req := AdmissionRequest{
+		Ctx:       ctx,
+		ToolName:  toolName,
+		Params:    params,
+		UserID:    userID,
+		SessionID: session.SessionIDFromContext(ctx),
+		State:     e.approvedSet,
+	}
+
+	res := e.admissionChain.Admit(req)
+	if res.Decision.Kind == Deny {
+		denied := &Result{
+			Success: false,
+			Error:   &Error{Code: "permission_denied", Message: res.Decision.Reason, Retryable: false},
+		}
+		stampAdmissionDecision(denied, res.AuditDecision)
+		return req, res, denied
+	}
+
+	return req, res, nil
+}
+
+// stampAdmissionDecision records the audit decision on a Result's metadata when
+// a matched AuditHook produced one. It is a no-op for an empty decision.
+func stampAdmissionDecision(result *Result, auditDecision string) {
+	if result == nil || auditDecision == "" {
+		return
+	}
+	if result.Metadata == nil {
+		result.Metadata = make(map[string]interface{})
+	}
+	result.Metadata["admission.decision"] = auditDecision
+}
+
 // Execute executes a tool by name with the given parameters.
 func (e *Executor) Execute(ctx context.Context, toolName string, params map[string]interface{}) (*Result, error) {
 	tool, ok := e.registry.Get(toolName)
@@ -122,14 +188,13 @@ func (e *Executor) Execute(ctx context.Context, toolName string, params map[stri
 		tool = dynamicTool
 	}
 
-	// Check permissions before execution
-	if e.permissionChecker != nil {
-		if err := e.permissionChecker.CheckPermission(ctx, toolName, params); err != nil {
-			return &Result{
-				Success: false,
-				Error:   &Error{Code: "permission_denied", Message: err.Error(), Retryable: false},
-			}, nil
-		}
+	// Admit before execution. The tool is already acquired (locally or via
+	// dynamic registration) so an externally-resolved tool is governed at the
+	// same seam as a local one. A Deny returns the permission_denied Result
+	// without running the tool body.
+	req, adm, denied := e.admit(ctx, toolName, params)
+	if denied != nil {
+		return denied, nil
 	}
 
 	// Normalize parameters to match schema expectations
@@ -188,20 +253,19 @@ func (e *Executor) Execute(ctx context.Context, toolName string, params map[stri
 		}
 	}
 
+	stampAdmissionDecision(result, adm.AuditDecision)
+	e.admissionChain.Observe(req, result)
+
 	return result, nil
 }
 
 // ExecuteWithTool executes a specific tool instance (not from registry).
 func (e *Executor) ExecuteWithTool(ctx context.Context, tool Tool, params map[string]interface{}) (*Result, error) {
-	// Check permissions before execution
-	if e.permissionChecker != nil {
-		toolName := tool.Name()
-		if err := e.permissionChecker.CheckPermission(ctx, toolName, params); err != nil {
-			return &Result{
-				Success: false,
-				Error:   &Error{Code: "permission_denied", Message: err.Error(), Retryable: false},
-			}, nil
-		}
+	// Admit before execution. A Deny returns the permission_denied Result
+	// without running the tool body.
+	req, adm, denied := e.admit(ctx, tool.Name(), params)
+	if denied != nil {
+		return denied, nil
 	}
 
 	// Handle large parameters: store in shared memory to prevent context bloat
@@ -254,6 +318,9 @@ func (e *Executor) ExecuteWithTool(ctx context.Context, tool Tool, params map[st
 			ExecutionTimeMs: duration.Milliseconds(),
 		}
 	}
+
+	stampAdmissionDecision(result, adm.AuditDecision)
+	e.admissionChain.Observe(req, result)
 
 	return result, nil
 }

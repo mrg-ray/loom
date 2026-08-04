@@ -156,6 +156,12 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		a.executor.SetPermissionChecker(a.permissionChecker)
 	}
 
+	// Attach the admission hook chain if provided. A nil chain leaves the
+	// executor as a pure pass-through.
+	if a.admissionChain != nil {
+		a.executor.SetAdmissionChain(a.admissionChain)
+	}
+
 	// Set up system prompt function for memory
 	// This allows dynamic prompt loading from PromptRegistry
 	// Context is threaded through for proper RLS user_id propagation in PostgreSQL.
@@ -491,6 +497,15 @@ func WithCompressionProfile(profile *CompressionProfile) Option {
 func WithPermissionChecker(checker *shuttle.PermissionChecker) Option {
 	return func(a *Agent) {
 		a.permissionChecker = checker
+	}
+}
+
+// WithAdmissionHooks sets the admission hook chain consulted before every tool
+// body runs. The chain carries the name-level permission check as its first
+// hook; a nil chain leaves tool execution as a pure pass-through.
+func WithAdmissionHooks(chain *shuttle.Chain) Option {
+	return func(a *Agent) {
+		a.admissionChain = chain
 	}
 }
 
@@ -1191,7 +1206,6 @@ func (a *Agent) getSystemPrompt(ctx context.Context) string {
 	}
 
 	// Append graph memory instructions if graph memory is enabled
-
 
 	// Inject live task context (current tasks, ready front, board stats).
 	// Rebuilt from DB each turn — survives context compaction.

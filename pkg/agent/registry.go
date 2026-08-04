@@ -72,6 +72,7 @@ type Registry struct {
 
 	// Agent dependencies (injected by server)
 	permissionChecker *shuttle.PermissionChecker // For permission validation
+	admissionChain    *shuttle.Chain             // Admission hook chain for tool-call admission
 	artifactStore     interface{}                // artifacts.Store for workspace tool
 
 	// providerPool is the server-level named provider pool injected by cmd_serve.go.
@@ -145,6 +146,7 @@ type RegistryConfig struct {
 
 	// Agent dependencies (injected by server)
 	PermissionChecker *shuttle.PermissionChecker // For permission validation
+	AdmissionChain    *shuttle.Chain             // Admission hook chain for tool-call admission
 	ArtifactStore     interface{}                // artifacts.Store for workspace tool
 
 	// Database encryption (opt-in for enterprise deployments)
@@ -208,6 +210,7 @@ func NewRegistry(config RegistryConfig) (*Registry, error) {
 		sessionStore:      config.SessionStore,
 		toolRegistry:      config.ToolRegistry,
 		permissionChecker: config.PermissionChecker,
+		admissionChain:    config.AdmissionChain,
 		artifactStore:     config.ArtifactStore,
 	}
 
@@ -870,6 +873,9 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 	// Inject server dependencies if available
 	if r.permissionChecker != nil {
 		opts = append(opts, WithPermissionChecker(r.permissionChecker))
+	}
+	if r.admissionChain != nil {
+		opts = append(opts, WithAdmissionHooks(r.admissionChain))
 	}
 
 	// Create agent with configuration
