@@ -1557,7 +1557,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		time.Duration(config.Tools.Permissions.TimeoutSeconds)*time.Second,
 		time.Second,
 	)
-	admissionChain, err := createAdmissionChain(config, shuttle.ChainDeps{Perm: permissionChecker, Ask: askResolver}, logger)
+	admissionChain, err := createAdmissionChain(config, shuttle.ChainDeps{Perm: permissionChecker, Ask: askResolver, Custom: shuttle.ProcessCustomHookRegistry()}, logger)
 	if err != nil {
 		logger.Fatal("Failed to build admission chain", zap.Error(err))
 	}
