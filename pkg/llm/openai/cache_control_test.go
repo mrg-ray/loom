@@ -27,11 +27,11 @@ func TestChatStream_CacheControlAndUsage(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		// A token chunk, then the final chunk carrying usage with cache tokens.
-		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}]}\n\n")
-		io.WriteString(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],"+
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],"+
 			"\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"total_tokens\":105,"+
 			"\"cache_read_input_tokens\":80,\"cache_creation_input_tokens\":20}}\n\n")
-		io.WriteString(w, "data: [DONE]\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	}))
 	defer srv.Close()
 
