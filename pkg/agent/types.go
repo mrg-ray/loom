@@ -76,6 +76,11 @@ type Agent struct {
 	// Admission hook chain consulted before every tool body runs
 	admissionChain *shuttle.Chain
 
+	// Resolves the caller identity (AdmissionRequest.UserID) from the call
+	// context; injected here because pkg/shuttle cannot import the storage
+	// layer that owns the user-id context key without a cycle
+	identityResolver func(context.Context) string
+
 	// Memory manager for conversation history
 	memory *Memory
 

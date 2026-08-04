@@ -162,6 +162,11 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		a.executor.SetAdmissionChain(a.admissionChain)
 	}
 
+	// Wire the caller-identity resolver so admission requests carry UserID.
+	if a.identityResolver != nil {
+		a.executor.SetIdentityResolver(a.identityResolver)
+	}
+
 	// Set up system prompt function for memory
 	// This allows dynamic prompt loading from PromptRegistry
 	// Context is threaded through for proper RLS user_id propagation in PostgreSQL.
@@ -506,6 +511,16 @@ func WithPermissionChecker(checker *shuttle.PermissionChecker) Option {
 func WithAdmissionHooks(chain *shuttle.Chain) Option {
 	return func(a *Agent) {
 		a.admissionChain = chain
+	}
+}
+
+// WithIdentityResolver sets the resolver that reads the caller identity
+// (AdmissionRequest.UserID) from the call context. The value lookup is injected
+// by the composition root because pkg/agent cannot import the storage layer
+// that owns the user-id context key without an import cycle.
+func WithIdentityResolver(resolver func(context.Context) string) Option {
+	return func(a *Agent) {
+		a.identityResolver = resolver
 	}
 }
 
