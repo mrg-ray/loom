@@ -369,12 +369,39 @@ func (c *SDKClient) convertMessagesToSDK(messages []llmtypes.Message) (string, [
 				anthropic.NewToolResultBlock(msg.ToolUseID, msg.Content, false),
 			})
 		}
+		// Prompt-cache breakpoint the compile flagged (§ prompt caching). ROM and
+		// the summary are system messages, already cached via the System block
+		// above; here we mark the message breakpoint (the last stable message
+		// before any current-turn offload stub) on the block just appended.
+		if msg.CacheBreakpoint && msg.Role != "system" {
+			markLastBlockCacheControl(sdkMessages)
+		}
 	}
 
 	// Combine all system prompts
 	systemPrompt := strings.Join(systemPrompts, "\n\n")
 
 	return systemPrompt, sdkMessages
+}
+
+// markLastBlockCacheControl sets an ephemeral cache_control marker on the last
+// content block of the last SDK message — the wire form of a prompt-cache
+// breakpoint on the conversation prefix.
+func markLastBlockCacheControl(msgs []anthropic.MessageParam) {
+	if len(msgs) == 0 {
+		return
+	}
+	blocks := msgs[len(msgs)-1].Content
+	if len(blocks) == 0 {
+		return
+	}
+	b := &blocks[len(blocks)-1]
+	switch {
+	case b.OfText != nil:
+		b.OfText.CacheControl = anthropic.NewCacheControlEphemeralParam()
+	case b.OfToolResult != nil:
+		b.OfToolResult.CacheControl = anthropic.NewCacheControlEphemeralParam()
+	}
 }
 
 // appendUserOrCoalesceSDK appends content blocks to the last user message in
