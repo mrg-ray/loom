@@ -85,6 +85,12 @@ type SegmentedMemory struct {
 	kernelDirty        bool
 	l1Dirty            bool
 
+	// msgTokenCache memoises the tiktoken count of a rendered message content,
+	// so the compile-time estimate (§5.1) does not re-tokenize unchanged
+	// messages on every provider call. Keyed by the rendered string, so a stub,
+	// a whole row, and a folded form each cache separately.
+	msgTokenCache map[string]int
+
 	// Memory compression (the fold compressor)
 	compressor MemoryCompressor
 

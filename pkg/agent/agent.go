@@ -2287,29 +2287,16 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				zap.Strings("advertised", advertised))
 		}
 
-		// Proactive relief (primary trigger): shed BEFORE sending when loom's own
-		// compiled-context estimate crosses the proactive limit (90% of window,
-		// §5.1). This keeps the context off the provider's hard window, so relief
-		// no longer depends on catching a provider refusal — the refusal path
-		// below is now only a backstop for an under-estimate. Recompile messages
-		// and the advertised tool set after a shed, exactly as the backstop does,
-		// so a fold-deactivated skill's tools do not linger for this call.
+		// Relief runs at compile, before the send: ReleasePressure self-gates on
+		// loom's own estimate (§5.1) — a no-op under the start mark, otherwise it
+		// sheds to the release mark. On a shed, recompile messages and the
+		// advertised tool set so a fold-deactivated skill's tools do not linger.
 		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
-			if shed, terminal, estimate, target := segMem.MaybeReleaseProactively(ctx); shed {
-				zap.L().Info("proactive relief: estimate over limit, shed before send",
+			if shed, estimate, target := segMem.ReleasePressure(ctx, 0); shed {
+				zap.L().Info("relief: shed before send",
 					zap.String("session_id", session.ID),
-					zap.Bool("terminal", terminal),
 					zap.Int("estimate_tokens", estimate),
 					zap.Int("target_tokens", target))
-				if terminal {
-					// The current turn alone overflows loom's window; relief cannot
-					// touch it (§5.2). End the turn with the recoverable error rather
-					// than send a context we know is over — mirrors the backstop's
-					// terminal branch, but caught proactively.
-					return nil, recovery.buildRecoverableError("context_exhausted",
-						fmt.Errorf("context exceeds window after relief: estimate %d ≥ window", estimate),
-						"", map[string]any{"estimate": estimate, "target": target})
-				}
 				messages = session.GetMessages()
 				tools = a.advertisedTools(session)
 				tools = recovery.activeTools(tools)
@@ -2317,23 +2304,22 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			}
 		}
 
-		// Call LLM
+		// Call LLM. Relief is proactive (above) — loom keeps the context under its
+		// own window. The provider refusal is only a backstop: if a clean
+		// context-too-long still comes back (loom's estimate under-counted), shed
+		// and resend once; a second refusal ends the turn with the recoverable
+		// context_exhausted error.
 		llmResp, err := a.chatWithRetry(ctx, messages, tools)
 		if err != nil && errors.Is(err, llm.ErrContextTooLong) {
-			// HLD §5.2 step 12: the provider's positively-identified refusal is
-			// the ONLY relief trigger. Run releasePressure once, recompile, and
-			// send ONCE more; a second refusal ends the turn with the
-			// recoverable error carrying {estimate, target}.
 			if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
-				estimate, target := segMem.ReleasePressure(ctx)
+				_, estimate, target := segMem.ReleasePressure(ctx, pressureRecoveryPenalty)
 				zap.L().Info("context too long: relief pass complete, resending once",
 					zap.String("session_id", session.ID),
 					zap.Int("estimate_tokens", estimate),
 					zap.Int("target_tokens", target))
 				// Relief can deactivate a skill whose load pair was folded
 				// (HLD §4.5): its tools leave KERNEL. The resend is a recompile,
-				// so recompute BOTH messages and the advertised tool set — else a
-				// deactivated skill's tools linger for one more provider call.
+				// so recompute BOTH messages and the advertised tool set.
 				messages = session.GetMessages()
 				tools = a.advertisedTools(session)
 				if segMem2, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem2 != nil {

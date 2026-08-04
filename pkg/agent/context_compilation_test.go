@@ -189,8 +189,11 @@ func TestReleasePressure_EvictsThenFolds(t *testing.T) {
 	const sessionID = "sess-relief"
 	require.NoError(t, store.SaveSession(ctx, &Session{ID: sessionID, Context: map[string]interface{}{}}))
 
-	sm := NewSegmentedMemory("ROM", 2000, 200) // tiny window so target is small
-	sm.SetThreshold(512)
+	// Window sized so the release mark (60% = 3600) clears the irreducible current
+	// turn (~1740-token tool row) — otherwise eviction can never reach target and
+	// the pass always escalates to fold, folding the evicted rows out of view.
+	sm := NewSegmentedMemory("ROM", 6000, 600)
+	sm.SetThreshold(6000) // > the ~5KB tool rows, so they render WHOLE (evictable), not stubs
 	sm.SetSessionStore(store, sessionID)
 	sm.SetCompressor(&foldCompressor{out: "covers msg:1-4\nsummary of the old turns"})
 
@@ -202,14 +205,21 @@ func TestReleasePressure_EvictsThenFolds(t *testing.T) {
 		return m
 	}
 	for turn := 1; turn <= 7; turn++ {
+		// The whole tool rows (5000 B, under the 6000 threshold) are the pressure
+		// AND the eviction targets: their sum crosses the start mark, and evicting
+		// them reaches target without any fold — so the evicted rows stay visible.
 		persist("user", fmt.Sprintf("question %d", turn), "", nil, true)
 		callID := fmt.Sprintf("c%d", turn)
 		persist("assistant", "", "", []ToolCall{{ID: callID, Name: "bulk_scan", Input: map[string]interface{}{}}}, false)
-		persist("tool", strings.Repeat("r", 5000), callID, nil, false)
+		// Token-DENSE content (varied, ~4 B/tok), so evicting a whole row to a stub
+		// actually sheds tokens — a compressible run like "rrrr" tokenizes so
+		// cheaply that eviction saves nothing and the pass escalates to fold.
+		persist("tool", strings.Repeat("scan 12,345 db=SALES cpu=678 io=9; ", 145), callID, nil, false)
 	}
 	require.Equal(t, int64(7), sm.CurrentTurn())
 
-	estimate, target := sm.ReleasePressure(ctx)
+	shed, estimate, target := sm.ReleasePressure(ctx, 0)
+	assert.True(t, shed, "estimate should cross the start mark and shed")
 	assert.Greater(t, target, 0)
 	assert.Greater(t, estimate, 0)
 

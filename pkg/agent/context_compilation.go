@@ -224,105 +224,162 @@ func previewOf(content string) string {
 
 // --- estimate & target (HLD §5.1) -------------------------------------------
 
-// estimateLocked returns UTF-8 bytes of the compiled context, exactly as it
-// would be sent (serialized KERNEL + ROM + summary + L1 view), ÷ 3. The divisor
-// is 3, not the folk value 4: JSON and tabular data run ≈3 bytes per token.
-// Computed only inside releasePressure — never on the normal path, nothing
-// cached. Must hold lock.
+// msgFramingTokens is the per-message role/serialization overhead the provider
+// adds around each message — a small fixed add.
+const msgFramingTokens = 4
+
+// cheapBytesPerToken is the divisor for estimateLocked's cheap tier. It is
+// deliberately smaller than the real bytes-per-token of this system's content
+// (~3.3), so the byte bound OVER-counts tokens: the cheap tier may tokenize a
+// little early, but it never reports "under" when we are actually near the limit.
+const cheapBytesPerToken = 2.7
+
+// estimateLocked returns the token count of the compiled context (KERNEL + ROM +
+// summary + L1 view). Two tiers, so the tokenizer runs only near the limit:
+//   - cheap: a byte bound, no tokenization — if it is under the start mark we are
+//     safely under and it is returned as is;
+//   - accurate: near the limit only, the real tiktoken count (cached per rendered
+//     message).
+// Must hold lock.
 func (sm *SegmentedMemory) estimateLocked() int {
+	compiled := sm.compileLocked()
+
+	// Cheap tier — byte bound, no tokenization.
 	bytes := sm.kernelBytes
-	for _, m := range sm.compileLocked() {
-		bytes += len(m.Content)
-		if len(m.ToolCalls) > 0 {
-			if b, err := json.Marshal(m.ToolCalls); err == nil {
+	for i := range compiled {
+		bytes += len(compiled[i].Content)
+		if len(compiled[i].ToolCalls) > 0 {
+			if b, err := json.Marshal(compiled[i].ToolCalls); err == nil {
 				bytes += len(b)
 			}
 		}
 	}
-	return tokenFigure(bytes)
-}
-
-// targetLocked returns WarningThresholdPercent% of (window − reserved output),
-// both bound via SetContextLimits (HLD §5.1). Must hold lock.
-func (sm *SegmentedMemory) targetLocked() int {
-	pct := sm.compressionProfile.WarningThresholdPercent
-	if pct <= 0 {
-		pct = 75
+	cheap := int(float64(bytes) / cheapBytesPerToken)
+	if limit := sm.startMarkLocked(0); limit <= 0 || cheap < limit {
+		return cheap
 	}
-	return pct * (sm.tokenBudget.MaxTokens - sm.tokenBudget.ReservedTokens) / 100
-}
 
-// proactiveReliefPercent is the self-imposed relief limit as a percentage of the
-// model window: loom sheds when its own estimate reaches this, so the context
-// stays off the provider's hard window and relief never depends on catching a
-// provider refusal. The 10% headroom absorbs the output reservation and the
-// estimate's error; the provider-refusal path stays only as a backstop.
-const proactiveReliefPercent = 90
-
-// proactiveLimitLocked returns proactiveReliefPercent% of the window. Must hold
-// lock. Sits above targetLocked (75% of usable) so a shed does not immediately
-// re-trigger.
-func (sm *SegmentedMemory) proactiveLimitLocked() int {
-	return proactiveReliefPercent * sm.tokenBudget.MaxTokens / 100
-}
-
-// MaybeReleaseProactively runs one relief pass IFF the compiled-context estimate
-// is at or above the proactive limit (§5.1). This is the primary relief trigger:
-// loom's own accounting, evaluated at compile before every send — not the
-// provider's refusal. Safe to call every provider call; it is a cheap estimate
-// unless the limit is crossed.
-//
-// Returns:
-//   - shed:     a relief pass ran.
-//   - terminal: after shedding everything sheddable the estimate still exceeds
-//     the window — the current turn alone overflows loom's window, so the turn
-//     cannot proceed (§5.2). loom enforces its own window here rather than
-//     waiting for the provider, since a deployment's window may sit below the
-//     provider's real ceiling.
-//   - estimate,target: post-pass figures for logging / the terminal error.
-func (sm *SegmentedMemory) MaybeReleaseProactively(ctx context.Context) (shed, terminal bool, estimate, target int) {
-	sm.mu.Lock()
-	over := sm.estimateLocked() >= sm.proactiveLimitLocked()
-	window := sm.tokenBudget.MaxTokens
-	sm.mu.Unlock()
-	if !over {
-		return false, false, 0, 0
+	// Accurate tier — near the limit, tokenize (cached per rendered message).
+	tc := sm.tokenCounter
+	if tc == nil {
+		tc = GetTokenCounter()
 	}
-	// ReleasePressure takes the lock itself; its returned estimate is post-pass.
-	estimate, target = sm.ReleasePressure(ctx)
-	return true, estimate >= window, estimate, target
+	tokens := tokenFigure(sm.kernelBytes)
+	for i := range compiled {
+		tokens += sm.msgTokensLocked(tc, &compiled[i])
+	}
+	return tokens
+}
+
+// msgTokensLocked returns one compiled message's token count, memoising the
+// (large) content tokenization by its rendered string. Tool-call bytes are small
+// and counted each time. Must hold lock.
+func (sm *SegmentedMemory) msgTokensLocked(tc *TokenCounter, m *Message) int {
+	n, ok := sm.msgTokenCache[m.Content]
+	if !ok {
+		n = tc.CountTokens(m.Content)
+		if sm.msgTokenCache == nil {
+			sm.msgTokenCache = make(map[string]int)
+		}
+		if len(sm.msgTokenCache) > 8192 { // bound: drop wholesale rather than grow unbounded
+			sm.msgTokenCache = make(map[string]int)
+		}
+		sm.msgTokenCache[m.Content] = n
+	}
+	if len(m.ToolCalls) > 0 {
+		if b, err := json.Marshal(m.ToolCalls); err == nil {
+			n += tc.CountTokens(string(b))
+		}
+	}
+	return n + msgFramingTokens
+}
+
+// Pressure water marks, both a percentage of the model window (MaxTokens), one
+// base so start and release are directly comparable (HLD §5.1):
+//   - START (HWM): begin relief when the estimate reaches this.
+//   - RELEASE (LWM): shed down to this. The HWM−LWM gap is the hysteresis band —
+//     30% here — so relief fires about half as often as a 15% band would, each
+//     pass shedding more. The 10% below HWM is headroom for the output
+//     reservation and the estimate's error.
+const (
+	pressureStartPercent   = 90 // HWM: trigger relief
+	pressureReleasePercent = 60 // LWM: shed target
+)
+
+// pressureRecoveryPenalty lowers both water marks (percentage points) for the
+// one recovery pass after a provider refusal. A refusal means loom's estimate
+// under-counted — the normal marks did not shed enough — so retry with the bar
+// 20 points lower (start 70% / release 40%) to force the deeper shed the
+// estimate would not otherwise trigger.
+const pressureRecoveryPenalty = 20
+
+// startMarkLocked is the HWM: begin relief when the estimate reaches it. penalty
+// (percentage points) lowers it for the recovery pass. Must hold lock.
+func (sm *SegmentedMemory) startMarkLocked(penalty int) int {
+	return (pressureStartPercent - penalty) * sm.tokenBudget.MaxTokens / 100
+}
+
+// releaseMarkLocked is the LWM: shed down to it. penalty lowers it in step with
+// startMarkLocked so the recovery pass sheds deeper. Must hold lock.
+func (sm *SegmentedMemory) releaseMarkLocked(penalty int) int {
+	return (pressureReleasePercent - penalty) * sm.tokenBudget.MaxTokens / 100
 }
 
 // --- releasePressure (HLD §5.2) ----------------------------------------------
 
-// ReleasePressure is one complete relief pass, no sends inside it, entered only
-// from the provider's context-too-long refusal (§5.2 step 12): four operations
-// — evict(T−K) · evict(T−1) · fold(T−K) · fold(T−1) — all eviction before any
-// fold. After each operation that changed anything the recompiled context is
-// estimated; at ≤ target the pass returns — enough is shed. After the fourth
-// operation it returns regardless. Returns the final {estimate, target} for the
-// caller's single resend and terminal error.
-func (sm *SegmentedMemory) ReleasePressure(ctx context.Context) (estimate, target int) {
+// ReleasePressure is the relief pass, called at compile before every send. It
+// SELF-GATES on loom's own accounting: if the estimate is under the start mark
+// (HWM, §5.1) there is no pressure and it is a no-op. Otherwise it sheds to the
+// release mark (LWM) via the escalating evict-then-fold ladder below —
+// recompiling and re-estimating after each op, returning the instant the
+// estimate reaches the mark. Returns whether it shed and the post-pass
+// {estimate, target}.
+//
+// penalty (percentage points) lowers both marks. It is 0 for the normal compile
+// pass; on the one recovery pass after a provider refusal it is
+// pressureRecoveryPenalty, so a shed the normal gate would skip is forced — the
+// only place the provider's refusal touches relief.
+func (sm *SegmentedMemory) ReleasePressure(ctx context.Context, penalty int) (shed bool, estimate, target int) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+
+	if sm.estimateLocked() < sm.startMarkLocked(penalty) {
+		return false, 0, 0 // under the start mark — no pressure to release
+	}
 
 	t := sm.currentTurnLocked()
 	k := int64(sm.protectedRecentTurns)
 	if k <= 0 {
 		k = defaultProtectedRecentTurns
 	}
-	target = sm.targetLocked()
+	target = sm.releaseMarkLocked(penalty)
 	estimate = -1
 
-	ops := []struct {
+	// Escalation is a halving ladder (§5.2): keep the newest K turns, then K/2,
+	// K/4 … down to 1 — shed the minimum needed and preserve as much recent
+	// context as possible, instead of an all-or-nothing K-then-1 cliff. K is
+	// config (protectedRecentTurns, default 16); halving is the mechanism. All
+	// eviction (re-runnable) is tried before any fold (lossy); each op recompiles
+	// and the pass returns the instant the estimate reaches target.
+	type reliefOp struct {
 		name     string
 		boundary int64
 		run      func(context.Context, int64) bool
-	}{
-		{"evict", t - k, sm.evictLocked},
-		{"evict", t - 1, sm.evictLocked},
-		{"fold", t - k, sm.foldLocked},
-		{"fold", t - 1, sm.foldLocked},
+	}
+	var rungs []int64
+	seen := map[int64]bool{}
+	for step := k; step >= 1; step /= 2 {
+		if b := t - step; !seen[b] {
+			seen[b] = true
+			rungs = append(rungs, b)
+		}
+	}
+	ops := make([]reliefOp, 0, 2*len(rungs))
+	for _, b := range rungs {
+		ops = append(ops, reliefOp{"evict", b, sm.evictLocked})
+	}
+	for _, b := range rungs {
+		ops = append(ops, reliefOp{"fold", b, sm.foldLocked})
 	}
 	for _, op := range ops {
 		if !op.run(ctx, op.boundary) {
@@ -338,16 +395,16 @@ func (sm *SegmentedMemory) ReleasePressure(ctx context.Context) (estimate, targe
 			zap.Int("estimate_tokens", estimate),
 			zap.Int("target_tokens", target))
 		if estimate <= target {
-			return estimate, target
+			return true, estimate, target
 		}
 	}
 
 	if estimate < 0 {
-		// The pass computed no estimate (nothing changed) — compute once for
-		// the terminal error (§5.1).
+		// The pass ran but shed nothing (every region was already flagged) —
+		// compute once for the caller.
 		estimate = sm.estimateLocked()
 	}
-	return estimate, target
+	return true, estimate, target
 }
 
 // evictLocked marks evicted=true on every tool row with turn ≤ b whose stored
@@ -599,8 +656,10 @@ func foldedSkillLoads(region []Message) []string {
 	return names
 }
 
-// defaultProtectedRecentTurns is K (HLD §5.1): protected newest user turns.
-const defaultProtectedRecentTurns = 5
+// defaultProtectedRecentTurns is K (HLD §5.1): the top rung of the halving
+// escalation ladder — the newest user turns relief tries hardest to keep. The
+// ladder folds/evicts at K, K/2, K/4 … 1 (§5.2).
+const defaultProtectedRecentTurns = 16
 
 // SetProtectedRecentTurns configures K (config ProtectedRecentTurns, §9).
 func (sm *SegmentedMemory) SetProtectedRecentTurns(k int) {
