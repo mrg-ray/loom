@@ -86,14 +86,18 @@ func (sm *SegmentedMemory) compileLocked() []Message {
 	}
 
 	// Step 6 render cases + step 7 pair atomicity. Track the message cache
-	// breakpoint: the last message before any CURRENT-TURN offload stub. Those
-	// stubs re-render to evicted stubs next turn, so caching one would mismatch;
-	// everything before the first one is turn-stable and safe to cache.
+	// breakpoint: the last message before any CURRENT-TURN ephemeral content.
+	// Two kinds re-render differently once the turn settles, so caching either
+	// would mismatch the next call's prefix: (a) offload stubs, which re-render
+	// to evicted stubs next turn; (b) query_tool_result call/result pairs, which
+	// never persist (§4.3) and are pruned once the turn settles. Everything
+	// before the first of these is turn-stable and safe to cache.
 	msgs := sm.contextMessages
 	lastStable, frozen := len(out)-1, false
 	emit := func(m *Message) {
 		out = append(out, sm.renderLocked(m, t, callName))
-		if m.Role == "tool" && !m.Evicted && len(m.Content) > sm.threshold && m.Turn == t {
+		if m.Turn == t && ((m.Role == "tool" && !m.Evicted && len(m.Content) > sm.threshold) ||
+			(m.Role == "assistant" && hasQueryToolResultCall(m))) {
 			frozen = true
 		}
 		if !frozen {
@@ -143,6 +147,18 @@ func (sm *SegmentedMemory) compileLocked() []Message {
 	}
 
 	return out
+}
+
+// hasQueryToolResultCall reports whether an assistant message issues a
+// query_tool_result call. Its call/result pair is ephemeral (§4.3) and pruned
+// when the turn settles, so it must sit behind the cache breakpoint.
+func hasQueryToolResultCall(m *Message) bool {
+	for _, c := range m.ToolCalls {
+		if c.Name == "query_tool_result" {
+			return true
+		}
+	}
+	return false
 }
 
 // renderLocked applies §5.2 step 6's five render cases — first matching case

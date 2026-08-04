@@ -143,6 +143,10 @@ func firstSystemMessage(t *testing.T, rec contextDumpRecord) string {
 // comparison between turns.
 func messageJSON(t *testing.T, m Message) string {
 	t.Helper()
+	// CacheBreakpoint is a transient per-call cache directive, not authored
+	// content — it advances every turn as the stable frontier grows. Prefix-
+	// extension and rewrite checks compare content identity, so exclude it.
+	m.CacheBreakpoint = false
 	b, err := json.Marshal(m)
 	require.NoError(t, err)
 	return string(b)
