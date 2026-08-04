@@ -40,23 +40,36 @@ type ChainDeps struct {
 
 // BuildChainFromConfig assembles the admission chain from a tools.hooks config.
 // The name-level permission hook is placed first when a checker is supplied,
-// then one hook per binding in config order. A malformed binding — unknown
-// kind, empty scope, bad matcher/read pattern, a gated-allowlist missing
-// state_key/source_tool, or a custom name with no registered hook — is an
-// error, so serve aborts rather than run silently ungoverned (fail-closed).
+// then one hook per binding in config order. Each gated-allowlist binding also
+// contributes a recorder post-tool hook — the sole writer of its approved set —
+// so the render tool's completions populate the set the gated read side checks.
+// A malformed binding — unknown kind, empty scope, bad matcher/read pattern, a
+// gated-allowlist missing state_key/source_tool, or a custom name with no
+// registered hook — is an error, so serve aborts rather than run silently
+// ungoverned (fail-closed).
 func BuildChainFromConfig(cfg HooksConfig, deps ChainDeps) (*Chain, error) {
 	hooks := make([]Hook, 0, len(cfg.Bindings)+1)
 	if deps.Perm != nil {
 		hooks = append(hooks, newPermHook(deps.Perm))
 	}
+	var postHooks []PostToolHook
 	for i, b := range cfg.Bindings {
 		h, err := buildHook(b, deps)
 		if err != nil {
 			return nil, fmt.Errorf("tools.hooks[%d] (kind %q): %w", i, b.Kind, err)
 		}
 		hooks = append(hooks, h)
+		if b.Kind == "gated-allowlist" {
+			postHooks = append(postHooks, &recorder{
+				sourceTool: b.SourceTool,
+				stateKey:   b.StateKey,
+				stmtParam:  b.StmtParam,
+				resultPath: b.ResultPath,
+				state:      deps.ApprovedSet,
+			})
+		}
 	}
-	return NewChain(hooks, nil, deps.Ask), nil
+	return NewChain(hooks, postHooks, deps.Ask), nil
 }
 
 // buildHook compiles one binding into a Hook, validating every field the kind
