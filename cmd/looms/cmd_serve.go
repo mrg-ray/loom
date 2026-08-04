@@ -1549,7 +1549,15 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Build the admission chain: the name-level permission check folded in as the
 	// first hook, then the library policies from tools.hooks. A malformed binding
 	// aborts startup so a path is never left silently ungoverned (fail-closed).
-	admissionChain, err := createAdmissionChain(config, shuttle.ChainDeps{Perm: permissionChecker}, logger)
+	// An `ask` decision defers to the HITL store — the same SQLite store
+	// contact_human uses — so a human resolves the approval out of band. Timeout
+	// mirrors tools.permissions; the poll interval matches ContactHumanConfig (1s).
+	askResolver := shuttle.NewHITLAskResolver(
+		hitlStore,
+		time.Duration(config.Tools.Permissions.TimeoutSeconds)*time.Second,
+		time.Second,
+	)
+	admissionChain, err := createAdmissionChain(config, shuttle.ChainDeps{Perm: permissionChecker, Ask: askResolver}, logger)
 	if err != nil {
 		logger.Fatal("Failed to build admission chain", zap.Error(err))
 	}
