@@ -40,7 +40,7 @@ type Decision struct {
 }
 
 // AdmissionRequest is the immutable view of a tool call handed to every hook.
-// State is the approved-set accessor (supplied by D-3) and may be nil.
+// State is the approved-set accessor and may be nil until one is wired.
 type AdmissionRequest struct {
 	Ctx       context.Context
 	ToolName  string
@@ -70,11 +70,11 @@ type AskResolver interface {
 }
 
 // CallIdentity is the shared call-equality key for approved-set membership.
-// Its normalization (Canonicalize) is supplied by D-3.
+// Canonicalize is the normalization that derives it.
 type CallIdentity string
 
 // ApprovedSetAccessor records and queries prior approvals keyed by a caller
-// state key. Implementations are supplied by D-3.
+// state key.
 type ApprovedSetAccessor interface {
 	Record(ctx context.Context, stateKey string, ids []CallIdentity) error
 	Contains(ctx context.Context, stateKey string, id CallIdentity) (bool, error)

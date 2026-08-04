@@ -237,6 +237,11 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 			threshold = a.sharedMemoryThreshold
 		}
 		a.executor.SetSharedMemory(a.sharedMemory, threshold)
+
+		// Back the approved-set accessor with the same store so a gated-allowlist
+		// reads it as AdmissionRequest.State; membership inherits the store's
+		// per-session isolation.
+		a.executor.SetApprovedSet(shuttle.NewApprovedSet(a.sharedMemory))
 	}
 
 	// The findings channel is retired: neither the record_finding tool nor automatic
@@ -3679,6 +3684,11 @@ func (a *Agent) SetSharedMemory(sharedMemory *storage.SharedMemoryStore) {
 			threshold = a.sharedMemoryThreshold
 		}
 		a.executor.SetSharedMemory(sharedMemory, threshold)
+
+		// Back the approved-set accessor with the same store so a gated-allowlist
+		// reads it as AdmissionRequest.State; membership inherits the store's
+		// per-session isolation.
+		a.executor.SetApprovedSet(shuttle.NewApprovedSet(sharedMemory))
 	}
 
 	// Inject into memory manager (which handles all sessions)

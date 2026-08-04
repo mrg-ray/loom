@@ -18,7 +18,7 @@ import "fmt"
 // AdmissionResult is the outcome of running the chain for one tool call.
 // AuditDecision is set when a matched hook is an AuditHook and its
 // AuditDecisionFor returns a non-empty string; it is carried to the persist
-// path (D-6).
+// path.
 type AdmissionResult struct {
 	Decision      Decision
 	AuditDecision string

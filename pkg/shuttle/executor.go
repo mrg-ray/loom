@@ -52,7 +52,7 @@ type Executor struct {
 	threshold           int64 // Threshold for using shared memory (bytes)
 	permissionChecker   *PermissionChecker
 	admissionChain      *Chain                       // Admission hook chain; nil is a pure pass-through
-	approvedSet         ApprovedSetAccessor          // Approved-set accessor threaded to hooks; nil until wired (D-3)
+	approvedSet         ApprovedSetAccessor          // Approved-set accessor threaded to hooks as req.State; nil until an approved-set store is wired
 	identityResolver    func(context.Context) string // Resolves AdmissionRequest.UserID from ctx; nil yields ""
 	toolRegistry        ToolRegistry                 // Tool registry for dynamic tool discovery
 	mcpManager          MCPManager                   // MCP manager for dynamic MCP tool registration
@@ -97,6 +97,13 @@ func (e *Executor) SetPermissionChecker(checker *PermissionChecker) {
 // tool body runs. A nil chain leaves execution as a pure pass-through.
 func (e *Executor) SetAdmissionChain(chain *Chain) {
 	e.admissionChain = chain
+}
+
+// SetApprovedSet configures the approved-set accessor threaded to admission
+// hooks as AdmissionRequest.State. A nil accessor leaves a gated-allowlist with
+// no store to read, so it fails closed.
+func (e *Executor) SetApprovedSet(accessor ApprovedSetAccessor) {
+	e.approvedSet = accessor
 }
 
 // SetIdentityResolver configures how AdmissionRequest.UserID is read from the

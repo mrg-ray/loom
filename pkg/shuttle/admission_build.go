@@ -86,8 +86,8 @@ func buildHook(b HookBinding, deps ChainDeps) (Hook, error) {
 	}
 }
 
-// libraryHook is a config-built policy whose Matches is the D-2 selection
-// contract — scope ∧ matcher — and whose Evaluate is the kind's decision body,
+// libraryHook is a config-built policy whose Matches is the scope ∧ matcher
+// selection contract and whose Evaluate is the kind's decision body,
 // supplied as a closure at build time.
 type libraryHook struct {
 	scope   ToolScope
@@ -154,7 +154,7 @@ func gatedAllowlistHook(b HookBinding, scope ToolScope, matcher Matcher, deps Ch
 		if state == nil {
 			return Decision{Kind: Deny, Reason: "gated-allowlist has no approved-set store"}
 		}
-		ok, err := state.Contains(req.Ctx, stateKey, CallIdentity(stmt))
+		ok, err := state.Contains(req.Ctx, stateKey, Canonicalize(req.ToolName, req.Params, stmtParam))
 		if err != nil {
 			return Decision{Kind: Deny, Reason: fmt.Sprintf("approved-set lookup failed: %v", err)}
 		}
@@ -204,6 +204,24 @@ func (h libraryAuditHook) Evaluate(req AdmissionRequest) Decision {
 // AuditDecisionFor renders the chain's final verdict for the audit record.
 func (h libraryAuditHook) AuditDecisionFor(final Decision) string {
 	return decisionLabel(final.Kind)
+}
+
+// Canonicalize derives the call-equality key an approved-set membership check
+// compares on. Normalization is conservative and fail-closed — it prefers a
+// false-deny over a false-allow and never widens the equivalence class: it takes
+// the SQL statement param named by stmtParam, trims it, collapses internal
+// whitespace runs to a single space, and strips a trailing ';'. No keyword or
+// case folding, no semantic rewrite. The write side that records approvals and
+// this read side normalize through this one function, so a rendered statement
+// matches its re-emitted whitespace-different form while a textually-outside
+// statement does not. toolName selects the normalization; only the SQL statement
+// normalization exists today.
+func Canonicalize(toolName string, params map[string]interface{}, stmtParam string) CallIdentity {
+	stmt := stmtValue(params, stmtParam)
+	stmt = strings.Join(strings.Fields(stmt), " ") // trim + collapse whitespace runs
+	stmt = strings.TrimSuffix(stmt, ";")
+	stmt = strings.TrimRight(stmt, " ") // a ';' preceded by whitespace leaves one trailing space
+	return CallIdentity(stmt)
 }
 
 // stmtValue reads the statement param a gated-allowlist keys on; a missing or
