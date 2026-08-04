@@ -133,6 +133,7 @@ func (s *SessionStore) initSchema() error {
 		result_json TEXT,
 		error TEXT,
 		execution_time_ms INTEGER,
+		admission_decision TEXT,
 		timestamp INTEGER NOT NULL,
 		FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 	);
@@ -1205,9 +1206,16 @@ func (s *SessionStore) SaveToolExecution(ctx context.Context, sessionID string, 
 		execTimeMs = &exec.Result.ExecutionTimeMs
 	}
 
+	// Audit decision — NULL unless an audit binding matched this call (SC-004:
+	// only non-empty rows count as audit records).
+	var admissionDecision *string
+	if exec.AdmissionDecision != "" {
+		admissionDecision = &exec.AdmissionDecision
+	}
+
 	query := `
-		INSERT INTO tool_executions (session_id, tool_name, input_json, result_json, error, execution_time_ms, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO tool_executions (session_id, tool_name, input_json, result_json, error, execution_time_ms, admission_decision, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	_, err = s.db.ExecContext(ctx, query,
@@ -1217,6 +1225,7 @@ func (s *SessionStore) SaveToolExecution(ctx context.Context, sessionID string, 
 		resultJSON,
 		errMsg,
 		execTimeMs,
+		admissionDecision,
 		time.Now().Unix(),
 	)
 
