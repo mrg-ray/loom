@@ -30,6 +30,7 @@ import (
 
 	"github.com/teradata-labs/loom/pkg/agent"
 	"github.com/teradata-labs/loom/pkg/observability"
+	"github.com/teradata-labs/loom/pkg/shuttle"
 )
 
 // testPool creates a pgxpool connected to the integration test PostgreSQL instance.
@@ -228,6 +229,127 @@ func TestRLS_UserIsolation_ToolExecutions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, statsB.ToolExecutionCount,
 		"User B must NOT see User A's tool executions in stats")
+}
+
+// TestRLS_ToolExecutions_AuditDecision verifies the D-6 audit trail on persisted
+// tool_executions rows: the admission decision each governed call carries, that
+// exactly the matching calls (including a denied one) become audit records, that
+// non-matching calls carry none, and that the rows are per-user isolated.
+//
+// The audit binding runs upstream (pkg/shuttle admission chain → executor stamps
+// result.Metadata["admission.decision"] → agent reads it into
+// ToolExecution.AdmissionDecision); at the storage surface a matched call is one
+// whose ToolExecution carries a non-empty AdmissionDecision, and a non-matching
+// call is one that carries none. This drives SaveToolExecution with both and reads
+// the persisted rows back.
+func TestRLS_ToolExecutions_AuditDecision(t *testing.T) {
+	pool := testPool(t)
+	store := testSessionStore(t, pool)
+
+	userA := uniqueID("user-a")
+	userB := uniqueID("user-b")
+	sessionID := uniqueID("sess-audit")
+
+	createTestSession(t, store, userA, sessionID, "test-agent")
+	ctxA := ContextWithUserID(context.Background(), userA)
+
+	// Matching (audited) calls: two allowed + one denied. The denied call's run
+	// outcome is a failure (Success=false, permission_denied) yet its admission
+	// decision is "deny" — decision is distinct from outcome (ac1).
+	audited := []agent.ToolExecution{
+		{
+			ToolName:          "list_files",
+			Input:             map[string]interface{}{"path": "/"},
+			Result:            &shuttle.Result{Success: true},
+			AdmissionDecision: "allow",
+		},
+		{
+			ToolName:          "read_file",
+			Input:             map[string]interface{}{"path": "/etc/hosts"},
+			Result:            &shuttle.Result{Success: true},
+			AdmissionDecision: "allow",
+		},
+		{
+			ToolName: "delete_all",
+			Input:    map[string]interface{}{"path": "/"},
+			Result: &shuttle.Result{
+				Success: false,
+				Error: &shuttle.Error{
+					Code:    "permission_denied",
+					Message: "permission_denied: blocked by admission policy",
+				},
+			},
+			AdmissionDecision: "deny",
+		},
+	}
+	// Non-matching calls: the audit matcher selected no calls, so these carry no
+	// decision and must not become audit records (ac3).
+	nonMatching := []agent.ToolExecution{
+		{
+			ToolName: "ping",
+			Input:    map[string]interface{}{},
+			Result:   &shuttle.Result{Success: true},
+		},
+		{
+			ToolName: "status",
+			Input:    map[string]interface{}{},
+			Result:   &shuttle.Result{Success: true},
+		},
+	}
+	wantAudited := len(audited)         // 3 matching calls -> 3 audit records
+	wantNonMatching := len(nonMatching) // 2 non-matching calls -> 0 audit records
+
+	for _, exec := range append(append([]agent.ToolExecution{}, audited...), nonMatching...) {
+		require.NoError(t, store.SaveToolExecution(ctxA, sessionID, exec),
+			"userA should be able to persist tool execution %q", exec.ToolName)
+	}
+
+	// ac2: one audit record per matching call — count(rows with a decision) equals
+	// the number of matching calls (SC-004), the denied call included.
+	var auditRecordCount int
+	require.NoError(t, execInTxNoRLS(context.Background(), pool, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			"SELECT count(*) FROM tool_executions WHERE session_id=$1 AND admission_decision IS NOT NULL",
+			sessionID).Scan(&auditRecordCount)
+	}))
+	assert.Equal(t, wantAudited, auditRecordCount,
+		"count(audit records) must equal count(matching calls), denied call included")
+
+	// ac3: the non-matching calls persisted rows but no audit records (NULL decision).
+	var nonMatchingRows int
+	require.NoError(t, execInTxNoRLS(context.Background(), pool, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			"SELECT count(*) FROM tool_executions WHERE session_id=$1 AND admission_decision IS NULL",
+			sessionID).Scan(&nonMatchingRows)
+	}))
+	assert.Equal(t, wantNonMatching, nonMatchingRows,
+		"non-matching calls must persist rows carrying no admission decision (not audit records)")
+
+	// ac1: the denied call's record carries decision "deny", distinct from its
+	// failed run outcome (error column = permission_denied).
+	var denyDecision, denyError string
+	require.NoError(t, execInTxNoRLS(context.Background(), pool, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			"SELECT admission_decision, error FROM tool_executions WHERE session_id=$1 AND tool_name='delete_all'",
+			sessionID).Scan(&denyDecision, &denyError)
+	}))
+	assert.Equal(t, "deny", denyDecision,
+		"a denied call's record must show a deny admission decision")
+	assert.Contains(t, denyError, "permission_denied",
+		"the denied call's run outcome (error) must be present and distinct from its deny decision")
+
+	// ac4: per-user isolation of the persisted rows (real postgres user_id RLS).
+	// userA sees exactly its own executions; userB sees none.
+	statsA, err := store.GetStats(ctxA)
+	require.NoError(t, err)
+	assert.Equal(t, wantAudited+wantNonMatching, statsA.ToolExecutionCount,
+		"userA must see all of its own tool executions")
+
+	ctxB := ContextWithUserID(context.Background(), userB)
+	statsB, err := store.GetStats(ctxB)
+	require.NoError(t, err)
+	assert.Equal(t, 0, statsB.ToolExecutionCount,
+		"userB must see zero of userA's tool executions (incl. audit records)")
 }
 
 // TestRLS_UserIsolation_MemorySnapshots verifies that memory snapshots are isolated by user.
