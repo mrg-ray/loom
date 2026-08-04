@@ -612,10 +612,11 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	apiTools := c.convertTools(tools)
 
 	req := &ChatCompletionRequest{
-		Model:       c.model,
-		Messages:    apiMessages,
-		Temperature: c.temperature,
-		Stream:      true, // Enable streaming
+		Model:         c.model,
+		Messages:      apiMessages,
+		Temperature:   c.temperature,
+		Stream:        true,                               // Enable streaming
+		StreamOptions: &StreamOptions{IncludeUsage: true}, // final usage chunk (tokens + cache)
 	}
 	if c.usesMaxCompletionTokens() {
 		req.MaxCompletionTokens = c.maxTokens
@@ -763,6 +764,8 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 			usage.InputTokens = chunk.Usage.PromptTokens
 			usage.OutputTokens = chunk.Usage.CompletionTokens
 			usage.TotalTokens = chunk.Usage.TotalTokens
+			usage.CacheReadInputTokens = chunk.Usage.CacheRead()
+			usage.CacheCreationInputTokens = chunk.Usage.CacheCreationInputTokens
 		}
 
 		// Check context cancellation
@@ -798,6 +801,10 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		usage.TotalTokens = tokenCount // Input tokens not available in stream
 	}
 	usage.CostUSD = c.calculateCost(usage.InputTokens, usage.OutputTokens)
+	zap.L().Info("prompt cache usage (stream)",
+		zap.Int("input_tokens", usage.InputTokens),
+		zap.Int("cache_read", usage.CacheReadInputTokens),
+		zap.Int("cache_creation", usage.CacheCreationInputTokens))
 
 	// Record token usage for rate limiter metrics
 	if c.rateLimiter != nil {

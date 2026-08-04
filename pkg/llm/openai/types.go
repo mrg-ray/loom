@@ -29,11 +29,18 @@ type ChatCompletionRequest struct {
 	Tools               []Tool                 `json:"tools,omitempty"`
 	ToolChoice          interface{}            `json:"tool_choice,omitempty"` // "auto", "none", or {"type": "function", "function": {"name": "..."}}
 	Stream              bool                   `json:"stream,omitempty"`
+	StreamOptions       *StreamOptions         `json:"stream_options,omitempty"`
 	User                string                 `json:"user,omitempty"`
 	ResponseFormat      map[string]interface{} `json:"response_format,omitempty"`
 }
 
 // ChatMessage represents a message in the conversation.
+// StreamOptions requests a final usage chunk during streaming so token and
+// prompt-cache accounting is available (OpenAI/litellm stream_options).
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
+}
+
 type ChatMessage struct {
 	Role       string      `json:"role"` // "system", "user", "assistant", "tool"
 	Content    interface{} `json:"content,omitempty"`
