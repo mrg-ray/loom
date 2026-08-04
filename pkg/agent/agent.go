@@ -1191,7 +1191,7 @@ func (a *Agent) getSystemPrompt(ctx context.Context) string {
 	}
 
 	// Append graph memory instructions if graph memory is enabled
-	basePrompt += a.graphMemoryPromptSupplement()
+
 
 	// Inject live task context (current tasks, ready front, board stats).
 	// Rebuilt from DB each turn — survives context compaction.
@@ -1205,7 +1205,7 @@ func (a *Agent) getSystemPrompt(ctx context.Context) string {
 	// session creation, so it stays byte-stable for the whole session.
 	basePrompt += a.skillMenuPromptSupplement()
 
-	return formatSystemPromptWithDatetime(basePrompt, a.workflowCommContext)
+	return basePrompt
 }
 
 // skillMenuPromptSupplement renders the agent's bound skills as a
@@ -1236,8 +1236,8 @@ func (a *Agent) skillMenuPromptSupplement() string {
 	}
 
 	var b strings.Builder
-	b.WriteString("\n\n---\n\nAVAILABLE SKILLS\n\n")
-	b.WriteString("These skills are bound to this agent. Load one with the manage_skills load action to bring its instructions into the conversation; until then only the name and description below are in context.\n\n")
+	b.WriteString("\n\n---\n\n# Available skills\n\n")
+	b.WriteString("Bound to this agent. Load with manage_skills to bring instructions into the conversation; until then, only the name + description below are in context.\n\n")
 	for _, rb := range resolved {
 		if rb.Skill == nil {
 			continue
