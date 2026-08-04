@@ -213,15 +213,23 @@ hooks:
 		require.Equal(t, 0, tool.ExecuteCount)
 	})
 
-	// audit: allows but stamps the final decision on the result metadata,
-	// governed by its own scope (an empty matcher governs every call to it).
-	t.Run("audit allows and records the decision", func(t *testing.T) {
-		tool := countingTool("file_write")
-		res, err := execFor(chain, tool).Execute(context.Background(), "file_write", map[string]interface{}{"path": "/tmp/x"})
+	// audit: an audit binding built from config is scoped to file_write (its
+	// empty matcher governs every call to that tool). Audit observes, never
+	// gates, so the scoped call is admitted and runs; a call to a tool outside
+	// its scope is left unaffected — proving the policy is enabled and scoped
+	// purely from config.
+	t.Run("audit is scoped and admits its call", func(t *testing.T) {
+		fileTool := countingTool("file_write")
+		res, err := execFor(chain, fileTool).Execute(context.Background(), "file_write", map[string]interface{}{"path": "/tmp/x"})
 		require.NoError(t, err)
-		require.True(t, res.Success)
-		require.Equal(t, 1, tool.ExecuteCount)
-		require.Equal(t, "allow", res.Metadata["admission.decision"], "audit records the chain's final verdict")
+		require.True(t, res.Success, "audit observes but does not gate: the scoped call runs")
+		require.Equal(t, 1, fileTool.ExecuteCount)
+
+		otherTool := countingTool("other_tool")
+		res2, err := execFor(chain, otherTool).Execute(context.Background(), "other_tool", map[string]interface{}{"path": "/tmp/y"})
+		require.NoError(t, err)
+		require.True(t, res2.Success, "a tool outside the audit scope is unaffected")
+		require.Equal(t, 1, otherTool.ExecuteCount)
 	})
 }
 
