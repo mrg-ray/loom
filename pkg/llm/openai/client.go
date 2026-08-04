@@ -14,6 +14,8 @@
 package openai
 
 import (
+	"go.uber.org/zap"
+
 	"bufio"
 	"bytes"
 	"context"
@@ -309,7 +311,39 @@ func (c *Client) convertMessages(messages []llmtypes.Message) []ChatMessage {
 		}
 	}
 
+	// Prompt-cache breakpoints: the compile marks the "perfect place" (ROM,
+	// summary, last message before any current-turn offload stub). Each maps 1:1
+	// to an apiMessage; convert its content to the block form litellm forwards to
+	// Anthropic as cache_control. Anthropic allows at most 4 breakpoints; the
+	// compile marks at most three (+ the tool list), so we stay within budget.
+	for i := range messages {
+		if i < len(apiMessages) && messages[i].CacheBreakpoint {
+			apiMessages[i].Content = withCacheControl(apiMessages[i].Content)
+		}
+	}
+
 	return apiMessages
+}
+
+// withCacheControl rewrites a message's content into the block form carrying a
+// cache_control marker on its last block. A plain string becomes a single text
+// block; an existing block list gets the marker appended to its last block.
+func withCacheControl(content interface{}) interface{} {
+	cc := map[string]interface{}{"type": "ephemeral"}
+	switch v := content.(type) {
+	case string:
+		if v == "" {
+			return content
+		}
+		return []map[string]interface{}{{"type": "text", "text": v, "cache_control": cc}}
+	case []map[string]interface{}:
+		if len(v) > 0 {
+			v[len(v)-1]["cache_control"] = cc
+		}
+		return v
+	default:
+		return content
+	}
 }
 
 // convertTools converts shuttle tools to OpenAI format.
@@ -414,16 +448,25 @@ func (c *Client) convertSchemaProperties(props map[string]*shuttle.JSONSchema) m
 func (c *Client) convertResponse(resp *ChatCompletionResponse) *llmtypes.LLMResponse {
 	llmResp := &llmtypes.LLMResponse{
 		Usage: llmtypes.Usage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-			TotalTokens:  resp.Usage.TotalTokens,
-			CostUSD:      c.calculateCost(resp.Usage.PromptTokens, resp.Usage.CompletionTokens),
+			InputTokens:              resp.Usage.PromptTokens,
+			OutputTokens:             resp.Usage.CompletionTokens,
+			TotalTokens:              resp.Usage.TotalTokens,
+			CacheReadInputTokens:     resp.Usage.CacheRead(),
+			CacheCreationInputTokens: resp.Usage.CacheCreationInputTokens,
+			CostUSD:                  c.calculateCost(resp.Usage.PromptTokens, resp.Usage.CompletionTokens),
 		},
 		Metadata: map[string]interface{}{
 			"model":         resp.Model,
 			"finish_reason": resp.Choices[0].FinishReason,
 		},
 	}
+
+	// Prompt-cache measurement: one line per call so a run's hit rate is legible
+	// in the logs (cache_read>0 means the provider served a cached prefix).
+	zap.L().Info("prompt cache usage",
+		zap.Int("input_tokens", resp.Usage.PromptTokens),
+		zap.Int("cache_read", resp.Usage.CacheRead()),
+		zap.Int("cache_creation", resp.Usage.CacheCreationInputTokens))
 
 	if len(resp.Choices) > 0 {
 		choice := resp.Choices[0]

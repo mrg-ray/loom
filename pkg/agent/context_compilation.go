@@ -60,14 +60,16 @@ const evictedStubFormat = "[%s result, ~%d tokens, evicted from context — re-r
 func (sm *SegmentedMemory) compileLocked() []Message {
 	out := make([]Message, 0, len(sm.contextMessages)+2)
 
-	// Step 2: ROM.
+	// Step 2: ROM. Its own cache breakpoint — the most stable prefix; survives a
+	// fold, which only invalidates from the summary downward.
 	if sm.romContent != "" {
-		out = append(out, Message{Role: "system", Content: sm.romContent})
+		out = append(out, Message{Role: "system", Content: sm.romContent, CacheBreakpoint: true})
 	}
 
-	// Step 3: the summary's newest version, one system message.
+	// Step 3: the summary's newest version, one system message. Its own cache
+	// breakpoint — stable until the next fold rewrites it.
 	if sm.summary.text != "" {
-		out = append(out, Message{Role: "system", Content: sm.summary.text})
+		out = append(out, Message{Role: "system", Content: sm.summary.text, CacheBreakpoint: true})
 	}
 
 	// Step 5: T — the session's current turn number.
@@ -83,11 +85,24 @@ func (sm *SegmentedMemory) compileLocked() []Message {
 		}
 	}
 
-	// Step 6 render cases + step 7 pair atomicity.
+	// Step 6 render cases + step 7 pair atomicity. Track the message cache
+	// breakpoint: the last message before any CURRENT-TURN offload stub. Those
+	// stubs re-render to evicted stubs next turn, so caching one would mismatch;
+	// everything before the first one is turn-stable and safe to cache.
 	msgs := sm.contextMessages
+	lastStable, frozen := len(out)-1, false
+	emit := func(m *Message) {
+		out = append(out, sm.renderLocked(m, t, callName))
+		if m.Role == "tool" && !m.Evicted && len(m.Content) > sm.threshold && m.Turn == t {
+			frozen = true
+		}
+		if !frozen {
+			lastStable = len(out) - 1
+		}
+	}
 	for i := 0; i < len(msgs); i++ {
 		m := msgs[i]
-		out = append(out, sm.renderLocked(&m, t, callName))
+		emit(&m)
 
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
 			// Consume this call batch's contiguous tool results, then emit a
@@ -103,7 +118,7 @@ func (sm *SegmentedMemory) compileLocked() []Message {
 			for j < len(msgs) && msgs[j].Role == "tool" {
 				r := msgs[j]
 				delete(missing, r.ToolUseID)
-				out = append(out, sm.renderLocked(&r, t, callName))
+				emit(&r)
 				j++
 			}
 			for _, c := range m.ToolCalls {
@@ -113,10 +128,18 @@ func (sm *SegmentedMemory) compileLocked() []Message {
 						ToolUseID: c.ID,
 						Content:   syntheticFailedResult,
 					})
+					if !frozen {
+						lastStable = len(out) - 1
+					}
 				}
 			}
 			i = j - 1
 		}
+	}
+
+	// The message breakpoint (ROM/summary already carry their own).
+	if lastStable >= 0 && !out[lastStable].CacheBreakpoint {
+		out[lastStable].CacheBreakpoint = true
 	}
 
 	return out
@@ -241,6 +264,7 @@ const cheapBytesPerToken = 2.7
 //     safely under and it is returned as is;
 //   - accurate: near the limit only, the real tiktoken count (cached per rendered
 //     message).
+//
 // Must hold lock.
 func (sm *SegmentedMemory) estimateLocked() int {
 	compiled := sm.compileLocked()

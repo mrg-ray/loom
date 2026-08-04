@@ -91,6 +91,26 @@ type ChatCompletionUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// Prompt-cache accounting. litellm forwards Anthropic usage as these two
+	// top-level fields; some gateways use the OpenAI-style
+	// prompt_tokens_details.cached_tokens instead — read both.
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	PromptTokensDetails      *struct {
+		CachedTokens int `json:"cached_tokens,omitempty"`
+	} `json:"prompt_tokens_details,omitempty"`
+}
+
+// CacheRead returns the prompt-cache read tokens from whichever field the
+// gateway populated.
+func (u ChatCompletionUsage) CacheRead() int {
+	if u.CacheReadInputTokens > 0 {
+		return u.CacheReadInputTokens
+	}
+	if u.PromptTokensDetails != nil {
+		return u.PromptTokensDetails.CachedTokens
+	}
+	return 0
 }
 
 // OpenAIError represents an error from the OpenAI API.
