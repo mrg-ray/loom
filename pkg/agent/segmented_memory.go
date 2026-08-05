@@ -127,7 +127,7 @@ type SegmentedMemory struct {
 	// Active pattern tracking (optional)
 	patternName string // Name of the active pattern, surfaced via GetActivePattern
 
-	// Configuration (reporting + the relief target's WarningThresholdPercent)
+	// Configuration (the profile carries the relief water marks, §5.1)
 	maxL1Tokens        int
 	minL1Messages      int
 	compressionProfile CompressionProfile
@@ -248,14 +248,23 @@ func (sm *SegmentedMemory) SetSessionStore(store SessionStorage, sessionID strin
 
 // SetThreshold sets the one threshold value in bytes (HLD §5.1: one value,
 // three roles — compile-time offload bound, persist-time row bound, retrieval
-// page bound). Non-positive values keep the current threshold.
+// page bound). Non-positive values keep the current threshold; positive values
+// below minThreshold clamp to it — the truncation tail alone runs ~150 bytes,
+// so a tinier bound could not hold stored = core + tail ≤ threshold.
 func (sm *SegmentedMemory) SetThreshold(bytes int64) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	if bytes > 0 {
+		if bytes < minThreshold {
+			bytes = minThreshold
+		}
 		sm.threshold = int(bytes)
 	}
 }
+
+// minThreshold is the floor for the §5.1 threshold: enough room for the §4.1
+// truncation tail plus a meaningful core.
+const minThreshold = 256
 
 // Threshold returns the configured threshold in bytes.
 func (sm *SegmentedMemory) Threshold() int {
@@ -333,14 +342,6 @@ func (sm *SegmentedMemory) AddMessage(ctx context.Context, msg Message) {
 	}
 }
 
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // adjustCompressionBoundary ensures tool_use/tool_result pairs stay together
 // (pair atomicity — HLD §11): a fold region never splits a call from its
 // result. Returns the adjusted boundary count. Must hold lock.
@@ -400,14 +401,20 @@ func (sm *SegmentedMemory) adjustCompressionBoundary(toCompressCount int) int {
 		for gIdx, g := range groups {
 			lastToolIdx, hasResults := groupLastToolIdx[gIdx]
 			isComplete := hasResults && groupFoundCount[gIdx] == len(g.toolCallIDs)
+			// A PRIOR-turn group missing results will never gain them — the
+			// crash window closed and compile synthesizes the missing result
+			// (§5.2 step 7) — so it must not block the boundary forever.
+			staleIncomplete := !isComplete &&
+				sm.contextMessages[g.assistantIdx].Turn < sm.currentTurnLocked()
 
 			if g.assistantIdx < toCompressCount {
 				// Assistant would fold.
-				if !isComplete {
-					// Incomplete group: pull boundary back to exclude assistant.
+				if !isComplete && !staleIncomplete {
+					// Incomplete current-turn group: results may still arrive —
+					// pull boundary back to exclude the assistant.
 					toCompressCount = g.assistantIdx
 					changed = true
-				} else if lastToolIdx >= toCompressCount {
+				} else if hasResults && lastToolIdx >= toCompressCount {
 					// Assistant folds but some tool_results stay in L1 — pull back.
 					toCompressCount = g.assistantIdx
 					changed = true

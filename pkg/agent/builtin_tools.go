@@ -292,6 +292,12 @@ func (t *QueryToolResultTool) paginate(payload string, input map[string]interfac
 			end = i
 			break
 		}
+		// A single unit larger than the whole page budget must not ride whole —
+		// the page bound is the same §5.1 threshold as every other bound. Bound
+		// it with the §4.1 tail so the cut is explicit.
+		if len(u) > budget {
+			u = truncateToolRowContent(u, budget)
+		}
 		page = append(page, u)
 		used += len(u) + 1
 	}

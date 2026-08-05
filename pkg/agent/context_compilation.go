@@ -187,9 +187,14 @@ func (sm *SegmentedMemory) renderLocked(m *Message, t int64, callName map[string
 }
 
 // offloadStub renders the §5.5 offload stub for a current-turn result strictly
-// over the threshold.
+// over the threshold. A row with no durable ID (storeless session) has no
+// query_tool_result door — printing message_id=0 would advertise a door that
+// errors — so it renders the evicted stub, whose only door is re-run.
 func (sm *SegmentedMemory) offloadStub(m *Message, callName map[string]string) string {
 	id, _ := strconv.ParseInt(m.ID, 10, 64)
+	if id <= 0 {
+		return sm.evictedStub(m, callName)
+	}
 	return fmt.Sprintf(offloadStubFormat,
 		stubToolName(m, callName),
 		tokenFigure(len(m.Content)),
@@ -471,8 +476,9 @@ func (sm *SegmentedMemory) ReleasePressure(ctx context.Context, penalty int) (sh
 
 	if estimate < 0 {
 		// The pass ran but shed nothing (every region was already flagged) —
-		// compute once for the caller.
-		estimate = sm.estimateLocked()
+		// compute once for the caller and say so honestly: a false return
+		// spares the caller a pointless recompile and resend.
+		return false, sm.estimateLocked(), target
 	}
 	return true, estimate, target
 }
@@ -609,8 +615,10 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 		if err == nil && compressed != "" {
 			newText = strings.TrimSpace(compressed)
 			// The first line states the covered span (§5.4.4) — enforced here
-			// when the compressor omitted it.
-			if !strings.HasPrefix(newText, "covers msg:") {
+			// when the compressor omitted it OR echoed a stale line: a span
+			// whose upper bound is below hiSeq under-claims this fold's
+			// coverage, and coverage is never silently lost.
+			if !coversThrough(newText, hiSeq) {
 				newText = fmt.Sprintf("covers msg:%d-%d\n", loSeq, hiSeq) + newText
 			}
 		}
@@ -715,6 +723,30 @@ func firstUserLine(region []Message) string {
 // foldedSkillLoads returns the names of skills whose manage_skills load pair —
 // the load call paired with a "Skill loaded: " confirmation — lies inside the
 // region.
+// coversThrough reports whether text opens with a "covers msg:A-B" line whose
+// upper bound reaches hiSeq — i.e. the span line genuinely claims this fold's
+// coverage, not a stale echo of a previous version's line.
+func coversThrough(text string, hiSeq int64) bool {
+	first := text
+	if i := strings.IndexByte(first, '\n'); i >= 0 {
+		first = first[:i]
+	}
+	rest, ok := strings.CutPrefix(first, "covers msg:")
+	if !ok {
+		return false
+	}
+	parts := strings.SplitN(strings.TrimSpace(rest), "-", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	fields := strings.Fields(parts[1])
+	if len(fields) == 0 {
+		return false
+	}
+	hi, err := strconv.ParseInt(fields[0], 10, 64)
+	return err == nil && hi >= hiSeq
+}
+
 func foldedSkillLoads(region []Message) []string {
 	loadCalls := make(map[string]string) // tool_use_id → skill name
 	for i := range region {
