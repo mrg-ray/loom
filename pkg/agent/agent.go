@@ -3420,6 +3420,9 @@ func (a *Agent) DeleteSession(sessionID string) {
 	a.mu.Lock()
 	delete(a.sessionToolLedger, sessionID)
 	a.mu.Unlock()
+	// In-turn SQLite databases are normally dropped at the session's next turn
+	// start; a deleted session has no next turn, so drop them here.
+	a.dropInTurnSQLite(sessionID)
 }
 
 // ClearAllSessions removes all sessions from memory.
@@ -3429,6 +3432,7 @@ func (a *Agent) ClearAllSessions() {
 	a.mu.Lock()
 	a.sessionToolLedger = make(map[string]map[string]bool)
 	a.mu.Unlock()
+	a.dropAllInTurnSQLite()
 }
 
 // CreateSession creates a new session without sending a message to the LLM.

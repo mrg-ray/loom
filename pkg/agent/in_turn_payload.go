@@ -143,6 +143,16 @@ func (a *Agent) dropInTurnSQLite(sessionID string) {
 	}
 }
 
+// dropAllInTurnSQLite drops every session's in-turn SQLite databases.
+func (a *Agent) dropAllInTurnSQLite() {
+	a.inTurnSQLMu.Lock()
+	defer a.inTurnSQLMu.Unlock()
+	for key, db := range a.inTurnSQL {
+		_ = db.Close()
+		delete(a.inTurnSQL, key)
+	}
+}
+
 // tabularPayload parses a payload into columns + rows. Accepted shapes: an
 // array of uniform objects, or {columns, rows}. Anything else errors —
 // paging-only.
