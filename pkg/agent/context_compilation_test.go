@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"github.com/teradata-labs/loom/pkg/observability"
 )
 
@@ -225,9 +226,10 @@ func TestReleasePressure_EvictsThenFolds(t *testing.T) {
 	const sessionID = "sess-relief"
 	require.NoError(t, store.SaveSession(ctx, &Session{ID: sessionID, Context: map[string]interface{}{}}))
 
-	// Window sized so the release mark (60% = 3600) clears the irreducible current
-	// turn (~1740-token tool row) — otherwise eviction can never reach target and
-	// the pass always escalates to fold, folding the evicted rows out of view.
+	// Window sized so the release mark (60% of usable 5400 = 3240) clears the
+	// irreducible current turn (~1740-token tool row) — otherwise eviction can
+	// never reach target and the pass always escalates to fold, folding the
+	// evicted rows out of view.
 	sm := NewSegmentedMemory("ROM", 6000, 600)
 	sm.SetThreshold(6000) // > the ~5KB tool rows, so they render WHOLE (evictable), not stubs
 	sm.SetSessionStore(store, sessionID)
@@ -317,4 +319,51 @@ func TestReFireOnRestore_DurableKey(t *testing.T) {
 	}, nil)
 	assert.Equal(t, []string{"alpha-skill"}, activated,
 		"re-fire keys on the manage_skills load call paired with a 'Skill loaded: ' confirmation")
+}
+
+func TestPressureMarks_UsableBase(t *testing.T) {
+	// Marks are percentages of usable = window − output reservation, never of
+	// the full window: a mark above usable would sit beyond the provider's
+	// refusal line and never fire.
+	sm := NewSegmentedMemory("ROM", 200000, 64000)
+	usable := 200000 - 64000
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	assert.Equal(t, 90*usable/100, sm.startMarkLocked(0))
+	assert.Equal(t, 60*usable/100, sm.releaseMarkLocked(0))
+	// The recovery pass lowers both marks by the penalty on the same base, so
+	// a refused prompt can never sit above the recovery start mark.
+	assert.Equal(t, 70*usable/100, sm.startMarkLocked(pressureRecoveryPenalty))
+	assert.Equal(t, 40*usable/100, sm.releaseMarkLocked(pressureRecoveryPenalty))
+}
+
+func TestPressureMarks_ProfileDrivenWithFallback(t *testing.T) {
+	usable := 100000 - 10000
+
+	// The profile's critical/warning thresholds ARE the marks.
+	custom := ProfileDefaults[loomv1.WorkloadProfile_WORKLOAD_PROFILE_BALANCED]
+	custom.CriticalThresholdPercent = 80
+	custom.WarningThresholdPercent = 50
+	sm := NewSegmentedMemoryWithCompression("ROM", 100000, 10000, custom)
+	sm.mu.Lock()
+	assert.Equal(t, 80*usable/100, sm.startMarkLocked(0))
+	assert.Equal(t, 50*usable/100, sm.releaseMarkLocked(0))
+	sm.mu.Unlock()
+
+	// A hand-built profile with a missing or inverted pair falls back to 90/60.
+	for _, bad := range []struct{ critical, warning int }{
+		{0, 0},    // unset
+		{50, 80},  // inverted band
+		{90, 0},   // zero release
+		{120, 60}, // start over 100
+	} {
+		p := ProfileDefaults[loomv1.WorkloadProfile_WORKLOAD_PROFILE_BALANCED]
+		p.CriticalThresholdPercent = bad.critical
+		p.WarningThresholdPercent = bad.warning
+		sm := NewSegmentedMemoryWithCompression("ROM", 100000, 10000, p)
+		sm.mu.Lock()
+		assert.Equal(t, 90*usable/100, sm.startMarkLocked(0), "critical=%d warning=%d", bad.critical, bad.warning)
+		assert.Equal(t, 60*usable/100, sm.releaseMarkLocked(0), "critical=%d warning=%d", bad.critical, bad.warning)
+		sm.mu.Unlock()
+	}
 }

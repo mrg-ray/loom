@@ -335,35 +335,64 @@ func (sm *SegmentedMemory) msgTokensLocked(tc *TokenCounter, m *Message) int {
 	return n + msgFramingTokens
 }
 
-// Pressure water marks, both a percentage of the model window (MaxTokens), one
-// base so start and release are directly comparable (HLD §5.1):
-//   - START (HWM): begin relief when the estimate reaches this.
-//   - RELEASE (LWM): shed down to this. The HWM−LWM gap is the hysteresis band —
-//     30% here — so relief fires about half as often as a 15% band would, each
-//     pass shedding more. The 10% below HWM is headroom for the output
-//     reservation and the estimate's error.
+// Pressure water marks, both a percentage of usable context — the window minus
+// the output reservation, the space the prompt may actually occupy on the
+// wire — one base so start and release are directly comparable (HLD §5.1):
+//   - START (HWM): begin relief when the estimate reaches this. Comes from the
+//     profile's CriticalThresholdPercent (default 90).
+//   - RELEASE (LWM): shed down to this. Comes from the profile's
+//     WarningThresholdPercent (default 60). The HWM−LWM gap is the hysteresis
+//     band — 30 points at the defaults — so relief fires about half as often
+//     as a 15-point band would, each pass shedding more. The 10% below HWM is
+//     headroom for the estimate's error.
+//
+// The defaults below stand in when a profile carries no valid pair.
 const (
-	pressureStartPercent   = 90 // HWM: trigger relief
-	pressureReleasePercent = 60 // LWM: shed target
+	defaultPressureStartPercent   = 90 // HWM: trigger relief
+	defaultPressureReleasePercent = 60 // LWM: shed target
 )
 
 // pressureRecoveryPenalty lowers both water marks (percentage points) for the
 // one recovery pass after a provider refusal. A refusal means loom's estimate
 // under-counted — the normal marks did not shed enough — so retry with the bar
-// 20 points lower (start 70% / release 40%) to force the deeper shed the
-// estimate would not otherwise trigger.
+// 20 points lower (start 70% / release 40% at the defaults) to force the
+// deeper shed the estimate would not otherwise trigger.
 const pressureRecoveryPenalty = 20
+
+// usableLocked is the prompt's real ceiling: the window minus the output
+// reservation. The provider refuses any request whose prompt exceeds it, so
+// the water marks are percentages of this, never of the full window — a mark
+// above usable would sit beyond the refusal line and never fire. Must hold
+// lock.
+func (sm *SegmentedMemory) usableLocked() int {
+	return sm.tokenBudget.MaxTokens - sm.tokenBudget.ReservedTokens
+}
+
+// marksLocked resolves the water marks from the compression profile:
+// HWM ← CriticalThresholdPercent, LWM ← WarningThresholdPercent. A missing or
+// inverted pair falls back to the 90/60 defaults, so a hand-built profile can
+// never zero the marks. Must hold lock.
+func (sm *SegmentedMemory) marksLocked() (start, release int) {
+	start = sm.compressionProfile.CriticalThresholdPercent
+	release = sm.compressionProfile.WarningThresholdPercent
+	if release <= 0 || release >= start || start > 100 {
+		return defaultPressureStartPercent, defaultPressureReleasePercent
+	}
+	return start, release
+}
 
 // startMarkLocked is the HWM: begin relief when the estimate reaches it. penalty
 // (percentage points) lowers it for the recovery pass. Must hold lock.
 func (sm *SegmentedMemory) startMarkLocked(penalty int) int {
-	return (pressureStartPercent - penalty) * sm.tokenBudget.MaxTokens / 100
+	start, _ := sm.marksLocked()
+	return (start - penalty) * sm.usableLocked() / 100
 }
 
 // releaseMarkLocked is the LWM: shed down to it. penalty lowers it in step with
 // startMarkLocked so the recovery pass sheds deeper. Must hold lock.
 func (sm *SegmentedMemory) releaseMarkLocked(penalty int) int {
-	return (pressureReleasePercent - penalty) * sm.tokenBudget.MaxTokens / 100
+	_, release := sm.marksLocked()
+	return (release - penalty) * sm.usableLocked() / 100
 }
 
 // --- releasePressure (HLD §5.2) ----------------------------------------------

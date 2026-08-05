@@ -151,9 +151,10 @@ func NewSegmentedMemory(romContent string, maxContextTokens, reservedOutputToken
 }
 
 // NewSegmentedMemoryWithCompression creates a new segmented memory instance
-// with a custom profile. The profile's WarningThresholdPercent is the relief
-// target percent (HLD §5.1); CriticalThresholdPercent is no longer used for
-// anything.
+// with a custom profile. The profile's CriticalThresholdPercent /
+// WarningThresholdPercent are the relief water marks (HWM/LWM, HLD §5.1),
+// percentages of usable context; a missing or inverted pair falls back to
+// 90/60.
 func NewSegmentedMemoryWithCompression(romContent string, maxContextTokens, reservedOutputTokens int, profile CompressionProfile) *SegmentedMemory {
 	// Use defaults if not specified (backwards compatibility)
 	if maxContextTokens == 0 {
