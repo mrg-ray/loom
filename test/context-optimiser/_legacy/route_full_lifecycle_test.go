@@ -30,9 +30,9 @@
 package contextoptimiser
 
 import (
-	"regexp"
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"

@@ -1192,7 +1192,6 @@ func (a *Agent) getSystemPrompt(ctx context.Context) string {
 
 	// Append graph memory instructions if graph memory is enabled
 
-
 	// Inject live task context (current tasks, ready front, board stats).
 	// Rebuilt from DB each turn — survives context compaction.
 	basePrompt += a.buildTaskContext(ctx)
