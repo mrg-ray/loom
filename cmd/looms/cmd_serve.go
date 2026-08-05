@@ -133,12 +133,9 @@ func builtinToolsToSuppress() []string {
 	suppressed := []string{"graph_memory", "task_board"}
 	if toolsNoneActive() {
 		suppressed = append(suppressed,
-			// Progressive-disclosure memory tools.
-			"conversation_memory",
-			"session_memory",
-			// Runtime tools surfaced by the agent on first error / first large result.
-			"get_error_details",
+			// Retrieval tools registered by default at agent construction.
 			"query_tool_result",
+			"recall",
 			// Communication + presentation tools wired by builtin.CommunicationTools,
 			// which MultiAgentServer.prepareAgent / UpdateAgent register on every
 			// agent regardless of how the agent was loaded.

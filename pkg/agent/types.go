@@ -285,8 +285,9 @@ type Config struct {
 	// ReservedOutputTokens is the number of tokens reserved for model output (0 = use defaults, typically 10%)
 	ReservedOutputTokens int
 
-	// ProtectedRecentTurns is K (HLD §5.1): the K newest user turns are never
-	// touched by relief. 0 = default (5).
+	// ProtectedRecentTurns is K (HLD §5.1): the top rung of relief's halving
+	// ladder — the newest turns relief tries hardest to keep, though the ladder
+	// walks toward T−1 when shedding at K is not enough. 0 = default (16).
 	ProtectedRecentTurns int
 
 	// PatternConfig controls pattern injection (nil = use defaults)

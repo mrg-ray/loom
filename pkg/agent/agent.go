@@ -239,17 +239,18 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	// Individual agents don't have access to the global tool registry during construction
 
 	// query_tool_result serves THIS TURN's memory by message_id (HLD §7.1) and
-	// recall retrieves summary-cited conversation spans (HLD §6). Both are
-	// registered always — their doors are printed by the offload stub and the
-	// summary's citations respectively.
+	// recall retrieves summary-cited conversation spans (HLD §6). Registered by
+	// default — their doors are printed by the offload stub and the summary's
+	// citations respectively — through RegisterTool, so the WithoutBuiltinTool
+	// suppression set is honoured.
 	queryTool := shuttle.Tool(NewQueryToolResultTool(a))
 	recallTool := shuttle.Tool(NewRecallTool(a))
 	if a.prompts != nil {
 		queryTool = shuttle.NewPromptAwareTool(queryTool, a.prompts, "tools.query_tool_result")
 		recallTool = shuttle.NewPromptAwareTool(recallTool, a.prompts, "tools.recall")
 	}
-	a.tools.Register(queryTool)
-	a.tools.Register(recallTool)
+	a.RegisterTool(queryTool)
+	a.RegisterTool(recallTool)
 
 	// Register graph_memory tool eagerly (not progressive disclosure).
 	// Unlike conversation_memory which depends on runtime state (L2 swap events),
@@ -1064,38 +1065,6 @@ func (a *Agent) ResetSessionContext(sessionID string) bool {
 // getSystemPrompt loads the system prompt from config or PromptRegistry.
 // Priority: ROM + Config.SystemPrompt (if explicitly set) > ROM + PromptRegistry > Default
 // ROM (Read-Only Memory) provides domain-specific knowledge loaded based on config.Rom
-// formatSystemPromptWithDatetime prepends current date/time information to system prompts.
-// This helps agents maintain temporal awareness and prevents confusion about the current date.
-func formatSystemPromptWithDatetime(prompt string, workflowCtx *WorkflowCommunicationContext) string {
-	now := time.Now()
-
-	// Format: "Monday, January 2, 2006 at 3:04 PM MST"
-	dateStr := now.Format("Monday, January 2, 2006")
-	timeStr := now.Format("3:04 PM MST")
-	timezone := now.Location().String()
-
-	// Get UTC offset for clarity
-	_, offset := now.Zone()
-	offsetHours := offset / 3600
-	offsetSign := "+"
-	if offsetHours < 0 {
-		offsetSign = "-"
-		offsetHours = -offsetHours
-	}
-
-	header := fmt.Sprintf("CURRENT DATE AND TIME\n"+
-		"Date: %s\n"+
-		"Time: %s (UTC%s%d)\n"+
-		"Timezone: %s\n\n"+
-		"---\n\n",
-		dateStr, timeStr, offsetSign, offsetHours, timezone)
-
-	// Add workflow communication instructions if available
-	workflowInstructions := formatWorkflowCommunicationInstructions(workflowCtx)
-
-	return header + workflowInstructions + prompt
-}
-
 func (a *Agent) getSystemPrompt(ctx context.Context) string {
 	// Load ROM content first (if configured)
 	var romContent string
@@ -1190,10 +1159,9 @@ func (a *Agent) getSystemPrompt(ctx context.Context) string {
 		basePrompt = `Use available tools to help the user accomplish their goals. Never fabricate data - only report what tools actually return.`
 	}
 
-	// Append graph memory instructions if graph memory is enabled
-
-	// Inject live task context (current tasks, ready front, board stats).
-	// Rebuilt from DB each turn — survives context compaction.
+	// Inject task context (current tasks, ready front, board stats).
+	// Rendered once into ROM at session creation — the ROM slot is
+	// byte-stable for the session, so this is a snapshot, not a live view.
 	basePrompt += a.buildTaskContext(ctx)
 
 	// Append task board tool instructions after the context block,
@@ -1248,38 +1216,6 @@ func (a *Agent) skillMenuPromptSupplement() string {
 		}
 	}
 	return b.String()
-}
-
-// graphMemoryPromptSupplement returns instructions for agents with graph memory enabled.
-// Returns empty string when graph memory is not available.
-func (a *Agent) graphMemoryPromptSupplement() string {
-	if a.graphMemoryStore == nil || a.graphMemoryConfig == nil || !a.graphMemoryConfig.Enabled {
-		return ""
-	}
-	return `
-
----
-
-GRAPH MEMORY
-
-You have persistent memory across sessions via the graph_memory tool. Relevant memories are automatically loaded into context each turn — you do not need to recall them manually.
-
-When to use the graph_memory tool:
-- When the user shares their name, role, preferences, or project context → remember immediately. Do not wait to be asked.
-- When you learn facts about systems, tools, or workflows → remember with entities and relationships.
-- When you need deeper context beyond what was auto-loaded → use recall or context_for.
-
-Actions:
-- remember: save facts (salience 0-1: critical decisions 0.8-1.0, casual facts 0.3-0.5)
-- recall: search by searchQuery, filter by type/tags
-- supersede: correct outdated info (preserves lineage)
-- forget: soft-delete
-- relate: link entities with typed relationships (USES, WORKS_ON, KNOWS_ABOUT)
-- context_for: get an entity's full profile within a token budget
-- entities: browse the knowledge graph
-- consolidate: merge related memories
-
-Focus on the user's request first. Memory operations happen alongside your work, not instead of it.`
 }
 
 // taskBoardPromptSupplement returns instructions for agents with task board enabled.
@@ -2218,13 +2154,16 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		})
 
 		// Build messages for LLM (will use segmented memory if configured).
-		// Nothing counts tokens on the normal path — the provider's refusal is
-		// the only relief trigger (HLD §11).
 		messages := session.GetMessages()
 
 		// === FEATURE INTEGRATION: Soft Reminders ===
-		// Add reminders if approaching limits (non-intrusive, doesn't remove tools)
-		// Thresholds: 75% of max (but minimum of 10 tools / 8 turns)
+		// Compute reminders if approaching limits (non-intrusive, doesn't remove
+		// tools). Thresholds: 75% of max (but minimum of 10 tools / 8 turns).
+		// The reminder is applied transiently at the provider call — appended as
+		// a trailing system message, never onto the ROM message (which would
+		// invalidate the ROM cache prefix at exactly the high-pressure moment)
+		// and never persisted, so it survives any relief recompile of messages.
+		softReminder := ""
 		if session.SegmentedMem != nil {
 			// Check tool execution reminder
 			toolReminder := buildSoftReminder(toolExecutionCount, a.config.MaxToolExecutions)
@@ -2232,16 +2171,9 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			turnReminder := buildTurnReminder(turnCount, a.config.MaxTurns)
 
 			// Combine reminders if both are active
-			combinedReminder := toolReminder + turnReminder
+			softReminder = toolReminder + turnReminder
 
-			if combinedReminder != "" {
-				// Append reminder to system message (if exists) or first user message
-				if len(messages) > 0 && messages[0].Role == "system" {
-					messages[0].Content += combinedReminder
-				} else if len(messages) > 0 && messages[0].Role == "user" {
-					messages[0].Content += combinedReminder
-				}
-
+			if softReminder != "" {
 				span.AddEvent("soft_reminder.added", map[string]interface{}{
 					"tool_count":        toolExecutionCount,
 					"turn_count":        turnCount,
@@ -2303,12 +2235,24 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			}
 		}
 
+		// withReminder appends the turn's soft reminder as a trailing system
+		// message on a copy — transient, past every cache breakpoint, never
+		// stored — so both the normal send and the recovery resend carry it.
+		withReminder := func(msgs []Message) []Message {
+			if softReminder == "" {
+				return msgs
+			}
+			out := make([]Message, len(msgs), len(msgs)+1)
+			copy(out, msgs)
+			return append(out, Message{Role: "system", Content: strings.TrimSpace(softReminder)})
+		}
+
 		// Call LLM. Relief is proactive (above) — loom keeps the context under its
 		// own window. The provider refusal is only a backstop: if a clean
 		// context-too-long still comes back (loom's estimate under-counted), shed
 		// and resend once; a second refusal ends the turn with the recoverable
 		// context_exhausted error.
-		llmResp, err := a.chatWithRetry(ctx, messages, tools)
+		llmResp, err := a.chatWithRetry(ctx, withReminder(messages), tools)
 		if err != nil && errors.Is(err, llm.ErrContextTooLong) {
 			if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
 				_, estimate, target := segMem.ReleasePressure(ctx, pressureRecoveryPenalty)
@@ -2321,10 +2265,11 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				// so recompute BOTH messages and the advertised tool set.
 				messages = session.GetMessages()
 				tools = a.advertisedTools(session)
+				tools = recovery.activeTools(tools)
 				if segMem2, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem2 != nil {
 					segMem2.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
 				}
-				llmResp, err = a.chatWithRetry(ctx, messages, tools)
+				llmResp, err = a.chatWithRetry(ctx, withReminder(messages), tools)
 				if err != nil && errors.Is(err, llm.ErrContextTooLong) {
 					zap.L().Error("context too long after relief: turn ends",
 						zap.String("session_id", session.ID),
