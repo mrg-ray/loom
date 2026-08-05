@@ -937,9 +937,9 @@ func (s *SessionStore) LoadMessagesForAgent(ctx context.Context, agentID string)
 	query := `
 		SELECT DISTINCT m.id, m.role, m.content, m.tool_calls_json, m.tool_use_id,
 		       m.tool_result_json, m.session_context, m.agent_id, m.timestamp, m.token_count, m.cost_usd,
-		       m.session_id
+		       m.evicted, m.turn, m.session_id
 		FROM messages m
-		WHERE (
+		WHERE m.folded = 0 AND ((
 			-- Messages from sessions owned by this agent (all contexts)
 			m.session_id IN (SELECT id FROM sessions WHERE agent_id = ?)
 		) OR (
@@ -949,7 +949,7 @@ func (s *SessionStore) LoadMessagesForAgent(ctx context.Context, agentID string)
 				WHERE agent_id = ? AND parent_session_id IS NOT NULL
 			)
 			AND m.session_context IN ('coordinator', 'shared')
-		)
+		))
 		ORDER BY m.timestamp ASC
 	`
 
@@ -968,6 +968,7 @@ func (s *SessionStore) LoadMessagesForAgent(ctx context.Context, agentID string)
 		var toolCallsJSON, toolUseID, toolResultJSON *string
 		var sessionContext, agentID sql.NullString
 		var timestamp int64
+		var evicted int
 
 		err := rows.Scan(
 			&msgID,
@@ -981,6 +982,8 @@ func (s *SessionStore) LoadMessagesForAgent(ctx context.Context, agentID string)
 			&timestamp,
 			&msg.TokenCount,
 			&msg.CostUSD,
+			&evicted,
+			&msg.Turn,
 			&sessionID,
 		)
 		if err != nil {
@@ -991,6 +994,7 @@ func (s *SessionStore) LoadMessagesForAgent(ctx context.Context, agentID string)
 		// Populate fields
 		msg.ID = fmt.Sprintf("%d", msgID)
 		msg.Timestamp = time.Unix(timestamp, 0)
+		msg.Evicted = evicted != 0
 
 		if sessionContext.Valid {
 			msg.SessionContext = types.SessionContext(sessionContext.String)
@@ -1071,9 +1075,9 @@ func (s *SessionStore) LoadMessagesFromParentSession(ctx context.Context, sessio
 	// Load messages from parent session that are relevant to sub-agents
 	query := `
 		SELECT id, role, content, tool_calls_json, tool_use_id, tool_result_json,
-		       session_context, agent_id, timestamp, token_count, cost_usd
+		       session_context, agent_id, timestamp, token_count, cost_usd, evicted, turn
 		FROM messages
-		WHERE session_id = ?
+		WHERE session_id = ? AND folded = 0
 		AND session_context IN ('coordinator', 'shared')
 		ORDER BY timestamp ASC
 	`
@@ -1092,6 +1096,7 @@ func (s *SessionStore) LoadMessagesFromParentSession(ctx context.Context, sessio
 		var toolCallsJSON, toolUseID, toolResultJSON *string
 		var sessionContext, agentID sql.NullString
 		var timestamp int64
+		var evicted int
 
 		err := rows.Scan(
 			&msgID,
@@ -1105,6 +1110,8 @@ func (s *SessionStore) LoadMessagesFromParentSession(ctx context.Context, sessio
 			&timestamp,
 			&msg.TokenCount,
 			&msg.CostUSD,
+			&evicted,
+			&msg.Turn,
 		)
 		if err != nil {
 			span.RecordError(err)
@@ -1114,6 +1121,7 @@ func (s *SessionStore) LoadMessagesFromParentSession(ctx context.Context, sessio
 		// Populate fields
 		msg.ID = fmt.Sprintf("%d", msgID)
 		msg.Timestamp = time.Unix(timestamp, 0)
+		msg.Evicted = evicted != 0
 
 		if sessionContext.Valid {
 			msg.SessionContext = types.SessionContext(sessionContext.String)

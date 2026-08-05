@@ -962,9 +962,12 @@ func scanMessages(rows pgx.Rows) ([]agent.Message, error) {
 			timestamp      time.Time
 			tokenCount     int
 			costUSD        float64
+			evicted        bool
+			folded         bool
+			turn           int64
 		)
 
-		if err := rows.Scan(&id, &role, &content, &toolCallsJSON, &toolUseID, &toolResultJSON, &sessionCtx, &msgAgentID, &timestamp, &tokenCount, &costUSD); err != nil {
+		if err := rows.Scan(&id, &role, &content, &toolCallsJSON, &toolUseID, &toolResultJSON, &sessionCtx, &msgAgentID, &timestamp, &tokenCount, &costUSD, &evicted, &folded, &turn); err != nil {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
 		}
 
@@ -974,6 +977,9 @@ func scanMessages(rows pgx.Rows) ([]agent.Message, error) {
 			Timestamp:  timestamp,
 			TokenCount: tokenCount,
 			CostUSD:    costUSD,
+			Evicted:    evicted,
+			Folded:     folded,
+			Turn:       turn,
 		}
 
 		if content != nil {
