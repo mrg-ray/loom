@@ -56,6 +56,22 @@ func IsAnthropicContextTooLong(statusCode int, body []byte) bool {
 			strings.Contains(resp.Error.Message, "exceed context limit"))
 }
 
+// IsBedrockContextTooLong positively identifies the context refusal surfaced
+// by the anthropic SDK's bedrock backend from the SDK error text. Bedrock
+// wraps anthropic's refusal in a ValidationException whose message carries the
+// same wording anthropic emits directly ("prompt is too long", "exceed
+// context limit") or bedrock's own variant ("Input is too long for requested
+// model"). Anything else is NOT context-too-long and propagates as today.
+func IsBedrockContextTooLong(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "prompt is too long") ||
+		strings.Contains(msg, "exceed context limit") ||
+		strings.Contains(msg, "Input is too long for requested model")
+}
+
 // IsOpenAIContextTooLong positively identifies the OpenAI-shaped (LiteLLM)
 // context-length refusal from the HTTP status and raw response body.
 func IsOpenAIContextTooLong(statusCode int, body []byte) bool {

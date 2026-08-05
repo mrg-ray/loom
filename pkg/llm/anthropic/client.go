@@ -228,38 +228,19 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 }
 
 // convertMessages converts agent messages to Anthropic format.
-// Returns the system prompt blocks (with cache_control on the last block) and the API messages.
-// System messages are extracted and combined, as Anthropic Messages API requires
-// them to be sent as a separate "system" field, not in the messages array.
+// Returns the system prompt blocks and the API messages. System messages are
+// extracted into the separate "system" field the Messages API requires — one
+// block per source message, so ROM and the summary keep their own compile-set
+// cache breakpoints: a fold rewrites the summary block and leaves ROM's cached
+// prefix intact.
+//
+// Cache breakpoints are the compile's decision (HLD §5.2 step 8): a message
+// with CacheBreakpoint=true gets cache_control on its last content block. The
+// client only translates the marker — it derives nothing itself.
 func (c *Client) convertMessages(messages []llmtypes.Message) ([]TextBlockParam, []Message) {
-	var systemPrompts []string
+	var systemBlocks []TextBlockParam
 	var apiMessages []Message
 
-	// Cache breakpoints (HLD §5.2 step 8; blueprint A6): beyond the system
-	// block and last-tool breakpoints, mark the last message with turn = T−2
-	// (when one exists) and the tip. The turn rides on the message, so the
-	// boundary is computed here rather than passed down.
-	var maxTurn int64
-	for i := range messages {
-		if messages[i].Turn > maxTurn {
-			maxTurn = messages[i].Turn
-		}
-	}
-	boundaryIdx := -1
-	if maxTurn >= 2 {
-		for i := range messages {
-			if messages[i].Turn == maxTurn-2 {
-				boundaryIdx = i
-			}
-		}
-	}
-	tipIdx := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role != "system" {
-			tipIdx = i
-			break
-		}
-	}
 	markLast := func() {
 		if n := len(apiMessages); n > 0 {
 			blocks := apiMessages[n-1].Content
@@ -269,12 +250,18 @@ func (c *Client) convertMessages(messages []llmtypes.Message) ([]TextBlockParam,
 		}
 	}
 
-	for msgIdx, msg := range messages {
+	for _, msg := range messages {
 		switch msg.Role {
 		case "system":
-			// Extract system messages - they'll be combined and sent separately
+			// Extract system messages — each becomes its own system block,
+			// carrying the compile's cache breakpoint when marked. Cached
+			// tokens don't count against the ITPM rate limit.
 			if msg.Content != "" {
-				systemPrompts = append(systemPrompts, msg.Content)
+				block := TextBlockParam{Type: "text", Text: msg.Content}
+				if msg.CacheBreakpoint {
+					block.CacheControl = &CacheControl{Type: "ephemeral"}
+				}
+				systemBlocks = append(systemBlocks, block)
 			}
 
 		case "user":
@@ -358,26 +345,17 @@ func (c *Client) convertMessages(messages []llmtypes.Message) ([]TextBlockParam,
 			})
 		}
 
-		// Third breakpoint at the last message with turn = T−2, and the tip
-		// breakpoint on the final message (HLD §5.2 step 8).
-		if msgIdx == boundaryIdx || msgIdx == tipIdx {
+		// The message cache breakpoint: compile marks the last stable message
+		// before any current-turn ephemeral content (HLD §5.2 step 8). Marking
+		// anything later — e.g. the tip — buys cache writes that are never
+		// read back, because ephemeral content re-renders next call.
+		if msg.CacheBreakpoint && msg.Role != "system" {
 			markLast()
 		}
 	}
 
-	// Combine all system prompts and wrap in a TextBlockParam with cache_control.
-	// Placing cache_control on the system block caches it for ~5 minutes.
-	// For Anthropic, cached tokens don't count against the ITPM rate limit.
-	if len(systemPrompts) == 0 {
+	if len(systemBlocks) == 0 {
 		return nil, apiMessages
-	}
-	systemText := strings.Join(systemPrompts, "\n\n")
-	systemBlocks := []TextBlockParam{
-		{
-			Type:         "text",
-			Text:         systemText,
-			CacheControl: &CacheControl{Type: "ephemeral"},
-		},
 	}
 	return systemBlocks, apiMessages
 }

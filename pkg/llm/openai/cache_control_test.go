@@ -35,7 +35,7 @@ func TestChatStream_CacheControlAndUsage(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(Config{Model: "test", Endpoint: srv.URL, MaxTokens: 100})
+	c := NewClient(Config{Model: "coding-agent/claude-sonnet-4-6", Endpoint: srv.URL, MaxTokens: 100})
 
 	// ROM, summary, and a later assistant message are marked as breakpoints; the
 	// user message is NOT — it must stay a plain string with no cache_control.
@@ -84,5 +84,22 @@ func TestChatStream_CacheControlAndUsage(t *testing.T) {
 	}
 	if resp.Usage.CacheCreationInputTokens != 20 {
 		t.Errorf("cache_creation: got %d want 20", resp.Usage.CacheCreationInputTokens)
+	}
+}
+
+// TestConvertMessages_CacheControlGatedToClaude proves cache_control is emitted
+// only for Anthropic-backed models: a non-claude model keeps plain string
+// content on marked messages — no foreign field, no block reshaping.
+func TestConvertMessages_CacheControlGatedToClaude(t *testing.T) {
+	c := NewClient(Config{Model: "gpt-4o", APIKey: "test"})
+	msgs := c.convertMessages([]llmtypes.Message{
+		{Role: "system", Content: "ROM", CacheBreakpoint: true},
+		{Role: "user", Content: "hello"},
+	})
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(msgs))
+	}
+	if _, ok := msgs[0].Content.(string); !ok {
+		t.Fatalf("non-claude model must keep plain string content, got %T", msgs[0].Content)
 	}
 }

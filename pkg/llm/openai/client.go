@@ -316,13 +316,26 @@ func (c *Client) convertMessages(messages []llmtypes.Message) []ChatMessage {
 	// to an apiMessage; convert its content to the block form litellm forwards to
 	// Anthropic as cache_control. Anthropic allows at most 4 breakpoints; the
 	// compile marks at most three (+ the tool list), so we stay within budget.
-	for i := range messages {
-		if i < len(apiMessages) && messages[i].CacheBreakpoint {
-			apiMessages[i].Content = withCacheControl(apiMessages[i].Content)
+	// Emitted only for Anthropic-backed models: cache_control is Anthropic's
+	// field, and a strict OpenAI-native endpoint may reject the foreign key or
+	// the string→block content reshaping that carries it.
+	if c.emitsCacheControl() {
+		for i := range messages {
+			if i < len(apiMessages) && messages[i].CacheBreakpoint {
+				apiMessages[i].Content = withCacheControl(apiMessages[i].Content)
+			}
 		}
 	}
 
 	return apiMessages
+}
+
+// emitsCacheControl reports whether the configured model is Anthropic-backed —
+// the only upstream that consumes cache_control. The OpenAI-shaped client
+// fronts many gateways (LiteLLM, Mistral, HuggingFace); only requests routed
+// to a claude model benefit from the marker, and only those get it.
+func (c *Client) emitsCacheControl() bool {
+	return strings.Contains(strings.ToLower(c.model), "claude")
 }
 
 // withCacheControl rewrites a message's content into the block form carrying a

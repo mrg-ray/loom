@@ -269,6 +269,9 @@ func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools
 			return c.client.Messages.New(ctx, params)
 		})
 		if err != nil {
+			if llm.IsBedrockContextTooLong(err) {
+				return nil, fmt.Errorf("bedrock SDK invocation failed: %s: %w", err, llm.ErrContextTooLong)
+			}
 			return nil, fmt.Errorf("bedrock SDK invocation failed: %w", err)
 		}
 		message = result.(*anthropic.Message)
@@ -276,6 +279,9 @@ func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools
 		// Direct call without rate limiting
 		message, err = c.client.Messages.New(ctx, params)
 		if err != nil {
+			if llm.IsBedrockContextTooLong(err) {
+				return nil, fmt.Errorf("bedrock SDK invocation failed: %s: %w", err, llm.ErrContextTooLong)
+			}
 			return nil, fmt.Errorf("bedrock SDK invocation failed: %w", err)
 		}
 	}
@@ -693,6 +699,9 @@ func (c *SDKClient) ChatStream(ctx context.Context, messages []llmtypes.Message,
 
 	// Check for stream errors (EOF is normal at end of stream)
 	if err := stream.Err(); err != nil && err != io.EOF {
+		if llm.IsBedrockContextTooLong(err) {
+			return nil, fmt.Errorf("stream error: %s: %w", err, llm.ErrContextTooLong)
+		}
 		return nil, fmt.Errorf("stream error: %w", err)
 	}
 

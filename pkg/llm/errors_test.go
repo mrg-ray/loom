@@ -64,3 +64,29 @@ func TestErrContextTooLong_IsWrappable(t *testing.T) {
 		t.Fatal("wrapped ErrContextTooLong must be identifiable with errors.Is")
 	}
 }
+
+func TestIsBedrockContextTooLong(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"anthropic wording via ValidationException",
+			errors.New(`operation error Bedrock Runtime: InvokeModel, ValidationException: prompt is too long: 210000 tokens > 200000 maximum`), true},
+		{"anthropic reserve wording",
+			errors.New(`ValidationException: input length and max_tokens exceed context limit: 195000 + 8000 > 200000`), true},
+		{"bedrock own wording",
+			errors.New(`ValidationException: Input is too long for requested model.`), true},
+		{"unrelated validation error",
+			errors.New(`ValidationException: The provided model identifier is invalid.`), false},
+		{"throttling", errors.New(`ThrottlingException: Too many requests`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsBedrockContextTooLong(tc.err); got != tc.want {
+				t.Errorf("IsBedrockContextTooLong(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
