@@ -322,8 +322,7 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 			}
 
 			// Restore re-fire runs after replay and outside the lock,
-			// reconstructing skill activations and disclosure tools from the
-			// durable snapshot.
+			// reconstructing skill activations from the durable snapshot.
 			if activateSkill != nil {
 				m.reFireOnRestore(sessionID, restoreSnapshot, activateSkill, ctxDebug)
 			}
@@ -408,12 +407,11 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 
 // reFireOnRestore reconstructs a restored session's runtime state from its
 // durable messages. It walks the durable snapshot (never the compacted L1/L2,
-// where load markers are gone) and, via the injected hooks, re-activates each
-// loaded skill with its required tools and re-registers the first-need
-// disclosure tools implied by durable error/large-result records. It performs
-// activation and tool advertisement only — no conversation message, no task —
-// so a replayed session advertises the same tools and reports the same active
-// skills as a live one.
+// where load markers are gone) and, via the injected hook, re-activates each
+// loaded skill with its required tools. It performs activation and tool
+// advertisement only — no conversation message, no task — so a replayed
+// session advertises the same tools and reports the same active skills as a
+// live one.
 func (m *Memory) reFireOnRestore(sessionID string, messages []Message,
 	activateSkill func(sessionID, skillName string),
 	ctxDebug *contextDebug,

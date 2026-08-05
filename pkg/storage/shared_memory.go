@@ -303,8 +303,8 @@ func (s *SharedMemoryStore) get(ref *loomv1.DataReference, callerSession string,
 	return sharedData.Data, nil
 }
 
-// IncrementRefCount increments the reference count for a data chunk.
-// Used by SessionReferenceTracker to pin references and prevent eviction.
+// IncrementRefCount increments the reference count for a data chunk,
+// pinning it against eviction.
 func (s *SharedMemoryStore) IncrementRefCount(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
