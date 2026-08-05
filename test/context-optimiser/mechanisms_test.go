@@ -72,13 +72,19 @@ func TestMech_EvictionFloor(t *testing.T) {
 	sid := "floor"
 
 	// a tiny result (well under 2× a stub) in an early turn
-	drive(t, r, sid, "tiny", callTools(emit("tiny", 250, "string")), sayText("noted"))
+	if err := drive(t, r, sid, "tiny", callTools(emit("tiny", 250, "string")), sayText("noted")); err != nil {
+		t.Fatal(err)
+	}
 	// large results to build pressure past the proactive limit, so relief runs
 	// on loom's own accounting (no injected refusal — a forced refusal after a
 	// proactive shed would trigger a second, fold-escalating pass that is not
 	// what this route tests).
-	drive(t, r, sid, "big1", callTools(emit("b1", 40000, "string")), sayText("ok"))
-	drive(t, r, sid, "big2", callTools(emit("b2", 40000, "string")), sayText("ok"))
+	if err := drive(t, r, sid, "big1", callTools(emit("b1", 40000, "string")), sayText("ok")); err != nil {
+		t.Fatal(err)
+	}
+	if err := drive(t, r, sid, "big2", callTools(emit("b2", 40000, "string")), sayText("ok")); err != nil {
+		t.Fatal(err)
+	}
 	if err := drive(t, r, sid, "status", sayText("proceeding")); err != nil {
 		t.Fatal(err)
 	}
@@ -132,9 +138,11 @@ func TestMech_SkillDeactivatedOnFold(t *testing.T) {
 	sid := "skilldeact"
 
 	// Load audit-trail → it declares web_search, which must appear in KERNEL.
-	drive(t, r, sid, "load audit-trail",
+	if err := drive(t, r, sid, "load audit-trail",
 		callTool("s1", "manage_skills", map[string]interface{}{"action": "load", "name": skillAuditTrail}),
-		sayText("loaded"))
+		sayText("loaded")); err != nil {
+		t.Fatal(err)
+	}
 
 	stagesBefore := r.readStages(t)
 	if !toolAdvertised(stagesBefore[len(stagesBefore)-1], requiredToolName) {
@@ -143,7 +151,9 @@ func TestMech_SkillDeactivatedOnFold(t *testing.T) {
 
 	// Pile conversation to force a fold that covers turn 1 (the load pair).
 	for i := 0; i < 9; i++ {
-		drive(t, r, sid, heavyConversation(i), sayText("ack"))
+		if err := drive(t, r, sid, heavyConversation(i), sayText("ack")); err != nil {
+			t.Fatal(err)
+		}
 	}
 	r.llm.refuse(1)
 	if err := drive(t, r, sid, "summarise", sayText("done")); err != nil {
@@ -177,9 +187,15 @@ func TestMech_RecallConversationOnly(t *testing.T) {
 	sid := "recall"
 
 	// Build a span that contains a tool result among conversation.
-	drive(t, r, sid, "first question about grants", sayText("here is my answer about grants"))
-	drive(t, r, sid, "run a scan", callTools(emit("scan", 5000, "string")), sayText("scan done"))
-	drive(t, r, sid, "note that", sayText("noted"))
+	if err := drive(t, r, sid, "first question about grants", sayText("here is my answer about grants")); err != nil {
+		t.Fatal(err)
+	}
+	if err := drive(t, r, sid, "run a scan", callTools(emit("scan", 5000, "string")), sayText("scan done")); err != nil {
+		t.Fatal(err)
+	}
+	if err := drive(t, r, sid, "note that", sayText("noted")); err != nil {
+		t.Fatal(err)
+	}
 
 	// Now the model recalls the early span (msg:1-6, covering the tool result).
 	if err := drive(t, r, sid, "what did we discuss?",

@@ -46,9 +46,6 @@ import (
 
 const (
 	envGate = "LOOM_CONTEXT_OPTIMISER"
-	// envSkipRestore audits the direct conversation only, leaving reload
-	// fidelity aside so a restore divergence cannot halt the route early.
-	envSkipRestore = "LOOM_CONTEXT_OPTIMISER_SKIP_RESTORE"
 )
 
 // requireGate skips unless the suite was asked for explicitly. Keeps the routes
@@ -191,13 +188,6 @@ func callTools(calls ...types.ToolCall) scriptedTurn {
 	return scriptedTurn{toolCalls: calls}
 }
 
-// loadSkill scripts a manage_skills(load) call.
-func loadSkill(id, name string) types.ToolCall {
-	return types.ToolCall{ID: id, Name: "manage_skills", Input: map[string]interface{}{
-		"action": "load", "name": name,
-	}}
-}
-
 // emit scripts an emit call returning a payload of the requested size and shape.
 func emit(id string, bytes int, shape string) types.ToolCall {
 	return types.ToolCall{ID: id, Name: emitToolName, Input: map[string]interface{}{
@@ -250,12 +240,6 @@ func (m *scriptedLLM) Chat(_ context.Context, messages []types.Message, _ []shut
 		ToolCalls: calls,
 		Usage:     types.Usage{InputTokens: 10, OutputTokens: 10},
 	}, nil
-}
-
-func (m *scriptedLLM) exhausted() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.over
 }
 
 // ---------------------------------------------------------------------------
@@ -319,14 +303,12 @@ func (e *emitTool) Execute(_ context.Context, params map[string]interface{}) (*s
 // ---------------------------------------------------------------------------
 
 type rig struct {
-	agent    *agent.Agent
-	orch     *skills.Orchestrator
-	store    *agent.SessionStore
-	llm      *scriptedLLM
-	mem      *agent.Memory
-	maxL2Tok int
-	outDir   string
-	dumpPath string
+	agent  *agent.Agent
+	orch   *skills.Orchestrator
+	store  *agent.SessionStore
+	llm    *scriptedLLM
+	mem    *agent.Memory
+	outDir string
 
 	skillsDir   string
 	patternsDir string
@@ -485,42 +467,4 @@ func (r *rig) readStages(t *testing.T) []stage {
 		}
 	}
 	return stages
-}
-
-// toolNames returns the advertised tool block of a stage, for readability.
-func (s stage) toolNames() []string {
-	out := make([]string, 0, len(s.Tools))
-	for _, t := range s.Tools {
-		out = append(out, t.Name)
-	}
-	return out
-}
-
-// describe renders a stage as the reader sees it: roles, order, and content
-// trimmed to a readable width, plus the advertised tools.
-func (s stage) describe(index int) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "### Stage %02d — session %s, turn %d\n\n", index, s.SessionID, s.Turn)
-	fmt.Fprintf(&b, "tools: %s\n\n", strings.Join(s.toolNames(), ", "))
-	for i, m := range s.Messages {
-		content := strings.ReplaceAll(m.Content, "\n", "\\n")
-		// The system slot is never trimmed: its byte-stability across a session
-		// is one of the things being audited, so it must be readable in full.
-		if m.Role != "system" && len(content) > 400 {
-			content = fmt.Sprintf("%s … [%d chars total]", content[:400], len(m.Content))
-		}
-		extra := ""
-		if m.ToolUseID != "" {
-			extra = fmt.Sprintf(" tool_use_id=%s", m.ToolUseID)
-		}
-		if len(m.ToolCalls) > 0 {
-			names := make([]string, 0, len(m.ToolCalls))
-			for _, tc := range m.ToolCalls {
-				names = append(names, fmt.Sprintf("%s(%s)", tc.Name, tc.ID))
-			}
-			extra += " calls=" + strings.Join(names, ",")
-		}
-		fmt.Fprintf(&b, "%2d. [%s]%s %s\n", i, m.Role, extra, content)
-	}
-	return b.String()
 }

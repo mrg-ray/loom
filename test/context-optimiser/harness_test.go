@@ -18,11 +18,6 @@ import (
 	"github.com/teradata-labs/loom/pkg/types"
 )
 
-// sized is emit input for an n-byte string payload.
-func sized(n int) map[string]interface{} {
-	return map[string]interface{}{"bytes": float64(n), "shape": "string"}
-}
-
 // heavyConversation is ~1.2 KB of user text — conversation that fold must
 // summarize (it is never a tool result, so eviction can never touch it).
 func heavyConversation(i int) string {
