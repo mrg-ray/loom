@@ -26,11 +26,23 @@ func sized(n int) map[string]interface{} {
 // heavyConversation is ~1.2 KB of user text — conversation that fold must
 // summarize (it is never a tool result, so eviction can never touch it).
 func heavyConversation(i int) string {
-	s := fmt.Sprintf("turn %d: ", i)
-	for len(s) < 3000 {
-		s += "please continue analysing the grant scope and record every decision. "
+	// VARIED, non-repetitive text: a real tokenizer (cl100k) tokenizes a single
+	// repeated sentence far too cheaply (~8 bytes/token), so repetitive filler
+	// never accumulates enough tokens to force a fold under the tiktoken estimate.
+	// Varied words + numbers land near ~4 bytes/token, like real prose. Seeded by
+	// i via a deterministic LCG (no rand — reproducible).
+	words := strings.Fields("consumer group spool ceiling ctas deferred chargeback tier failure " +
+		"rate department statement nightly batch window boundary lock io gigabytes climbed cpu " +
+		"seconds inversion anomaly database owning user decision recorded escalate dba threshold " +
+		"surcharge blended exempt registered shift log deferral saturation headroom estate ceiling")
+	var b strings.Builder
+	fmt.Fprintf(&b, "turn %d: ", i)
+	n := int64(i*131 + 7)
+	for b.Len() < 3600 {
+		n = (n*1103515245 + 12345) & 0x7fffffff
+		fmt.Fprintf(&b, "%s-%d ", words[int(n)%len(words)], n%9973)
 	}
-	return s
+	return b.String()
 }
 
 // countingCompressor is the scripted summarizer: it returns a fixed summary so a

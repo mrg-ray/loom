@@ -142,6 +142,13 @@ type Message struct {
 	// only inside releasePressure; folded rows are filtered at the database read.
 	Folded bool
 
+	// CacheBreakpoint marks a compiled message where a provider prompt-cache
+	// breakpoint (cache_control) should be placed. Transient — set only by
+	// compileLocked at render time, never persisted. The compile decides the
+	// "perfect place" (ROM, summary, and the last message before any current-turn
+	// offload stub); each provider client honors it.
+	CacheBreakpoint bool
+
 	// Timestamp when the message was created
 	Timestamp time.Time
 

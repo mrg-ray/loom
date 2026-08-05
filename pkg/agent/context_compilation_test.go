@@ -128,6 +128,42 @@ func TestCompile_LegacyOversizePriorTurnRendersEvictedStub(t *testing.T) {
 	assert.Equal(t, want, rendered, "a legacy unbounded prior-turn row renders the evicted stub")
 }
 
+// TestCompile_CurrentTurnQueryPairSitsBehindCacheBreakpoint proves the cache
+// breakpoint freezes BEFORE a current-turn query_tool_result call/result pair.
+// That pair is ephemeral (§4.3) and pruned when the turn settles; if it sat
+// inside the cached prefix, the next call's prefix would lose it and miss the
+// cache. This is the same freeze rule the offload stub gets — here with no
+// offload stub preceding the pair (the anomalous failed cross-turn query).
+func TestCompile_CurrentTurnQueryPairSitsBehindCacheBreakpoint(t *testing.T) {
+	sm := newCompileMemory(t)
+	// Turn 1 settled.
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "q1", Turn: 1})
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Content: "a1", Turn: 1})
+	// Turn 2 current: a bare query_tool_result pair, no offload stub before it.
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "q2", Turn: 2})
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Turn: 2,
+		ToolCalls: []ToolCall{{ID: "c1", Name: "query_tool_result"}}})
+	sm.AddMessage(context.Background(), Message{Role: "tool", ID: "1", ToolUseID: "c1",
+		Content: "error: not_this_turn", Turn: 2})
+
+	out := sm.GetMessagesForLLM()
+	queryIdx, bpIdx := -1, -1
+	for i, m := range out {
+		if m.Role == "assistant" && len(m.ToolCalls) == 1 && m.ToolCalls[0].Name == "query_tool_result" {
+			queryIdx = i
+		}
+		if i >= 1 && m.CacheBreakpoint { // i>=1 skips the ROM breakpoint at idx 0
+			bpIdx = i
+		}
+	}
+	require.NotEqual(t, -1, queryIdx, "the query_tool_result call is present")
+	require.NotEqual(t, -1, bpIdx, "a message cache breakpoint was placed")
+	assert.Less(t, bpIdx, queryIdx,
+		"the breakpoint freezes before the ephemeral query pair, keeping it out of the cached prefix")
+	assert.False(t, out[queryIdx].CacheBreakpoint, "the query call itself is never the breakpoint")
+	assert.False(t, out[queryIdx+1].CacheBreakpoint, "the query result is never the breakpoint")
+}
+
 func TestCompile_EvictedFlagRendersEvictedStub(t *testing.T) {
 	sm := newCompileMemory(t)
 	content := strings.Repeat("e", 900) // under threshold, but flagged
@@ -189,8 +225,11 @@ func TestReleasePressure_EvictsThenFolds(t *testing.T) {
 	const sessionID = "sess-relief"
 	require.NoError(t, store.SaveSession(ctx, &Session{ID: sessionID, Context: map[string]interface{}{}}))
 
-	sm := NewSegmentedMemory("ROM", 2000, 200) // tiny window so target is small
-	sm.SetThreshold(512)
+	// Window sized so the release mark (60% = 3600) clears the irreducible current
+	// turn (~1740-token tool row) — otherwise eviction can never reach target and
+	// the pass always escalates to fold, folding the evicted rows out of view.
+	sm := NewSegmentedMemory("ROM", 6000, 600)
+	sm.SetThreshold(6000) // > the ~5KB tool rows, so they render WHOLE (evictable), not stubs
 	sm.SetSessionStore(store, sessionID)
 	sm.SetCompressor(&foldCompressor{out: "covers msg:1-4\nsummary of the old turns"})
 
@@ -202,14 +241,21 @@ func TestReleasePressure_EvictsThenFolds(t *testing.T) {
 		return m
 	}
 	for turn := 1; turn <= 7; turn++ {
+		// The whole tool rows (5000 B, under the 6000 threshold) are the pressure
+		// AND the eviction targets: their sum crosses the start mark, and evicting
+		// them reaches target without any fold — so the evicted rows stay visible.
 		persist("user", fmt.Sprintf("question %d", turn), "", nil, true)
 		callID := fmt.Sprintf("c%d", turn)
 		persist("assistant", "", "", []ToolCall{{ID: callID, Name: "bulk_scan", Input: map[string]interface{}{}}}, false)
-		persist("tool", strings.Repeat("r", 5000), callID, nil, false)
+		// Token-DENSE content (varied, ~4 B/tok), so evicting a whole row to a stub
+		// actually sheds tokens — a compressible run like "rrrr" tokenizes so
+		// cheaply that eviction saves nothing and the pass escalates to fold.
+		persist("tool", strings.Repeat("scan 12,345 db=SALES cpu=678 io=9; ", 145), callID, nil, false)
 	}
 	require.Equal(t, int64(7), sm.CurrentTurn())
 
-	estimate, target := sm.ReleasePressure(ctx)
+	shed, estimate, target := sm.ReleasePressure(ctx, 0)
+	assert.True(t, shed, "estimate should cross the start mark and shed")
 	assert.Greater(t, target, 0)
 	assert.Greater(t, estimate, 0)
 

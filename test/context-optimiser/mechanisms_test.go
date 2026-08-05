@@ -73,11 +73,12 @@ func TestMech_EvictionFloor(t *testing.T) {
 
 	// a tiny result (well under 2× a stub) in an early turn
 	drive(t, r, sid, "tiny", callTools(emit("tiny", 250, "string")), sayText("noted"))
-	// large results to build pressure
+	// large results to build pressure past the proactive limit, so relief runs
+	// on loom's own accounting (no injected refusal — a forced refusal after a
+	// proactive shed would trigger a second, fold-escalating pass that is not
+	// what this route tests).
 	drive(t, r, sid, "big1", callTools(emit("b1", 40000, "string")), sayText("ok"))
 	drive(t, r, sid, "big2", callTools(emit("b2", 40000, "string")), sayText("ok"))
-	// force relief
-	r.llm.refuse(1)
 	if err := drive(t, r, sid, "status", sayText("proceeding")); err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +155,16 @@ func TestMech_SkillDeactivatedOnFold(t *testing.T) {
 	// The load pair is now folded; web_search must have left KERNEL.
 	if toolAdvertised(final, requiredToolName) {
 		t.Errorf("§4.5: %s still advertised after its skill's load pair was folded — skill not deactivated", requiredToolName)
+	}
+	// §4.5: the fold summary must PIN a note naming the deactivated skill, so the
+	// model can see the capability went out with the fold and reload it if still
+	// in use — a silent deactivation leaves the model unable to tell.
+	joined := ""
+	for _, m := range final.Messages {
+		joined += m.Content + "\n"
+	}
+	if !strings.Contains(joined, "Folded active skill") || !strings.Contains(joined, skillAuditTrail) {
+		t.Errorf("§4.5: fold summary does not pin the folded-skill note naming %q", skillAuditTrail)
 	}
 }
 

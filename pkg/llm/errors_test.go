@@ -43,8 +43,12 @@ func TestIsOpenAIContextTooLong(t *testing.T) {
 	}{
 		{"litellm context_length_exceeded", 400,
 			`{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 200000 tokens"}}`, true},
+		{"litellm passthrough of anthropic-via-vertex (the company gateway)", 400,
+			`{"error":{"message":"litellm.BadRequestError: Vertex_aiException BadRequestError - b'{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 258934 tokens > 200000 maximum\"}}'. Received Model Group=coding-agent/claude-haiku-4-5","type":null,"param":null,"code":"400"}}`, true},
+		{"litellm passthrough exceed context limit", 400,
+			`{"error":{"message":"litellm.BadRequestError: input length and max_tokens exceed context limit","code":"400"}}`, true},
 		{"other 400 code", 400,
-			`{"error":{"code":"invalid_api_key"}}`, false},
+			`{"error":{"code":"invalid_api_key","message":"bad key"}}`, false},
 	}
 	for _, c := range cases {
 		if got := IsOpenAIContextTooLong(c.code, []byte(c.body)); got != c.want {

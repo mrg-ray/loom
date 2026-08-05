@@ -66,13 +66,14 @@ func TestFullLifecycle(t *testing.T) {
 	evictMark := mark()
 	r.llm.refuse(1)
 	step("Status?", sayText("Three scans loaded; proceeding."))
-	// 7-15. pile on unevictable conversation
-	for i := 0; i < 9; i++ {
+	// 7+. pile on unevictable conversation until it crosses the start mark on its
+	// own — big tool results were evicted at moment 1, so only conversation
+	// (which renders whole) can drive the fold now.
+	for i := 0; i < 18; i++ {
 		step(heavyConversation(i), sayText("ack"))
 	}
-	// 16. RELIEF MOMENT 2 — eviction insufficient, fold fires
+	// RELIEF MOMENT 2 — eviction insufficient, fold fires
 	foldMark := mark()
-	r.llm.refuse(1)
 	step("Summarise the audit so far.", sayText("Here is the audit summary."))
 	// 17. recall across the fold
 	step("What did I first ask you to do?", sayText("You asked me to load the grant-review skill."))

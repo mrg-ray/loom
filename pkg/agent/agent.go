@@ -2340,23 +2340,39 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				zap.Strings("advertised", advertised))
 		}
 
-		// Call LLM
+		// Relief runs at compile, before the send: ReleasePressure self-gates on
+		// loom's own estimate (§5.1) — a no-op under the start mark, otherwise it
+		// sheds to the release mark. On a shed, recompile messages and the
+		// advertised tool set so a fold-deactivated skill's tools do not linger.
+		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+			if shed, estimate, target := segMem.ReleasePressure(ctx, 0); shed {
+				zap.L().Info("relief: shed before send",
+					zap.String("session_id", session.ID),
+					zap.Int("estimate_tokens", estimate),
+					zap.Int("target_tokens", target))
+				messages = session.GetMessages()
+				tools = a.advertisedTools(session)
+				tools = recovery.activeTools(tools)
+				segMem.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
+			}
+		}
+
+		// Call LLM. Relief is proactive (above) — loom keeps the context under its
+		// own window. The provider refusal is only a backstop: if a clean
+		// context-too-long still comes back (loom's estimate under-counted), shed
+		// and resend once; a second refusal ends the turn with the recoverable
+		// context_exhausted error.
 		llmResp, err := a.chatWithRetry(ctx, messages, tools)
 		if err != nil && errors.Is(err, llm.ErrContextTooLong) {
-			// HLD §5.2 step 12: the provider's positively-identified refusal is
-			// the ONLY relief trigger. Run releasePressure once, recompile, and
-			// send ONCE more; a second refusal ends the turn with the
-			// recoverable error carrying {estimate, target}.
 			if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
-				estimate, target := segMem.ReleasePressure(ctx)
+				_, estimate, target := segMem.ReleasePressure(ctx, pressureRecoveryPenalty)
 				zap.L().Info("context too long: relief pass complete, resending once",
 					zap.String("session_id", session.ID),
 					zap.Int("estimate_tokens", estimate),
 					zap.Int("target_tokens", target))
 				// Relief can deactivate a skill whose load pair was folded
 				// (HLD §4.5): its tools leave KERNEL. The resend is a recompile,
-				// so recompute BOTH messages and the advertised tool set — else a
-				// deactivated skill's tools linger for one more provider call.
+				// so recompute BOTH messages and the advertised tool set.
 				messages = session.GetMessages()
 				tools = a.advertisedTools(session)
 				if segMem2, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem2 != nil {
