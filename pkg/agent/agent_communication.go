@@ -24,6 +24,39 @@ import (
 	"github.com/teradata-labs/loom/pkg/storage"
 )
 
+// boundedPayloadValue marshals data for an inter-agent message and bounds the
+// result at threshold bytes (D3: inter-agent messages carry content inline,
+// bounded by the same 16384 write rule as any stored row; a ref crossing
+// agents is a ref crossing turns, which §4.3 forbids).
+//
+// Within the bound the marshaled bytes ride exactly. Over it, the payload is
+// REPLACED by a small self-describing JSON document — never the marshaled
+// bytes cut mid-structure, which is not JSON and which no receiver can
+// unmarshal. The receiver therefore always gets a well-formed document, and an
+// over-bound send says so in the payload itself.
+// Returns the wire value and the TRUE marshaled size, so the metadata records
+// what was produced even when the value carries the bound notice instead.
+func boundedPayloadValue(data interface{}, threshold int) ([]byte, int, error) {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to marshal data: %w", err)
+	}
+	if len(raw) <= threshold {
+		return raw, len(raw), nil
+	}
+	stub, err := json.Marshal(map[string]interface{}{
+		"truncated":      true,
+		"original_bytes": len(raw),
+		"preview":        previewOf(string(raw)),
+		"note": fmt.Sprintf("payload exceeded the %d-byte inter-agent bound and was not sent; "+
+			"ask the sender for a narrower slice.", threshold),
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to marshal bound notice: %w", err)
+	}
+	return stub, len(raw), nil
+}
+
 // Send sends a message to another agent using value or reference semantics.
 // The communication policy determines whether to use direct value or reference.
 func (a *Agent) Send(ctx context.Context, toAgent string, messageType string, data interface{}) (*loomv1.CommunicationMessage, error) {
@@ -31,28 +64,23 @@ func (a *Agent) Send(ctx context.Context, toAgent string, messageType string, da
 		return nil, fmt.Errorf("communication policy not configured")
 	}
 
-	// Marshal data to JSON
-	dataBytes, err := json.Marshal(data)
+	// Marshal data to JSON, bounded inline (D3). The metadata records the TRUE
+	// size, so a receiver can see what the bound elided.
+	dataBytes, trueSize, err := boundedPayloadValue(data, int(storage.DefaultSharedMemoryThreshold))
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal data: %w", err)
+		return nil, err
 	}
 
 	// Create message payload
 	payload := &loomv1.MessagePayload{
 		Metadata: &loomv1.PayloadMetadata{
-			SizeBytes:   int64(len(dataBytes)),
+			SizeBytes:   int64(trueSize),
 			ContentType: "application/json",
 			Compression: "none",
 			Encoding:    "none",
 		},
 	}
-
-	// The ref path is deleted (blueprint D3): inter-agent messages carry
-	// content inline, bounded by the same write rule as any stored row — a ref
-	// crossing agents is a ref crossing turns, exactly what §4.3 forbids.
-	payload.Data = &loomv1.MessagePayload_Value{
-		Value: []byte(truncateToolRowContent(string(dataBytes), int(storage.DefaultSharedMemoryThreshold))),
-	}
+	payload.Data = &loomv1.MessagePayload_Value{Value: dataBytes}
 
 	// Get policy for message type
 	policy := a.commPolicy.GetPolicy(messageType)
@@ -120,27 +148,18 @@ func (a *Agent) SendAsync(ctx context.Context, toAgent string, messageType strin
 		return "", fmt.Errorf("communication policy not configured")
 	}
 
-	// Marshal data to JSON
-	dataBytes, err := json.Marshal(data)
+	bounded, trueSize, err := boundedPayloadValue(data, int(storage.DefaultSharedMemoryThreshold))
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal data: %w", err)
+		return "", err
 	}
-
-	// Create message payload
 	payload := &loomv1.MessagePayload{
 		Metadata: &loomv1.PayloadMetadata{
-			SizeBytes:   int64(len(dataBytes)),
+			SizeBytes:   int64(trueSize),
 			ContentType: "application/json",
 			Compression: "none",
 			Encoding:    "none",
 		},
-	}
-
-	// The ref path is deleted (blueprint D3): inter-agent messages carry
-	// content inline, bounded by the same write rule as any stored row — a ref
-	// crossing agents is a ref crossing turns, exactly what §4.3 forbids.
-	payload.Data = &loomv1.MessagePayload_Value{
-		Value: []byte(truncateToolRowContent(string(dataBytes), int(storage.DefaultSharedMemoryThreshold))),
+		Data: &loomv1.MessagePayload_Value{Value: bounded},
 	}
 
 	// Generate message ID
@@ -187,28 +206,23 @@ func (a *Agent) SendAndReceive(ctx context.Context, toAgent string, messageType 
 		defer cancel()
 	}
 
-	// Marshal data to JSON
-	dataBytes, err := json.Marshal(data)
+	// Marshal data to JSON, bounded inline (D3). The metadata records the TRUE
+	// size, so a receiver can see what the bound elided.
+	dataBytes, trueSize, err := boundedPayloadValue(data, int(storage.DefaultSharedMemoryThreshold))
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal data: %w", err)
+		return nil, err
 	}
 
 	// Create message payload
 	payload := &loomv1.MessagePayload{
 		Metadata: &loomv1.PayloadMetadata{
-			SizeBytes:   int64(len(dataBytes)),
+			SizeBytes:   int64(trueSize),
 			ContentType: "application/json",
 			Compression: "none",
 			Encoding:    "none",
 		},
 	}
-
-	// The ref path is deleted (blueprint D3): inter-agent messages carry
-	// content inline, bounded by the same write rule as any stored row — a ref
-	// crossing agents is a ref crossing turns, exactly what §4.3 forbids.
-	payload.Data = &loomv1.MessagePayload_Value{
-		Value: []byte(truncateToolRowContent(string(dataBytes), int(storage.DefaultSharedMemoryThreshold))),
-	}
+	payload.Data = &loomv1.MessagePayload_Value{Value: dataBytes}
 
 	// Use message queue for request-response if configured
 	if a.messageQueue != nil {
@@ -272,27 +286,18 @@ func (a *Agent) SendWithAck(ctx context.Context, toAgent string, messageType str
 		defer cancel()
 	}
 
-	// Marshal data to JSON
-	dataBytes, err := json.Marshal(data)
+	bounded, trueSize, err := boundedPayloadValue(data, int(storage.DefaultSharedMemoryThreshold))
 	if err != nil {
-		return fmt.Errorf("failed to marshal data: %w", err)
+		return err
 	}
-
-	// Create message payload
 	payload := &loomv1.MessagePayload{
 		Metadata: &loomv1.PayloadMetadata{
-			SizeBytes:   int64(len(dataBytes)),
+			SizeBytes:   int64(trueSize),
 			ContentType: "application/json",
 			Compression: "none",
 			Encoding:    "none",
 		},
-	}
-
-	// The ref path is deleted (blueprint D3): inter-agent messages carry
-	// content inline, bounded by the same write rule as any stored row — a ref
-	// crossing agents is a ref crossing turns, exactly what §4.3 forbids.
-	payload.Data = &loomv1.MessagePayload_Value{
-		Value: []byte(truncateToolRowContent(string(dataBytes), int(storage.DefaultSharedMemoryThreshold))),
+		Data: &loomv1.MessagePayload_Value{Value: bounded},
 	}
 
 	// Generate message ID for tracking
