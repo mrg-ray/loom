@@ -1762,9 +1762,14 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	//
 	// This is the Chat()-entry persist site — the only turn-incrementing event
 	// (HLD §4.5) — hence turnStart=true.
+	//
+	// Time enters the session here, written into the turn at arrival: temporal
+	// words ("today", "this month") resolve at utterance time, and a value
+	// written once is durable content like any other row — the whole session
+	// stays byte-stable. Nothing renders time dynamically anywhere.
 	userMsg := a.appendMessage(ctx, session, Message{
 		Role:          "user",
-		Content:       userMessage,
+		Content:       time.Now().Format("[Mon 2006-01-02 15:04 MST] ") + userMessage,
 		ContentBlocks: p.contentBlocks,
 		AgentID:       a.id, // Track which agent received this message
 		Timestamp:     time.Now(),
