@@ -531,6 +531,23 @@ func (c *Client) convertResponse(resp *ChatCompletionResponse, providerCostUSD f
 	return llmResp
 }
 
+// anthropicFallbackPricing returns published Anthropic rates for a model id
+// proxied through an OpenAI-compatible endpoint. Mirrors the bedrock client's
+// substring matching so a gateway-proxied Claude is never priced as a GPT.
+func anthropicFallbackPricing(modelID string) (inputPerM, outputPerM float64, matched bool) {
+	switch {
+	case strings.Contains(modelID, "claude-opus-4-1"):
+		return 15.0, 75.0, true
+	case strings.Contains(modelID, "claude-opus"):
+		return 5.0, 25.0, true
+	case strings.Contains(modelID, "claude-haiku"):
+		return 1.0, 5.0, true
+	case strings.Contains(modelID, "claude-sonnet"), strings.Contains(modelID, "claude-3-5-sonnet"):
+		return 3.0, 15.0, true
+	}
+	return 0, 0, false
+}
+
 // providerCostHeader is litellm's own computed cost for the call. It is
 // cache-aware and authoritative — preferred over any local estimate.
 const providerCostHeader = "x-litellm-response-cost"
@@ -576,6 +593,17 @@ func (c *Client) calculateCost(inputTokens, outputTokens, cacheReadTokens, cache
 	// The catalog (pkg/llm/catalog) is the source of truth for pricing. Fall back
 	// to the provider-local rates below only for model ids it does not list.
 	inputCostPerM, outputCostPerM, ok := catalog.LookupPricing("openai", c.model)
+	if !ok {
+		// Gateways (litellm et al.) proxy non-OpenAI models through this
+		// OpenAI-compatible client under ids like "coding-agent/claude-sonnet-4-6".
+		// Falling through to the GPT rate card below would price them wrongly, so
+		// recognise the Anthropic family first. Order matters: check "opus-4-1"
+		// before "opus-4", since Contains("opus-4-5","opus-4") is true.
+		if in, out, matched := anthropicFallbackPricing(c.model); matched {
+			inputCostPerM, outputCostPerM = in, out
+			ok = true
+		}
+	}
 	if !ok {
 		switch c.model {
 		case "gpt-4o":
