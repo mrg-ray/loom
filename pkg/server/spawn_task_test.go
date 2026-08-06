@@ -8,6 +8,8 @@ package server
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,6 +21,7 @@ import (
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/teradata-labs/loom/pkg/shuttle/builtin"
+	"github.com/teradata-labs/loom/pkg/types"
 )
 
 // spawnTestServer builds a server whose registry can instantiate the named
@@ -160,4 +163,105 @@ func TestSpawn_FailedTaskCleansUp(t *testing.T) {
 	assert.Nil(t, resp)
 	assert.Zero(t, srv.countSpawnedAgentsByParent(parent),
 		"the half-built sub-agent must not stay tracked after a failed task")
+}
+
+// spawningLLM is a parent's brain: on its first turn it delegates by calling
+// manage_ephemeral_agents(spawn, ...), then reports whatever came back. It
+// records every tool result it is shown, which is where a sub-agent's answer
+// must appear for the parent to be able to use it.
+type spawningLLM struct {
+	mu          sync.Mutex
+	toolResults []string
+	delegated   bool
+}
+
+func (m *spawningLLM) Chat(ctx context.Context, messages []llmtypes.Message, tools []shuttle.Tool) (*llmtypes.LLMResponse, error) {
+	m.mu.Lock()
+	for _, msg := range messages {
+		if msg.Role == "tool" {
+			m.toolResults = append(m.toolResults, msg.Content)
+		}
+	}
+	first := !m.delegated
+	m.delegated = true
+	m.mu.Unlock()
+
+	if first {
+		return &llmtypes.LLMResponse{
+			ToolCalls: []types.ToolCall{{
+				ID:   "spawn-1",
+				Name: "manage_ephemeral_agents",
+				Input: map[string]interface{}{
+					"command":         "spawn",
+					"agent_id":        "helper",
+					"initial_message": "check these queries",
+				},
+			}},
+			Usage: llmtypes.Usage{InputTokens: 10, OutputTokens: 5},
+		}, nil
+	}
+	return &llmtypes.LLMResponse{
+		Content: "delegated and read the answer",
+		Usage:   llmtypes.Usage{InputTokens: 10, OutputTokens: 5},
+	}, nil
+}
+
+func (m *spawningLLM) Name() string  { return "spawning-llm" }
+func (m *spawningLLM) Model() string { return "spawning-model" }
+
+func (m *spawningLLM) results() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string{}, m.toolResults...)
+}
+
+// answeringLLM is the spawned helper: it answers with a distinctive string so
+// the test can prove that exact text travelled back to the parent.
+type answeringLLM struct{}
+
+func (answeringLLM) Chat(ctx context.Context, messages []llmtypes.Message, tools []shuttle.Tool) (*llmtypes.LLMResponse, error) {
+	return &llmtypes.LLMResponse{
+		Content: "SUBAGENT-VERDICT: query 2 does a full scan",
+		Usage:   llmtypes.Usage{InputTokens: 10, OutputTokens: 5},
+	}, nil
+}
+func (answeringLLM) Name() string  { return "answering-llm" }
+func (answeringLLM) Model() string { return "answering-model" }
+
+// TestSpawn_ParentReadsAnswerAsToolResult is the path-1+5 gate: an ordinary
+// agent holding manage_ephemeral_agents delegates to a sub-agent and reads the
+// sub-agent's answer in the tool result, in the same place every other tool
+// result appears. This exercises the whole chain — tool call, handler, child
+// run, response mapping — not just the server call.
+func TestSpawn_ParentReadsAnswerAsToolResult(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	registry, err := agent.NewRegistry(agent.RegistryConfig{
+		ConfigDir:   t.TempDir(),
+		DBPath:      ":memory:",
+		Logger:      logger,
+		LLMProvider: answeringLLM{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = registry.Close() })
+	registry.RegisterConfig(&loomv1.AgentConfig{Name: "helper", Description: "spawnable helper"})
+
+	parentLLM := &spawningLLM{}
+	parentAgent := agent.NewAgent(&mockBackend{}, parentLLM)
+
+	srv := setupBroadcastTestServer(t, map[string]*agent.Agent{"parent": parentAgent}, registry)
+	parentSessionID := parentSession(t, srv)
+
+	// Attach the spawn tool exactly as the Weave path does, stamped with this
+	// parent's session and id.
+	parentAgent.RegisterTool(builtin.NewManageEphemeralAgentsTool(srv, parentSessionID, "parent"))
+
+	_, err = parentAgent.Chat(context.Background(), parentSessionID, "review my queries")
+	require.NoError(t, err)
+
+	joined := strings.Join(parentLLM.results(), "\n")
+	require.NotEmpty(t, joined, "the parent must be shown a tool result")
+	assert.Contains(t, joined, "SUBAGENT-VERDICT: query 2 does a full scan",
+		"the sub-agent's answer must reach the parent as the tool's result")
+	assert.Contains(t, joined, "completed",
+		"the result reports the task ran, not merely that an agent was created")
 }
