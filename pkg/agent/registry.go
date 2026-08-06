@@ -845,12 +845,18 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 			}
 		}
 
-		// Set context limits on memory if specified
+		// Set context limits on memory if specified. The reservation is
+		// resolved against the request's real max_tokens (§5.1 "usable"), not
+		// taken from config alone — the marks must never sit above the
+		// provider's refusal line.
 		if config.Llm != nil {
 			if config.Llm.MaxContextTokens > 0 || config.Llm.ReservedOutputTokens > 0 {
 				memory.SetContextLimits(
 					int(config.Llm.MaxContextTokens),
-					int(config.Llm.ReservedOutputTokens))
+					EffectiveOutputReservation(
+						config.Llm.Provider, config.Llm.Model,
+						int(config.Llm.MaxTokens), int(config.Llm.ReservedOutputTokens),
+						int(config.Llm.MaxContextTokens)))
 			}
 		}
 

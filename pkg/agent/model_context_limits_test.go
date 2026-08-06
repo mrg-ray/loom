@@ -317,3 +317,97 @@ func TestModelPrefixMatching(t *testing.T) {
 		})
 	}
 }
+
+// TestEffectiveOutputReservation covers the §5.1 invariant: the reservation the
+// marks subtract must cover the request's real max_tokens, whichever build path
+// resolved it, so `usable` is never larger than the provider's real ceiling.
+func TestEffectiveOutputReservation(t *testing.T) {
+	tests := []struct {
+		name              string
+		provider, model   string
+		configuredMax     int // llm.max_tokens (the wire value)
+		configuredReserve int // llm.reserved_output_tokens
+		maxContext        int
+		want              int
+	}{
+		{
+			name:       "explicit wire max_tokens dominates the 10% default",
+			provider:   "anthropic",
+			model:      "unknown-model",
+			maxContext: 200000,
+			// 10% would be 20000; the request really sends 64000.
+			configuredMax: 64000,
+			want:          64000,
+		},
+		{
+			name:       "catalog output cap covers the factory path when max_tokens is unset",
+			provider:   "anthropic",
+			model:      "claude-sonnet-4-6", // catalog: 64000 max output
+			maxContext: 200000,
+			want:       64000, // not the 20000 the 10% default would give
+		},
+		{
+			name:              "explicit reserve wins when it is the largest",
+			provider:          "anthropic",
+			model:             "unknown-model",
+			maxContext:        200000,
+			configuredMax:     8000,
+			configuredReserve: 30000,
+			want:              30000,
+		},
+		{
+			name:       "10% default stands for an unknown model with no wire override",
+			provider:   "custom",
+			model:      "unknown-model",
+			maxContext: 100000,
+			want:       10000,
+		},
+		{
+			name:          "reserve never claims the whole window",
+			provider:      "custom",
+			model:         "unknown-model",
+			maxContext:    48000,
+			configuredMax: 64000, // larger than the window itself
+			want:          24000, // capped at half, leaving a working budget
+		},
+		{
+			name: "nothing known returns zero so callers keep their defaults",
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := EffectiveOutputReservation(tt.provider, tt.model,
+				tt.configuredMax, tt.configuredReserve, tt.maxContext)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestEffectiveOutputReservation_MarksStayBelowRefusalLine is the end-to-end
+// property: with the reservation applied, the relief start mark sits below the
+// provider's ceiling (window − max_tokens), so proactive relief fires before a
+// refusal instead of after it.
+func TestEffectiveOutputReservation_MarksStayBelowRefusalLine(t *testing.T) {
+	const window, wireMaxTokens = 200000, 64000
+
+	reserve := EffectiveOutputReservation("anthropic", "claude-sonnet-4-6", wireMaxTokens, 0, window)
+	sm := NewSegmentedMemory("ROM", window, reserve)
+
+	sm.mu.Lock()
+	start := sm.startMarkLocked(0)
+	sm.mu.Unlock()
+
+	refusalLine := window - wireMaxTokens
+	assert.LessOrEqual(t, start, refusalLine,
+		"the start mark must sit at or below window − max_tokens, or relief can never fire")
+
+	// The pre-fix 10% reserve put the mark above the line — guard the regression.
+	stale := NewSegmentedMemory("ROM", window, window/10)
+	stale.mu.Lock()
+	staleStart := stale.startMarkLocked(0)
+	stale.mu.Unlock()
+	assert.Greater(t, staleStart, refusalLine,
+		"precondition: the 10% reserve is exactly the geometry this fix corrects")
+}

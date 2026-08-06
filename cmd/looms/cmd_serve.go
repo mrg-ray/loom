@@ -1593,12 +1593,17 @@ func runServe(cmd *cobra.Command, args []string) {
 					}
 				}
 
-				// Set context limits on memory if specified
+				// Set context limits on memory if specified. The reservation
+				// covers the request's real max_tokens (HLD §5.1 "usable") so
+				// the relief marks stay below the provider's refusal line.
 				if cfg.Llm != nil {
 					if cfg.Llm.MaxContextTokens > 0 || cfg.Llm.ReservedOutputTokens > 0 {
 						memory.SetContextLimits(
 							int(cfg.Llm.MaxContextTokens),
-							int(cfg.Llm.ReservedOutputTokens))
+							agent.EffectiveOutputReservation(
+								cfg.Llm.Provider, cfg.Llm.Model,
+								int(cfg.Llm.MaxTokens), int(cfg.Llm.ReservedOutputTokens),
+								int(cfg.Llm.MaxContextTokens)))
 					}
 				}
 
@@ -2968,12 +2973,17 @@ func runServe(cmd *cobra.Command, args []string) {
 				}
 			}
 
-			// Set context limits on memory if specified
+			// Set context limits on memory if specified. The reservation
+			// covers the request's real max_tokens (HLD §5.1 "usable") so the
+			// relief marks stay below the provider's refusal line.
 			if agentConfig.Llm != nil {
 				if agentConfig.Llm.MaxContextTokens > 0 || agentConfig.Llm.ReservedOutputTokens > 0 {
 					memory.SetContextLimits(
 						int(agentConfig.Llm.MaxContextTokens),
-						int(agentConfig.Llm.ReservedOutputTokens))
+						agent.EffectiveOutputReservation(
+							agentConfig.Llm.Provider, agentConfig.Llm.Model,
+							int(agentConfig.Llm.MaxTokens), int(agentConfig.Llm.ReservedOutputTokens),
+							int(agentConfig.Llm.MaxContextTokens)))
 				}
 			}
 
