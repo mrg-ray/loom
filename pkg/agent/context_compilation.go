@@ -418,9 +418,20 @@ func (sm *SegmentedMemory) ReleasePressure(ctx context.Context, penalty int) (sh
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	// One pass at a time: fold releases the lock across its compressor call,
+	// so without this guard a second caller could enter mid-pass and run an
+	// interleaved ladder. The conversation loop is sequential today; the flag
+	// makes that a guarantee instead of a call-graph accident.
+	if sm.reliefInFlight {
+		return false, sm.estimateLocked(), sm.releaseMarkLocked(penalty)
+	}
+
 	if sm.estimateLocked() < sm.startMarkLocked(penalty) {
 		return false, 0, 0 // under the start mark — no pressure to release
 	}
+
+	sm.reliefInFlight = true
+	defer func() { sm.reliefInFlight = false }()
 
 	t := sm.currentTurnLocked()
 	k := int64(sm.protectedRecentTurns)
@@ -550,7 +561,11 @@ func (sm *SegmentedMemory) evictLocked(ctx context.Context, b int64) bool {
 // folded flags commit in one transaction; the new version and flags are
 // mirrored into memory in the same step; skills whose manage_skills load pair
 // lies inside the region are deactivated. Returns whether anything changed.
-// Must hold lock.
+//
+// Lock contract: held at entry and exit, RELEASED across the compressor's LLM
+// call (prepare → compress → validate+commit). The snapshot version check
+// after re-locking keeps the commit correct if a concurrent mutator ever
+// appears.
 func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 	// Region: the seq-ordered prefix with turn ≤ b, pair-adjusted so a call
 	// and its result are never split across the boundary.
@@ -581,7 +596,9 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 
 	// Compressor input: the current summary text + the region as rendered —
 	// stubs as stubs, so it summarizes conversation, never payloads — with
-	// msg: addresses visible for citation (§5.4.2/4).
+	// msg: addresses visible for citation (§5.4.2/4). Built under the lock,
+	// as value copies: nothing the unlocked compress phase touches aliases
+	// shared state.
 	t := sm.currentTurnLocked()
 	callName := make(map[string]string)
 	for i := range sm.contextMessages {
@@ -603,15 +620,42 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 		input = append(input, r)
 	}
 
+	// The prepare snapshot: the summary version this fold builds on and the
+	// region's identity, checked after the unlocked compress phase.
+	n0 := sm.summary.n
+	lastRegionID := sm.contextMessages[count-1].ID
+
 	// Compressor = the same model as the agent, or better; its output is
 	// version n+1 whole (superseded, not merged). Fold is rare and its output
 	// is the session's whole memory, so the call gets 120s, not the old 5s.
+	// The LOCK IS RELEASED across the call: the compressor is a pure function
+	// of the snapshot built above, and holding the write lock through a
+	// network call would serialize every reader behind it for the duration.
 	newText := ""
 	fallback := false
 	if sm.compressor != nil && sm.compressor.IsEnabled() {
+		sm.mu.Unlock()
 		compressCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 		compressed, err := sm.compressor.CompressMessages(compressCtx, input)
 		cancel()
+		sm.mu.Lock()
+
+		// Validate the snapshot before committing on top of it. Every L1
+		// appender runs on the conversation-loop thread, which is blocked
+		// inside this pass — so a mismatch is not an expected path but the
+		// guard that keeps this true by enforcement, not by call graph: if a
+		// concurrent mutator ever appears, the fold degrades to one discarded
+		// compressor call instead of a lost update.
+		if sm.summary.n != n0 || count > len(sm.contextMessages) ||
+			sm.contextMessages[count-1].ID != lastRegionID {
+			zap.L().Warn("releasePressure: fold snapshot invalidated during compress — discarding",
+				zap.String("session_id", sm.sessionID),
+				zap.Int64("boundary_turn", b),
+				zap.Int("summary_version_at_prepare", n0),
+				zap.Int("summary_version_now", sm.summary.n))
+			return false
+		}
+
 		if err == nil && compressed != "" {
 			newText = strings.TrimSpace(compressed)
 			// The first line states the covered span (§5.4.4) — enforced here

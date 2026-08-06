@@ -18,7 +18,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -366,4 +368,132 @@ func TestPressureMarks_ProfileDrivenWithFallback(t *testing.T) {
 		assert.Equal(t, 60*usable/100, sm.releaseMarkLocked(0), "critical=%d warning=%d", bad.critical, bad.warning)
 		sm.mu.Unlock()
 	}
+}
+
+// gatedCompressor signals when the fold reaches it, then blocks until released.
+type gatedCompressor struct {
+	enterOnce sync.Once
+	entered   chan struct{}
+	release   chan struct{}
+	out       string
+}
+
+func (g *gatedCompressor) CompressMessages(ctx context.Context, _ []Message) (string, error) {
+	g.enterOnce.Do(func() { close(g.entered) })
+	<-g.release
+	return g.out, nil
+}
+func (g *gatedCompressor) IsEnabled() bool { return true }
+
+// reliefConversation persists conversation-only turns (nothing evictable), so
+// the relief ladder must escalate to fold.
+func reliefConversation(t *testing.T, sm *SegmentedMemory, store *SessionStore, sessionID string, turns int) {
+	t.Helper()
+	ctx := context.Background()
+	for turn := 1; turn <= turns; turn++ {
+		u := Message{Role: "user", Content: fmt.Sprintf("turn %d: ", turn) + strings.Repeat("grant audit 123 db=SALES cpu=456; ", 100)}
+		require.NoError(t, store.SaveMessage(ctx, sessionID, &u, true))
+		sm.AddMessage(ctx, u)
+		a := Message{Role: "assistant", Content: fmt.Sprintf("noted %d", turn)}
+		require.NoError(t, store.SaveMessage(ctx, sessionID, &a, false))
+		sm.AddMessage(ctx, a)
+	}
+}
+
+// TestReleasePressure_ReadersRunDuringFoldCompress proves the lock is released
+// across the fold's compressor call: a reader completes while the compressor
+// is in flight. On a build that holds the write lock through the LLM call this
+// fails — the reader blocks until the compressor returns.
+func TestReleasePressure_ReadersRunDuringFoldCompress(t *testing.T) {
+	store, err := NewSessionStore(filepath.Join(t.TempDir(), "s.db"), observability.NewNoOpTracer())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	const sessionID = "sess-relief-readers"
+	require.NoError(t, store.SaveSession(ctx, &Session{ID: sessionID, Context: map[string]interface{}{}}))
+
+	sm := NewSegmentedMemory("ROM", 6000, 600)
+	sm.SetThreshold(6000)
+	sm.SetSessionStore(store, sessionID)
+	g := &gatedCompressor{entered: make(chan struct{}), release: make(chan struct{}), out: "covers msg:1-999\nfolded conversation"}
+	sm.SetCompressor(g)
+
+	reliefConversation(t, sm, store, sessionID, 7)
+
+	done := make(chan struct{})
+	go func() { defer close(done); sm.ReleasePressure(ctx, 0) }()
+
+	select {
+	case <-g.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("relief never reached the fold compressor")
+	}
+
+	readerDone := make(chan struct{})
+	go func() { defer close(readerDone); _ = sm.GetL2Summary(); _ = sm.GetTokenCount() }()
+	select {
+	case <-readerDone:
+		// Readers run while the compressor is in flight — the lock breathes.
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader blocked while the fold compressor was in flight — the write lock is held across the LLM call")
+	}
+
+	close(g.release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("relief pass did not finish after the compressor was released")
+	}
+	assert.Contains(t, sm.GetL2Summary(), "folded conversation")
+}
+
+// racingCompressor mutates the summary DURING its first compress call —
+// possible only because the lock is released there — to force the snapshot
+// validation to fire.
+type racingCompressor struct {
+	sm    *SegmentedMemory
+	raced bool
+	out   string
+}
+
+func (r *racingCompressor) CompressMessages(ctx context.Context, _ []Message) (string, error) {
+	if !r.raced {
+		r.raced = true
+		// setSummary takes sm.mu itself: on a build holding the lock across
+		// the compressor call this self-deadlocks — which is the point.
+		r.sm.setSummary(99, "raced summary")
+	}
+	return r.out, nil
+}
+func (r *racingCompressor) IsEnabled() bool { return true }
+
+// TestReleasePressure_FoldDiscardsStaleSnapshot proves a fold whose snapshot
+// was invalidated mid-compress is discarded, never committed: the pass folds
+// again on top of the new state (version 100), instead of clobbering it with
+// the stale result (version 1 — the lost update).
+func TestReleasePressure_FoldDiscardsStaleSnapshot(t *testing.T) {
+	store, err := NewSessionStore(filepath.Join(t.TempDir(), "s.db"), observability.NewNoOpTracer())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	const sessionID = "sess-relief-stale"
+	require.NoError(t, store.SaveSession(ctx, &Session{ID: sessionID, Context: map[string]interface{}{}}))
+
+	sm := NewSegmentedMemory("ROM", 6000, 600)
+	sm.SetThreshold(6000)
+	sm.SetSessionStore(store, sessionID)
+	rc := &racingCompressor{sm: sm, out: "covers msg:1-999\nrebuilt on the raced state"}
+	sm.SetCompressor(rc)
+
+	reliefConversation(t, sm, store, sessionID, 7)
+
+	shed, _, _ := sm.ReleasePressure(ctx, 0)
+	assert.True(t, shed, "the pass sheds via the second, valid fold")
+
+	sm.mu.Lock()
+	n := sm.summary.n
+	sm.mu.Unlock()
+	assert.Equal(t, 100, n,
+		"the stale fold (would-be version 1) must be discarded; the retry builds version 100 on top of the raced state")
+	assert.Contains(t, sm.GetL2Summary(), "rebuilt on the raced state")
 }

@@ -111,6 +111,10 @@ type SegmentedMemory struct {
 	// touched by relief.
 	protectedRecentTurns int
 
+	// reliefInFlight guards ReleasePressure: fold releases the lock across
+	// its compressor call, and this keeps a second pass from interleaving.
+	reliefInFlight bool
+
 	// skillDeactivation is the skills orchestrator's deactivation path, called
 	// when fold flags a region containing a manage_skills load pair.
 	skillDeactivation func(sessionID, skillName string)
