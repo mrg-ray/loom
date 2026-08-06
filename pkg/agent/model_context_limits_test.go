@@ -14,9 +14,11 @@
 package agent
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGetModelContextLimits(t *testing.T) {
@@ -410,4 +412,34 @@ func TestEffectiveOutputReservation_MarksStayBelowRefusalLine(t *testing.T) {
 	stale.mu.Unlock()
 	assert.Greater(t, staleStart, refusalLine,
 		"precondition: the 10% reserve is exactly the geometry this fix corrects")
+}
+
+// TestNewAgent_DoesNotClobberComputedReservation reproduces the server's build
+// order: the caller computes the effective reservation onto the Memory, then
+// NewAgent re-applies SetContextLimits from its config. A zero in the config
+// must not erase the computed value — otherwise the reserve falls back to
+// window/10 and the relief marks land above the provider's refusal line.
+func TestNewAgent_DoesNotClobberComputedReservation(t *testing.T) {
+	const window, effectiveReserve = 200000, 64000
+
+	m := NewMemory()
+	m.SetContextLimits(window, effectiveReserve) // what cmd_serve computes
+
+	ag := NewAgent(nil, nil,
+		WithMemory(m),
+		WithConfig(&Config{MaxContextTokens: window}), // ReservedOutputTokens unset
+	)
+
+	sess := ag.memory.GetOrCreateSession(context.Background(), "reserve-session")
+	segMem, ok := sess.SegmentedMem.(*SegmentedMemory)
+	require.True(t, ok)
+
+	segMem.mu.Lock()
+	defer segMem.mu.Unlock()
+	assert.Equal(t, effectiveReserve, segMem.tokenBudget.ReservedTokens,
+		"the computed reservation survives agent construction")
+	assert.Equal(t, window-effectiveReserve, segMem.usableLocked(),
+		"usable is window minus the real output reservation")
+	assert.Less(t, segMem.startMarkLocked(0), window-effectiveReserve,
+		"the start mark stays below the provider's refusal line")
 }

@@ -1650,9 +1650,14 @@ func runServe(cmd *cobra.Command, args []string) {
 					if cfg.Llm.MaxContextTokens > 0 {
 						agentCfg.MaxContextTokens = int(cfg.Llm.MaxContextTokens)
 					}
-					if cfg.Llm.ReservedOutputTokens > 0 {
-						agentCfg.ReservedOutputTokens = int(cfg.Llm.ReservedOutputTokens)
-					}
+					// The EFFECTIVE reservation, not the raw field: NewAgent
+					// re-applies SetContextLimits from this config onto the same
+					// Memory, so a raw (often zero) value here would clobber the
+					// value computed above and drop the reserve to window/10.
+					agentCfg.ReservedOutputTokens = agent.EffectiveOutputReservation(
+						cfg.Llm.Provider, cfg.Llm.Model,
+						int(cfg.Llm.MaxTokens), int(cfg.Llm.ReservedOutputTokens),
+						int(cfg.Llm.MaxContextTokens))
 				}
 
 				// Transfer pattern configuration from proto if present
@@ -2945,9 +2950,11 @@ func runServe(cmd *cobra.Command, args []string) {
 				if agentConfig.Llm.MaxContextTokens > 0 {
 					cfg.MaxContextTokens = int(agentConfig.Llm.MaxContextTokens)
 				}
-				if agentConfig.Llm.ReservedOutputTokens > 0 {
-					cfg.ReservedOutputTokens = int(agentConfig.Llm.ReservedOutputTokens)
-				}
+				// The EFFECTIVE reservation — see the note at the other build site.
+				cfg.ReservedOutputTokens = agent.EffectiveOutputReservation(
+					agentConfig.Llm.Provider, agentConfig.Llm.Model,
+					int(agentConfig.Llm.MaxTokens), int(agentConfig.Llm.ReservedOutputTokens),
+					int(agentConfig.Llm.MaxContextTokens))
 			}
 
 			// Create memory instance for this agent

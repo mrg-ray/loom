@@ -136,7 +136,13 @@ func (m *Memory) SetContextLimits(maxContextTokens, reservedOutputTokens int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.maxContextTokens = maxContextTokens
-	m.reservedOutputTokens = reservedOutputTokens
+	// 0 means "unset" — it must not erase a reservation an earlier caller
+	// computed. Agent construction re-applies these limits from its config, and
+	// a zero there would silently drop the reserve back to window/10, putting
+	// the relief marks above the provider's refusal line (HLD §5.1 "usable").
+	if reservedOutputTokens > 0 {
+		m.reservedOutputTokens = reservedOutputTokens
+	}
 }
 
 // SetCompressionProfile sets the compression profile for new sessions.
