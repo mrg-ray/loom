@@ -117,10 +117,8 @@ func toolsNoneActive() bool {
 //	tools.minimal=true → suppress graph_memory, task_board
 //	                    (the two progressive-disclosure tools that previously
 //	                    over-coupled to subsystem wiring)
-//	tools.none=true    → also suppress the progressive-disclosure memory
-//	                    tools (conversation_memory, session_memory), the
-//	                    runtime error/result tools (get_error_details,
-//	                    query_tool_result), and the agent-coupling tools
+//	tools.none=true    → also suppress the retrieval tools
+//	                    (query_tool_result, recall) and the agent-coupling tools
 //	                    wired by MultiAgentServer.prepareAgent /
 //	                    UpdateAgent (send_message, publish,
 //	                    shared_memory_read, shared_memory_write).
