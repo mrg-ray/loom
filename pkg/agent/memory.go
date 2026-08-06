@@ -179,6 +179,9 @@ func (m *Memory) SetThresholdBytes(bytes int64) {
 	if bytes <= 0 {
 		return
 	}
+	if bytes < minThreshold {
+		bytes = minThreshold // the §4.1 tail alone needs room; see minThreshold
+	}
 	m.thresholdBytes = bytes
 	for _, session := range m.sessions {
 		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
@@ -188,8 +191,13 @@ func (m *Memory) SetThresholdBytes(bytes int64) {
 }
 
 // thresholdOrDefault returns the configured threshold, else the default bound.
+// Never below minThreshold: this value is the persist-time row bound, and a
+// smaller one cannot hold stored = core + tail ≤ threshold (§4.1).
 func (m *Memory) thresholdOrDefault() int {
 	if m.thresholdBytes > 0 {
+		if m.thresholdBytes < minThreshold {
+			return minThreshold
+		}
 		return int(m.thresholdBytes)
 	}
 	return int(storage.DefaultSharedMemoryThreshold)

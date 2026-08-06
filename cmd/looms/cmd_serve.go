@@ -199,11 +199,6 @@ func registerYAMLBuiltinTools(
 		"tool_search":   true, // Auto-registered when !tools.minimal/none and toolRegistry available
 	}
 	otherMechanismTools := map[string]string{
-		"recall_conversation":             "memory/swap layer",
-		"clear_recalled_context":          "memory/swap layer",
-		"search_conversation":             "memory/swap layer",
-		"get_tool_result":                 "async tool result retrieval",
-		"get_error_details":               "error details retrieval",
 		"delegate_to_agent":               "coordination subsystem",
 		"send_message":                    "communication subsystem (MessageQueue)",
 		"shared_memory_write":             "communication subsystem (SharedMemoryStore)",

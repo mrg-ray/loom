@@ -66,6 +66,9 @@ func (sm *SegmentedMemory) inTurnPayload(messageID int64) (string, error) {
 // this agent, in bytes.
 func (a *Agent) contextThreshold() int {
 	if a.sharedMemoryThreshold > 0 {
+		if a.sharedMemoryThreshold < minThreshold {
+			return minThreshold // §4.1 needs room for the tail; see minThreshold
+		}
 		return int(a.sharedMemoryThreshold)
 	}
 	return int(storage.DefaultSharedMemoryThreshold)

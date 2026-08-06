@@ -497,3 +497,32 @@ func TestReleasePressure_FoldDiscardsStaleSnapshot(t *testing.T) {
 		"the stale fold (would-be version 1) must be discarded; the retry builds version 100 on top of the raced state")
 	assert.Contains(t, sm.GetL2Summary(), "rebuilt on the raced state")
 }
+
+// TestThresholdFloor_AllConsumers pins the §4.1 invariant at every seam that
+// carries the threshold: a configured value below minThreshold cannot hold
+// stored = core + tail ≤ threshold, so each consumer clamps. Before the clamp,
+// Memory.thresholdOrDefault and Agent.contextThreshold returned the raw value
+// and a persisted row exceeded its own bound.
+func TestThresholdFloor_AllConsumers(t *testing.T) {
+	const tiny = 50
+
+	m := NewMemory()
+	m.SetThresholdBytes(tiny)
+	assert.GreaterOrEqual(t, m.thresholdOrDefault(), minThreshold,
+		"the persist-time row bound clamps to the floor")
+
+	ag := NewAgent(nil, nil)
+	ag.SetSharedMemoryThreshold(tiny)
+	assert.GreaterOrEqual(t, ag.contextThreshold(), minThreshold,
+		"the retrieval/page bound clamps to the floor")
+
+	sm := NewSegmentedMemory("ROM", 200000, 20000)
+	sm.SetThreshold(tiny)
+	assert.GreaterOrEqual(t, sm.Threshold(), minThreshold,
+		"the compile-time offload bound clamps to the floor")
+
+	// The invariant the floor exists to protect, at the clamped value.
+	stored := truncateToolRowContent(strings.Repeat("x", 5000), m.thresholdOrDefault())
+	assert.LessOrEqual(t, len(stored), m.thresholdOrDefault(),
+		"a truncated row never exceeds its own bound")
+}

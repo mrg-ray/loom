@@ -86,3 +86,50 @@ func TestMessages_RoundTrip_ContextCompilationColumns(t *testing.T) {
 	require.NoError(t, err, "LoadSession must scan every selected column")
 	require.NotNil(t, sess)
 }
+
+// TestMessages_CrossAgentReadsFilterFolded proves the two cross-agent readers
+// exclude folded rows, matching LoadSession/LoadMessages and the SQLite store.
+// Before the fix both queries selected `folded` and never filtered on it, so a
+// postgres deployment leaked folded rows into cross-agent context while SQLite
+// did not.
+func TestMessages_CrossAgentReadsFilterFolded(t *testing.T) {
+	pool := testPool(t)
+	store := testSessionStore(t, pool)
+
+	userID := uniqueID("user-xa")
+	agentID := uniqueID("agent-xa")
+	parentID := createTestSession(t, store, userID, uniqueID("sess-parent"), agentID)
+	ctx := ContextWithUserID(context.Background(), userID)
+
+	require.NoError(t, store.SaveMessage(ctx, parentID,
+		&agent.Message{Role: "user", Content: "folded-away", SessionContext: "coordinator"}, true))
+	require.NoError(t, store.SaveMessage(ctx, parentID,
+		&agent.Message{Role: "user", Content: "still-here", SessionContext: "coordinator"}, true))
+
+	msgs, err := store.LoadMessages(ctx, parentID)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	foldSeq, err := strconv.ParseInt(msgs[0].ID, 10, 64)
+	require.NoError(t, err)
+	require.NoError(t, store.FoldMessages(ctx, parentID, []int64{foldSeq}, 1, "covers msg:1-1\nsummary"))
+
+	// Reader 1: by agent.
+	byAgent, err := store.LoadMessagesForAgent(ctx, agentID)
+	require.NoError(t, err)
+	for _, m := range byAgent {
+		require.NotEqual(t, "folded-away", m.Content, "LoadMessagesForAgent must not return folded rows")
+	}
+	require.NotEmpty(t, byAgent, "the unfolded row is still returned")
+
+	// Reader 2: from parent session, via a child session.
+	childID := createTestSession(t, store, userID, uniqueID("sess-child"), uniqueID("agent-child"))
+	_, err = pool.Exec(ctx, "UPDATE sessions SET parent_session_id = $1 WHERE id = $2", parentID, childID)
+	require.NoError(t, err)
+
+	fromParent, err := store.LoadMessagesFromParentSession(ctx, childID)
+	require.NoError(t, err)
+	require.NotEmpty(t, fromParent, "the unfolded coordinator row is visible to the child")
+	for _, m := range fromParent {
+		require.NotEqual(t, "folded-away", m.Content, "LoadMessagesFromParentSession must not return folded rows")
+	}
+}

@@ -799,7 +799,7 @@ agent:
 - `pkg/memory/salience.go` -- Salience engine (`ComputeSalience`, `BoostSalience`, `RankBySalience`, `CombineScores`)
 - `pkg/memory/budget.go` -- Token budget phased allocation (`BudgetConfig`, `AllocateMemoryBudget`)
 - `pkg/agent/graph_memory_tool.go` -- Agent tool (8 actions)
-- `pkg/agent/agent.go` -- `injectGraphMemoryContext()`, `graphMemoryPromptSupplement()`, `checkAndRegisterGraphMemoryTool()`
+- `pkg/agent/agent.go` -- `injectGraphMemoryContext()`, `checkAndRegisterGraphMemoryTool()`
 - `pkg/storage/backend/backend.go` -- `GraphMemoryProvider` interface
 - `pkg/storage/sqlite/graph_memory_store.go` -- SQLite implementation
 - `pkg/storage/sqlite/migrations/000002_graph_memory.up.sql` -- SQLite schema
