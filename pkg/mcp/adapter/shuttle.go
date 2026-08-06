@@ -31,21 +31,13 @@ import (
 	"github.com/teradata-labs/loom/pkg/mcp/client"
 	"github.com/teradata-labs/loom/pkg/mcp/protocol"
 	"github.com/teradata-labs/loom/pkg/shuttle"
-	"github.com/teradata-labs/loom/pkg/storage"
 )
 
 // debugBedrockTools is cached at package init to avoid repeated os.Getenv calls.
 var debugBedrockTools = os.Getenv("LOOM_DEBUG_BEDROCK_TOOLS") == "1"
 
-// Result truncation and caching configuration
+// Schema caching configuration
 const (
-	// DefaultMaxResultBytes is the maximum size of tool results before truncation
-	// 20KB matches MaxPreviewChars in storage package (20,000 chars ≈ 5K tokens)
-	DefaultMaxResultBytes = 20000
-
-	// DefaultMaxResultRows is the maximum number of rows to return from SQL results
-	DefaultMaxResultRows = 500
-
 	// SchemaCacheTTL is how long schema results are cached
 	SchemaCacheTTL = 5 * time.Minute
 )
@@ -92,22 +84,13 @@ func (c *schemaCache) set(key string, result string) {
 	}
 }
 
-// TruncationConfig configures how tool results are truncated
-type TruncationConfig struct {
-	MaxResultBytes int  // Maximum result size in bytes (0 = use default)
-	MaxResultRows  int  // Maximum rows for SQL results (0 = use default)
-	Enabled        bool // Whether truncation is enabled
-}
-
 // MCPToolAdapter wraps an MCP tool as a shuttle.Tool
 type MCPToolAdapter struct {
 	client        *client.Client
 	tool          protocol.Tool
-	serverName    string                     // Used as backend identifier
-	truncation    TruncationConfig           // Result truncation settings
-	sharedMemory  *storage.SharedMemoryStore // For storing other large data
-	uiResourceURI string                     // From tool._meta.ui.resourceUri (MCP Apps)
-	logger        *zap.Logger                // Structured logger (defaults to no-op)
+	serverName    string      // Used as backend identifier
+	uiResourceURI string      // From tool._meta.ui.resourceUri (MCP Apps)
+	logger        *zap.Logger // Structured logger (defaults to no-op)
 }
 
 // NewMCPToolAdapter creates a new adapter that wraps an MCP tool
@@ -116,50 +99,6 @@ func NewMCPToolAdapter(client *client.Client, tool protocol.Tool, serverName str
 		client:     client,
 		tool:       tool,
 		serverName: serverName,
-		truncation: TruncationConfig{
-			MaxResultBytes: DefaultMaxResultBytes,
-			MaxResultRows:  DefaultMaxResultRows,
-			Enabled:        true, // Enable by default
-		},
-		sharedMemory: nil,          // Will be set by SetSharedMemory if needed
-		logger:       zap.NewNop(), // No-op by default; use SetLogger to enable
-	}
-
-	// Extract UI metadata from tool._meta.ui if present (MCP Apps)
-	if uiMeta := protocol.GetUIToolMeta(tool); uiMeta != nil {
-		adapter.uiResourceURI = uiMeta.ResourceURI
-	}
-
-	return adapter
-}
-
-// SetSharedMemory configures shared memory store for this adapter.
-// Enables automatic storage of large non-SQL data.
-func (a *MCPToolAdapter) SetSharedMemory(store *storage.SharedMemoryStore) {
-	a.sharedMemory = store
-}
-
-// SetLogger configures the structured logger for this adapter.
-// If not called, a no-op logger is used.
-func (a *MCPToolAdapter) SetLogger(logger *zap.Logger) {
-	if logger != nil {
-		a.logger = logger
-	}
-}
-
-// NewMCPToolAdapterWithConfig creates a new adapter with custom truncation config
-func NewMCPToolAdapterWithConfig(client *client.Client, tool protocol.Tool, serverName string, config TruncationConfig) *MCPToolAdapter {
-	if config.MaxResultBytes == 0 {
-		config.MaxResultBytes = DefaultMaxResultBytes
-	}
-	if config.MaxResultRows == 0 {
-		config.MaxResultRows = DefaultMaxResultRows
-	}
-	adapter := &MCPToolAdapter{
-		client:     client,
-		tool:       tool,
-		serverName: serverName,
-		truncation: config,
 		logger:     zap.NewNop(), // No-op by default; use SetLogger to enable
 	}
 
@@ -169,6 +108,14 @@ func NewMCPToolAdapterWithConfig(client *client.Client, tool protocol.Tool, serv
 	}
 
 	return adapter
+}
+
+// SetLogger configures the structured logger for this adapter.
+// If not called, a no-op logger is used.
+func (a *MCPToolAdapter) SetLogger(logger *zap.Logger) {
+	if logger != nil {
+		a.logger = logger
+	}
 }
 
 // Name implements shuttle.Tool
@@ -300,15 +247,11 @@ func (a *MCPToolAdapter) Execute(ctx context.Context, params map[string]interfac
 		}, nil
 	}
 
-	// Convert MCP content to shuttle result data
+	// Convert MCP content to shuttle result data. The result rides WHOLE —
+	// arrival appends whole (ContextCompilation HLD §4): the compile-time
+	// offload, the persist-time row bound and the retrieval page bound are the
+	// only size logic, so no second bound may cut the payload upstream here.
 	data := convertMCPContent(mcpResult.Content)
-
-	// Apply result truncation (#1: Truncate Tool Results)
-	var truncated bool
-	var originalSize int
-	if a.truncation.Enabled {
-		data, truncated, originalSize = a.truncateResult(data)
-	}
 
 	// Cache schema results (#4: Schema Caching)
 	if a.isSchemaLookupTool() {
@@ -321,11 +264,6 @@ func (a *MCPToolAdapter) Execute(ctx context.Context, params map[string]interfac
 	metadata := map[string]interface{}{
 		"mcp_server": a.serverName,
 		"tool_name":  a.tool.Name,
-	}
-	if truncated {
-		metadata["truncated"] = true
-		metadata["original_size"] = originalSize
-		metadata["truncated_to"] = a.truncation.MaxResultBytes
 	}
 
 	return &shuttle.Result{
@@ -408,7 +346,7 @@ func AdaptMCPTools(ctx context.Context, mcpClient *client.Client, serverName str
 }
 
 // =============================================================================
-// Helper methods for result truncation and schema caching
+// Helper methods for schema caching
 // =============================================================================
 
 // isSchemaLookupTool returns true if this tool fetches table/column schema
@@ -437,84 +375,6 @@ func (a *MCPToolAdapter) buildSchemaCacheKey(params map[string]interface{}) stri
 	paramsJSON, _ := json.Marshal(params)
 	hash := sha256.Sum256(paramsJSON)
 	return fmt.Sprintf("%s:%s:%x", a.serverName, a.tool.Name, hash[:8])
-}
-
-// truncateResult applies truncation to tool results to reduce token consumption
-// Returns: (truncatedData, wasTruncated, originalSize)
-func (a *MCPToolAdapter) truncateResult(data interface{}) (interface{}, bool, int) {
-	switch v := data.(type) {
-	case string:
-		return a.truncateString(v)
-	case []map[string]interface{}:
-		return a.truncateArrayResult(v)
-	default:
-		// For other types, convert to string and truncate
-		jsonBytes, err := json.Marshal(data)
-		if err != nil {
-			return data, false, 0
-		}
-		truncated, wasTruncated, originalSize := a.truncateString(string(jsonBytes))
-		return truncated, wasTruncated, originalSize
-	}
-}
-
-// truncateString truncates a string result to maxResultBytes
-func (a *MCPToolAdapter) truncateString(s string) (interface{}, bool, int) {
-	originalSize := len(s)
-	if originalSize <= a.truncation.MaxResultBytes {
-		return s, false, originalSize
-	}
-
-	// Try to truncate at a row boundary for SQL results
-	truncated := s[:a.truncation.MaxResultBytes]
-
-	// Look for last complete row (newline)
-	lastNewline := strings.LastIndex(truncated, "\n")
-	if lastNewline > a.truncation.MaxResultBytes/2 {
-		truncated = truncated[:lastNewline]
-	}
-
-	// Add truncation notice
-	rowCount := strings.Count(s, "\n")
-	truncatedRows := strings.Count(truncated, "\n")
-
-	notice := fmt.Sprintf("\n\n[TRUNCATED: Showing %d of ~%d rows (%d of %d bytes). Use LIMIT in queries or create volatile tables for full results.]",
-		truncatedRows, rowCount, len(truncated), originalSize)
-
-	return truncated + notice, true, originalSize
-}
-
-// truncateArrayResult truncates array results (multiple content items)
-func (a *MCPToolAdapter) truncateArrayResult(items []map[string]interface{}) (interface{}, bool, int) {
-	jsonBytes, _ := json.Marshal(items)
-	originalSize := len(jsonBytes)
-
-	if originalSize <= a.truncation.MaxResultBytes {
-		return items, false, originalSize
-	}
-
-	// Keep only first N items
-	maxItems := a.truncation.MaxResultRows
-	if len(items) <= maxItems {
-		// Items are fine, but individual items might be large
-		// Truncate text content within items
-		for i := range items {
-			if text, ok := items[i]["text"].(string); ok {
-				if len(text) > a.truncation.MaxResultBytes/len(items) {
-					items[i]["text"] = text[:a.truncation.MaxResultBytes/len(items)] + "... [truncated]"
-				}
-			}
-		}
-		return items, true, originalSize
-	}
-
-	truncatedItems := items[:maxItems]
-	truncatedItems = append(truncatedItems, map[string]interface{}{
-		"type": "text",
-		"text": fmt.Sprintf("[TRUNCATED: Showing %d of %d items]", maxItems, len(items)),
-	})
-
-	return truncatedItems, true, originalSize
 }
 
 // ClearSchemaCache clears the global schema cache (useful for testing or cache invalidation)

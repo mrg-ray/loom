@@ -456,62 +456,8 @@ func TestMCPToolAdapter_InputSchema_InvalidJSON(t *testing.T) {
 }
 
 // =============================================================================
-// Tests for result truncation (#1) and schema caching (#4)
+// Tests for schema caching (#4)
 // =============================================================================
-
-func TestTruncateString_NoTruncation(t *testing.T) {
-	tool := protocol.Tool{Name: "test"}
-	adapter := NewMCPToolAdapter(nil, tool, "test")
-
-	// Small string - no truncation
-	result, truncated, originalSize := adapter.truncateString("hello world")
-	assert.Equal(t, "hello world", result)
-	assert.False(t, truncated)
-	assert.Equal(t, 11, originalSize)
-}
-
-func TestTruncateString_LargeString(t *testing.T) {
-	tool := protocol.Tool{Name: "test"}
-	adapter := NewMCPToolAdapter(nil, tool, "test")
-
-	// Create string larger than default 20000 bytes (updated from 4096)
-	largeString := ""
-	for i := 0; i < 1000; i++ { // Increased from 200 to generate >20KB
-		largeString += "Row " + string(rune('A'+i%26)) + ": some data here\n"
-	}
-
-	result, truncated, originalSize := adapter.truncateString(largeString)
-
-	assert.True(t, truncated)
-	assert.Greater(t, originalSize, DefaultMaxResultBytes)
-
-	resultStr := result.(string)
-	assert.Contains(t, resultStr, "[TRUNCATED:")
-	assert.LessOrEqual(t, len(resultStr), originalSize)
-}
-
-func TestTruncateResult_TypeSwitch(t *testing.T) {
-	tool := protocol.Tool{Name: "test"}
-	adapter := NewMCPToolAdapter(nil, tool, "test")
-
-	tests := []struct {
-		name        string
-		input       interface{}
-		expectTrunc bool
-	}{
-		{"small string", "hello", false},
-		{"nil", nil, false},
-		{"small map", map[string]interface{}{"key": "value"}, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, truncated, _ := adapter.truncateResult(tt.input)
-			assert.Equal(t, tt.expectTrunc, truncated)
-			assert.NotNil(t, result)
-		})
-	}
-}
 
 func TestIsSchemaLookupTool(t *testing.T) {
 	tests := []struct {
@@ -587,52 +533,6 @@ func TestSchemaCache_Stats(t *testing.T) {
 	entries, age := GetSchemaCacheStats()
 	assert.Equal(t, 2, entries)
 	assert.Less(t, age.Seconds(), float64(1)) // Should be very recent
-}
-
-func TestNewMCPToolAdapterWithConfig(t *testing.T) {
-	tool := protocol.Tool{Name: "test"}
-
-	// Custom config
-	config := TruncationConfig{
-		MaxResultBytes: 8192,
-		MaxResultRows:  50,
-		Enabled:        true,
-	}
-
-	adapter := NewMCPToolAdapterWithConfig(nil, tool, "test", config)
-	assert.Equal(t, 8192, adapter.truncation.MaxResultBytes)
-	assert.Equal(t, 50, adapter.truncation.MaxResultRows)
-	assert.True(t, adapter.truncation.Enabled)
-}
-
-func TestNewMCPToolAdapterWithConfig_Defaults(t *testing.T) {
-	tool := protocol.Tool{Name: "test"}
-
-	// Config with zeros should use defaults
-	config := TruncationConfig{
-		MaxResultBytes: 0,
-		MaxResultRows:  0,
-		Enabled:        true,
-	}
-
-	adapter := NewMCPToolAdapterWithConfig(nil, tool, "test", config)
-	assert.Equal(t, DefaultMaxResultBytes, adapter.truncation.MaxResultBytes)
-	assert.Equal(t, DefaultMaxResultRows, adapter.truncation.MaxResultRows)
-}
-
-func TestTruncateArrayResult(t *testing.T) {
-	tool := protocol.Tool{Name: "test"}
-	adapter := NewMCPToolAdapter(nil, tool, "test")
-
-	// Small array - no truncation
-	smallItems := []map[string]interface{}{
-		{"type": "text", "text": "hello"},
-		{"type": "text", "text": "world"},
-	}
-
-	result, truncated, _ := adapter.truncateArrayResult(smallItems)
-	assert.False(t, truncated)
-	assert.Equal(t, smallItems, result)
 }
 
 func TestClearSchemaCache(t *testing.T) {
@@ -1523,12 +1423,14 @@ func TestExecute_ParameterNormalization_EndToEnd(t *testing.T) {
 	assert.False(t, hasSnake, "snake_case key should not be sent to MCP server")
 }
 
-func TestExecute_Truncation(t *testing.T) {
-	// Call Execute with a tool that returns a very large result (>20KB).
-	// Verify truncation works end-to-end.
+func TestExecute_LargeResultRidesWhole(t *testing.T) {
+	// A large MCP result must reach the agent WHOLE — arrival appends whole
+	// (ContextCompilation HLD §4); the compile-time offload and persist-time
+	// row bound are the only size logic. No adapter-level cut may starve
+	// query_tool_result of the payload it exists to serve.
 	testTool := protocol.Tool{
-		Name:        "read_log",
-		Description: "Read a large log file",
+		Name:        "read_all",
+		Description: "Read all data",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -1539,13 +1441,12 @@ func TestExecute_Truncation(t *testing.T) {
 		},
 	}
 
-	// Generate a large result (~40KB)
 	var largeContent strings.Builder
 	for i := 0; i < 2000; i++ {
-		fmt.Fprintf(&largeContent, "2025-01-15 10:00:%02d INFO  Processing record %d of 10000\n", i%60, i)
+		fmt.Fprintf(&largeContent, "Row %d: data data data data\n", i)
 	}
 	largeText := largeContent.String()
-	require.Greater(t, len(largeText), DefaultMaxResultBytes, "test data must exceed max result bytes")
+	require.Greater(t, len(largeText), 40000, "test data must exceed every old adapter bound")
 
 	handler := func(method string, params json.RawMessage) (interface{}, *protocol.Error) {
 		switch method {
@@ -1568,70 +1469,6 @@ func TestExecute_Truncation(t *testing.T) {
 	adapter := NewMCPToolAdapter(mcpClient, testTool, "test-server")
 
 	result, err := adapter.Execute(context.Background(), map[string]interface{}{
-		"path": "/var/log/app.log",
-	})
-
-	require.NoError(t, err)
-	require.NotNil(t, result)
-	assert.True(t, result.Success)
-
-	// Verify truncation happened
-	resultStr, ok := result.Data.(string)
-	require.True(t, ok, "result data should be a string")
-	assert.Contains(t, resultStr, "[TRUNCATED:")
-	assert.Less(t, len(resultStr), len(largeText), "truncated result should be smaller than original")
-
-	// Verify metadata reflects truncation
-	assert.Equal(t, true, result.Metadata["truncated"])
-	assert.Equal(t, len(largeText), result.Metadata["original_size"])
-	assert.Equal(t, DefaultMaxResultBytes, result.Metadata["truncated_to"])
-}
-
-func TestExecute_Truncation_Disabled(t *testing.T) {
-	// Verify that truncation can be disabled via config.
-	testTool := protocol.Tool{
-		Name:        "read_all",
-		Description: "Read all data",
-		InputSchema: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{
-				"path": map[string]interface{}{
-					"type": "string",
-				},
-			},
-		},
-	}
-
-	var largeContent strings.Builder
-	for i := 0; i < 2000; i++ {
-		fmt.Fprintf(&largeContent, "Row %d: data data data data\n", i)
-	}
-	largeText := largeContent.String()
-	require.Greater(t, len(largeText), DefaultMaxResultBytes)
-
-	handler := func(method string, params json.RawMessage) (interface{}, *protocol.Error) {
-		switch method {
-		case "tools/list":
-			return protocol.ToolListResult{
-				Tools: []protocol.Tool{testTool},
-			}, nil
-		case "tools/call":
-			return protocol.CallToolResult{
-				Content: []protocol.Content{
-					{Type: "text", Text: largeText},
-				},
-			}, nil
-		default:
-			return nil, protocol.NewError(protocol.MethodNotFound, "unknown", nil)
-		}
-	}
-
-	mcpClient, _ := newMockClientWithHandler(t, handler)
-	adapter := NewMCPToolAdapterWithConfig(mcpClient, testTool, "test-server", TruncationConfig{
-		Enabled: false, // Disable truncation
-	})
-
-	result, err := adapter.Execute(context.Background(), map[string]interface{}{
 		"path": "/var/log/full.log",
 	})
 
@@ -1639,9 +1476,8 @@ func TestExecute_Truncation_Disabled(t *testing.T) {
 	require.NotNil(t, result)
 	assert.True(t, result.Success)
 
-	// With truncation disabled, data should be the full original text
-	assert.Equal(t, largeText, result.Data)
-	assert.Nil(t, result.Metadata["truncated"], "truncated metadata should not be present")
+	assert.Equal(t, largeText, result.Data, "the payload arrives byte-identical, never cut")
+	assert.Nil(t, result.Metadata["truncated"], "no truncation metadata exists")
 }
 
 func TestExecute_SchemaCaching_EndToEnd(t *testing.T) {
@@ -1820,9 +1656,9 @@ func TestExecute_EmptyContent(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Success)
-	// Empty content -> convertMCPContent returns nil -> truncateResult marshals nil
-	// to JSON "null" string. This is the actual behavior when truncation is enabled.
-	assert.Equal(t, "null", result.Data, "empty content produces 'null' after JSON marshaling in truncation")
+	// Empty content → convertMCPContent returns nil, and the result rides
+	// as-is — nothing reshapes it on the way to the agent.
+	assert.Nil(t, result.Data, "empty content arrives as nil, untransformed")
 }
 
 func TestExecute_ContextCancellation(t *testing.T) {
