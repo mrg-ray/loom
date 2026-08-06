@@ -526,3 +526,52 @@ func TestThresholdFloor_AllConsumers(t *testing.T) {
 	assert.LessOrEqual(t, len(stored), m.thresholdOrDefault(),
 		"a truncated row never exceeds its own bound")
 }
+
+// panickingCompressor models a provider client that faults mid-call.
+type panickingCompressor struct{}
+
+func (p *panickingCompressor) CompressMessages(context.Context, []Message) (string, error) {
+	panic("provider client faulted mid-compress")
+}
+func (p *panickingCompressor) IsEnabled() bool { return true }
+
+// TestReleasePressure_CompressorPanicDoesNotCorruptTheLock pins the unwind
+// contract. fold releases sm.mu across the compressor call while
+// ReleasePressure holds `defer sm.mu.Unlock()` for the whole pass. If the
+// re-lock were sequential rather than deferred, a panic in the compressor would
+// leave the mutex unlocked, and that deferred unlock would hit an unlocked
+// mutex — a FATAL runtime throw (recover cannot catch it), turning a
+// recoverable provider fault into a process crash. With the deferred re-lock
+// the panic stays an ordinary panic and the mutex is left usable.
+func TestReleasePressure_CompressorPanicDoesNotCorruptTheLock(t *testing.T) {
+	store, err := NewSessionStore(filepath.Join(t.TempDir(), "s.db"), observability.NewNoOpTracer())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	const sessionID = "sess-relief-panic"
+	require.NoError(t, store.SaveSession(ctx, &Session{ID: sessionID, Context: map[string]interface{}{}}))
+
+	sm := NewSegmentedMemory("ROM", 6000, 600)
+	sm.SetThreshold(6000)
+	sm.SetSessionStore(store, sessionID)
+	sm.SetCompressor(&panickingCompressor{})
+
+	reliefConversation(t, sm, store, sessionID, 7)
+
+	assert.Panics(t, func() { _, _, _ = sm.ReleasePressure(ctx, 0) },
+		"the compressor's panic propagates as a panic, not a fatal double-unlock")
+
+	// The decisive assertion: the mutex is in a sane state afterwards. A
+	// sequential re-lock would have crashed the process before reaching here.
+	done := make(chan struct{})
+	go func() {
+		sm.mu.Lock()
+		sm.mu.Unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("mutex left in an unusable state after the compressor panic")
+	}
+}

@@ -636,9 +636,18 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 	if sm.compressor != nil && sm.compressor.IsEnabled() {
 		sm.mu.Unlock()
 		compressCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
-		compressed, err := sm.compressor.CompressMessages(compressCtx, input)
-		cancel()
-		sm.mu.Lock()
+		// The re-lock is DEFERRED, not sequential. ReleasePressure holds a
+		// `defer sm.mu.Unlock()` for the whole pass, so if the compressor
+		// panicked while the lock was released, that deferred unlock would run
+		// against an unlocked mutex — a fatal runtime throw that recover()
+		// cannot catch, turning a recoverable provider fault into a process
+		// crash. Re-taking the lock on the way out keeps the pass's invariant
+		// true however the call exits.
+		compressed, err := func() (string, error) {
+			defer sm.mu.Lock()
+			defer cancel()
+			return sm.compressor.CompressMessages(compressCtx, input)
+		}()
 
 		// Validate the snapshot before committing on top of it. Every L1
 		// appender runs on the conversation-loop thread, which is blocked
