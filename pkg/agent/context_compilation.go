@@ -373,6 +373,19 @@ func (sm *SegmentedMemory) usableLocked() int {
 	return sm.tokenBudget.MaxTokens - sm.tokenBudget.ReservedTokens
 }
 
+// applyPenalty lowers a mark percentage for the recovery pass, floored at 1.
+// Without the floor a configured profile with a release mark under the penalty
+// (validation allows warning=10) yields a NEGATIVE target on the recovery pass:
+// the pass's exit test is `estimate <= target`, which no estimate can satisfy,
+// so it runs every rung of the ladder — folding the whole of L1 into the
+// summary after a single provider refusal.
+func applyPenalty(pct, penalty int) int {
+	if p := pct - penalty; p >= 1 {
+		return p
+	}
+	return 1
+}
+
 // marksLocked resolves the water marks from the compression profile:
 // HWM ← CriticalThresholdPercent, LWM ← WarningThresholdPercent. A missing or
 // inverted pair falls back to the 90/60 defaults, so a hand-built profile can
@@ -390,14 +403,14 @@ func (sm *SegmentedMemory) marksLocked() (start, release int) {
 // (percentage points) lowers it for the recovery pass. Must hold lock.
 func (sm *SegmentedMemory) startMarkLocked(penalty int) int {
 	start, _ := sm.marksLocked()
-	return (start - penalty) * sm.usableLocked() / 100
+	return applyPenalty(start, penalty) * sm.usableLocked() / 100
 }
 
 // releaseMarkLocked is the LWM: shed down to it. penalty lowers it in step with
 // startMarkLocked so the recovery pass sheds deeper. Must hold lock.
 func (sm *SegmentedMemory) releaseMarkLocked(penalty int) int {
 	_, release := sm.marksLocked()
-	return (release - penalty) * sm.usableLocked() / 100
+	return applyPenalty(release, penalty) * sm.usableLocked() / 100
 }
 
 // --- releasePressure (HLD §5.2) ----------------------------------------------

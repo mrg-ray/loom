@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/shuttle"
@@ -264,6 +265,19 @@ func (t *QueryToolResultTool) paginate(payload string, input map[string]interfac
 		units = strings.Split(payload, "\n")
 	}
 
+	budget := threshold - 512 // envelope headroom for the wrapper fields
+	if budget < 1024 {
+		budget = 1024
+	}
+
+	// A unit larger than the whole page budget is SPLIT into budget-sized
+	// pieces, not truncated: the page bound is the same §5.1 threshold as every
+	// other bound, but cutting a unit and dropping the remainder would make it
+	// unreachable — offset addresses units, so nothing could ask for the rest,
+	// and re-running the producing call regenerates the same oversized unit.
+	// Splitting keeps every byte reachable by paging on.
+	units = splitOversizedUnits(units, budget)
+
 	if offset >= len(units) {
 		return &shuttle.Result{
 			Success: false,
@@ -281,22 +295,12 @@ func (t *QueryToolResultTool) paginate(payload string, input map[string]interfac
 
 	// Bound the serialized page at the threshold, cut at a unit boundary.
 	page := make([]string, 0, end-offset)
-	budget := threshold - 512 // envelope headroom for the wrapper fields
-	if budget < 1024 {
-		budget = 1024
-	}
 	used := 0
 	for i := offset; i < end; i++ {
 		u := units[i]
 		if used > 0 && used+len(u) > budget {
 			end = i
 			break
-		}
-		// A single unit larger than the whole page budget must not ride whole —
-		// the page bound is the same §5.1 threshold as every other bound. Bound
-		// it with the §4.1 tail so the cut is explicit.
-		if len(u) > budget {
-			u = truncateToolRowContent(u, budget)
 		}
 		page = append(page, u)
 		used += len(u) + 1
@@ -313,6 +317,39 @@ func (t *QueryToolResultTool) paginate(payload string, input map[string]interfac
 			"has_more":       offset+len(page) < len(units),
 		},
 	}, nil
+}
+
+// splitOversizedUnits replaces any unit longer than budget with consecutive
+// budget-sized pieces, cut on UTF-8 rune boundaries. Paging then walks the
+// pieces like any other units, so an oversized unit stays fully reachable and
+// total_count / has_more describe what is actually retrievable.
+func splitOversizedUnits(units []string, budget int) []string {
+	oversized := false
+	for _, u := range units {
+		if len(u) > budget {
+			oversized = true
+			break
+		}
+	}
+	if !oversized {
+		return units
+	}
+	out := make([]string, 0, len(units))
+	for _, u := range units {
+		for len(u) > budget {
+			cut := budget
+			for cut > 0 && !utf8.RuneStart(u[cut]) {
+				cut--
+			}
+			if cut == 0 {
+				cut = budget // pathological: no rune boundary in range
+			}
+			out = append(out, u[:cut])
+			u = u[cut:]
+		}
+		out = append(out, u)
+	}
+	return out
 }
 
 // Backend returns the backend type this tool requires.

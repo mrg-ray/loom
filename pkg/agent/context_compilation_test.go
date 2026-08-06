@@ -575,3 +575,26 @@ func TestReleasePressure_CompressorPanicDoesNotCorruptTheLock(t *testing.T) {
 		t.Fatal("mutex left in an unusable state after the compressor panic")
 	}
 }
+
+// TestPressureMarks_PenaltyNeverGoesNegative pins the recovery pass against a
+// configured profile whose release mark is below the penalty. Validate() admits
+// warning=10/critical=30, and an unclamped subtraction then yields a negative
+// target — which `estimate <= target` can never satisfy, so relief runs every
+// rung of the ladder and folds the whole of L1 after one provider refusal.
+func TestPressureMarks_PenaltyNeverGoesNegative(t *testing.T) {
+	p := ProfileDefaults[loomv1.WorkloadProfile_WORKLOAD_PROFILE_BALANCED]
+	p.WarningThresholdPercent = 10
+	p.CriticalThresholdPercent = 30
+	require.NoError(t, p.Validate(), "the profile the marks must survive is a VALID one")
+
+	sm := NewSegmentedMemoryWithCompression("ROM", 200000, 20000, p)
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	assert.Positive(t, sm.releaseMarkLocked(pressureRecoveryPenalty),
+		"the recovery release mark must stay positive, or the shed loop can never exit")
+	assert.Positive(t, sm.startMarkLocked(pressureRecoveryPenalty),
+		"the recovery start mark must stay positive")
+	assert.LessOrEqual(t, sm.releaseMarkLocked(pressureRecoveryPenalty), sm.startMarkLocked(pressureRecoveryPenalty),
+		"the band must not invert under the penalty")
+}
