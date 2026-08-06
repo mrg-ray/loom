@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -195,13 +196,13 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 	}
 
 	// Call API
-	resp, err := c.callAPI(ctx, req)
+	resp, hdr, err := c.callAPI(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("API call failed: %w", err)
 	}
 
-	// Convert response
-	return c.convertResponse(resp), nil
+	// Convert response. The gateway's own cost (cache-aware) wins when present.
+	return c.convertResponse(resp, parseProviderCost(hdr)), nil
 }
 
 // convertMessages converts agent messages to OpenAI format.
@@ -458,7 +459,7 @@ func (c *Client) convertSchemaProperties(props map[string]*shuttle.JSONSchema) m
 }
 
 // convertResponse converts OpenAI response to agent format.
-func (c *Client) convertResponse(resp *ChatCompletionResponse) *llmtypes.LLMResponse {
+func (c *Client) convertResponse(resp *ChatCompletionResponse, providerCostUSD float64) *llmtypes.LLMResponse {
 	llmResp := &llmtypes.LLMResponse{
 		Usage: llmtypes.Usage{
 			InputTokens:              resp.Usage.PromptTokens,
@@ -466,7 +467,10 @@ func (c *Client) convertResponse(resp *ChatCompletionResponse) *llmtypes.LLMResp
 			TotalTokens:              resp.Usage.TotalTokens,
 			CacheReadInputTokens:     resp.Usage.CacheRead(),
 			CacheCreationInputTokens: resp.Usage.CacheCreationInputTokens,
-			CostUSD:                  c.calculateCost(resp.Usage.PromptTokens, resp.Usage.CompletionTokens),
+			CostUSD: costOrEstimate(providerCostUSD, func() float64 {
+				return c.calculateCost(resp.Usage.PromptTokens, resp.Usage.CompletionTokens,
+					resp.Usage.CacheRead(), resp.Usage.CacheCreationInputTokens)
+			}),
 		},
 		Metadata: map[string]interface{}{
 			"model":         resp.Model,
@@ -527,9 +531,48 @@ func (c *Client) convertResponse(resp *ChatCompletionResponse) *llmtypes.LLMResp
 	return llmResp
 }
 
+// providerCostHeader is litellm's own computed cost for the call. It is
+// cache-aware and authoritative — preferred over any local estimate.
+const providerCostHeader = "x-litellm-response-cost"
+
+// parseProviderCost reads the gateway's reported cost, if it sent one.
+// Returns 0 when absent or unparseable, meaning "fall back to the estimate".
+func parseProviderCost(h http.Header) float64 {
+	if h == nil {
+		return 0
+	}
+	v := strings.TrimSpace(h.Get(providerCostHeader))
+	if v == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return 0
+	}
+	return f
+}
+
+// costOrEstimate prefers the provider's reported cost; estimate() is used only
+// when the provider did not report one.
+func costOrEstimate(providerCostUSD float64, estimate func() float64) float64 {
+	if providerCostUSD > 0 {
+		return providerCostUSD
+	}
+	return estimate()
+}
+
 // calculateCost estimates the cost in USD based on token usage.
-// Pricing as of 2024-11 for various OpenAI models.
-func (c *Client) calculateCost(inputTokens, outputTokens int) float64 {
+//
+// Cache tiers matter: a cache write bills at 1.25x the input rate and a cache
+// read at 0.10x, so a cache-blind total over-charges a cache-heavy workload by
+// several fold. NOTE the OpenAI-compatible semantics: prompt_tokens INCLUDES
+// cached tokens (unlike Anthropic native, where input_tokens excludes them),
+// so the uncached remainder must be derived by subtraction.
+//
+// This is the FALLBACK. When the gateway reports its own cost (litellm's
+// x-litellm-response-cost header) that figure is authoritative and is used
+// instead — see providerCostUSD.
+func (c *Client) calculateCost(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int) float64 {
 	// The catalog (pkg/llm/catalog) is the source of truth for pricing. Fall back
 	// to the provider-local rates below only for model ids it does not list.
 	inputCostPerM, outputCostPerM, ok := catalog.LookupPricing("openai", c.model)
@@ -587,9 +630,15 @@ func (c *Client) calculateCost(inputTokens, outputTokens int) float64 {
 		}
 	}
 
-	inputCost := float64(inputTokens) * inputCostPerM / 1_000_000
+	uncached := inputTokens - cacheReadTokens - cacheCreationTokens
+	if uncached < 0 {
+		uncached = 0
+	}
+	inputCost := float64(uncached) * inputCostPerM / 1_000_000
+	cacheWriteCost := float64(cacheCreationTokens) * inputCostPerM * 1.25 / 1_000_000
+	cacheReadCost := float64(cacheReadTokens) * inputCostPerM * 0.10 / 1_000_000
 	outputCost := float64(outputTokens) * outputCostPerM / 1_000_000
-	return inputCost + outputCost
+	return inputCost + cacheWriteCost + cacheReadCost + outputCost
 }
 
 // usesMaxCompletionTokens returns true when the model requires max_completion_tokens
@@ -813,7 +862,10 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		usage.OutputTokens = tokenCount
 		usage.TotalTokens = tokenCount // Input tokens not available in stream
 	}
-	usage.CostUSD = c.calculateCost(usage.InputTokens, usage.OutputTokens)
+	usage.CostUSD = costOrEstimate(parseProviderCost(httpResp.Header), func() float64 {
+		return c.calculateCost(usage.InputTokens, usage.OutputTokens,
+			usage.CacheReadInputTokens, usage.CacheCreationInputTokens)
+	})
 	zap.L().Info("prompt cache usage (stream)",
 		zap.Int("input_tokens", usage.InputTokens),
 		zap.Int("cache_read", usage.CacheReadInputTokens),
@@ -854,17 +906,17 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 }
 
 // callAPI makes the HTTP request to OpenAI's API.
-func (c *Client) callAPI(ctx context.Context, req *ChatCompletionRequest) (*ChatCompletionResponse, error) {
+func (c *Client) callAPI(ctx context.Context, req *ChatCompletionRequest) (*ChatCompletionResponse, http.Header, error) {
 	// Marshal request
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	// Create HTTP request
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	// Set headers
@@ -881,14 +933,14 @@ func (c *Client) callAPI(ctx context.Context, req *ChatCompletionRequest) (*Chat
 			return c.httpClient.Do(httpReq)
 		})
 		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
+			return nil, nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
 		httpResp = result.(*http.Response)
 	} else {
 		var err error
 		httpResp, err = c.httpClient.Do(httpReq)
 		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
+			return nil, nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
 	}
 	defer func() { _ = httpResp.Body.Close() }()
@@ -896,32 +948,32 @@ func (c *Client) callAPI(ctx context.Context, req *ChatCompletionRequest) (*Chat
 	// Read response
 	respBody, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	// Parse response
 	var resp ChatCompletionResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+		return nil, nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
 	// Positive identification of the provider's context-too-long refusal
 	// (HLD §5.2 step 12) — the only relief trigger.
 	if llm.IsOpenAIContextTooLong(httpResp.StatusCode, respBody) {
-		return nil, fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong)
+		return nil, nil, fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong)
 	}
 
 	// Check for API errors
 	if resp.Error != nil {
-		return nil, fmt.Errorf("OpenAI API error: %s (type: %s)", resp.Error.Message, resp.Error.Type)
+		return nil, nil, fmt.Errorf("OpenAI API error: %s (type: %s)", resp.Error.Message, resp.Error.Type)
 	}
 
 	// Check status code
 	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
+		return nil, nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
 	}
 
-	return &resp, nil
+	return &resp, httpResp.Header, nil
 }
 
 // Ensure Client implements LLMProvider interface.
