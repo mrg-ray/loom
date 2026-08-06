@@ -1172,7 +1172,22 @@ func (a *Agent) getSystemPrompt(ctx context.Context) string {
 	// session creation, so it stays byte-stable for the whole session.
 	basePrompt += a.skillMenuPromptSupplement()
 
+	// Append the team block for a woven workflow participant. Empty for every
+	// other agent — nothing outside weave attaches a workflow context.
+	basePrompt += a.workflowCommPromptSupplement()
+
 	return basePrompt
+}
+
+// workflowCommPromptSupplement renders the team block for an agent that weave
+// attached a workflow communication context to: the peers it can reach and the
+// mechanics of reaching them. Empty for every other agent — a standalone agent,
+// a cloud workflow step and a plain spawned sub-agent all render nothing,
+// because none of their paths attaches a context. Session-stable: the peer list
+// is fixed for the life of the workflow, so this does not disturb the ROM slot's
+// byte-stability.
+func (a *Agent) workflowCommPromptSupplement() string {
+	return formatWorkflowCommunicationInstructions(a.workflowCommContext)
 }
 
 // skillMenuPromptSupplement renders the agent's bound skills as a
@@ -1508,9 +1523,17 @@ func (a *Agent) SetWorkflowCommunicationContext(ctx *WorkflowCommunicationContex
 	a.workflowCommContext = ctx
 }
 
-// formatWorkflowCommunicationInstructions generates concise, directive communication instructions
-// based on the agent's workflow context. These instructions are injected at the top of the system
-// prompt (after timestamp) to ensure LLMs see and follow them.
+// formatWorkflowCommunicationInstructions renders an agent's team block: the
+// peers it can reach and the mechanics of reaching them. It is appended to the
+// end of ROM at session creation (see workflowCommPromptSupplement) — weave
+// attaches the context before the session exists, and the peer list is fixed
+// for the life of the workflow, so the rendered block is byte-stable for the
+// session.
+//
+// The reply rule is load-bearing: an agent's turn text is not delivered
+// anywhere, so a received message travels back only when the agent calls
+// send_message. Without that line a worker answers into nothing and the
+// workflow stalls after its first delegation.
 func formatWorkflowCommunicationInstructions(ctx *WorkflowCommunicationContext) string {
 	if ctx == nil {
 		return ""
@@ -1523,7 +1546,7 @@ func formatWorkflowCommunicationInstructions(ctx *WorkflowCommunicationContext) 
 		instructions.WriteString("🔔 WORKFLOW COMMUNICATION (PUB-SUB)\n")
 		instructions.WriteString(fmt.Sprintf("Subscribed topics: %s\n", strings.Join(ctx.SubscribedTopics, ", ")))
 		instructions.WriteString("→ To post: publish(topic=\"topic-name\", message=\"your message\")\n")
-		instructions.WriteString("→ Responses auto-inject as \"[BROADCAST FROM agent]: ...\"\n")
+		instructions.WriteString("→ Incoming posts are marked \"[BROADCAST FROM agent]:\"\n")
 		instructions.WriteString("→ Do NOT poll - you will be notified automatically\n\n")
 	}
 
@@ -1532,15 +1555,16 @@ func formatWorkflowCommunicationInstructions(ctx *WorkflowCommunicationContext) 
 		instructions.WriteString("🔔 WORKFLOW COMMUNICATION (DIRECT MESSAGING)\n")
 		instructions.WriteString(fmt.Sprintf("Available agents: %s\n", strings.Join(ctx.AvailableAgents, ", ")))
 		instructions.WriteString("→ To send: send_message(to_agent=\"agent-id\", message=\"task description\")\n")
-		instructions.WriteString("→ Responses auto-inject as \"[MESSAGE FROM agent]: ...\"\n")
-		instructions.WriteString("→ Do NOT poll - you will be notified automatically\n\n")
+		instructions.WriteString("→ Incoming messages are marked \"[MESSAGE FROM agent]:\"\n")
+		instructions.WriteString("→ When a message arrives, send your answer back to its sender with send_message — your reply text alone is not delivered\n")
+		instructions.WriteString("→ Do NOT poll - you will be notified automatically\n")
 	}
 
-	if instructions.Len() > 0 {
-		instructions.WriteString("---\n\n")
+	if instructions.Len() == 0 {
+		return ""
 	}
 
-	return instructions.String()
+	return "\n\n---\n\n" + strings.TrimRight(instructions.String(), "\n")
 }
 
 // getGuidanceMessage loads a guidance message from PromptRegistry or returns default.
