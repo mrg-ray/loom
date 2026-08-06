@@ -246,6 +246,28 @@ func (s *MultiAgentServer) SpawnSubAgent(ctx context.Context, req *builtin.Spawn
 			zap.String("sub_agent_id", subAgentID),
 			zap.Int("output_len", len(output)),
 			zap.Int64("duration_ms", durationMs))
+
+		// A sub-agent that answered and subscribes to nothing is finished: its
+		// answer is already this call's result, and there is no command to give
+		// it another task. Tear it down here rather than leaving it to the idle
+		// reaper — it would otherwise hold one of the parent's spawn slots for
+		// fifteen minutes, so a parent delegating repeatedly would hit the
+		// spawn limit for children that had all already answered. Nothing has
+		// been started yet, so this is the whole teardown.
+		if len(subscriptionIDs) == 0 {
+			s.cleanupSpawnedAgent(sessionID, "task completed")
+			logger.Info("One-shot sub-agent despawned after answering",
+				zap.String("sub_agent_id", subAgentID))
+			return &builtin.SpawnSubAgentResponse{
+				SubAgentID: subAgentID,
+				SessionID:  sessionID,
+				Status:     status,
+				Output:     output,
+				TokensUsed: tokensUsed,
+				CostUSD:    costUSD,
+				DurationMs: durationMs,
+			}, nil
+		}
 	}
 
 	// Start background monitoring for sub-agent lifecycle

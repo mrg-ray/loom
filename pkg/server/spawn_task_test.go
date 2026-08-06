@@ -265,3 +265,74 @@ func TestSpawn_ParentReadsAnswerAsToolResult(t *testing.T) {
 	assert.Contains(t, joined, "completed",
 		"the result reports the task ran, not merely that an agent was created")
 }
+
+// TestSpawn_OneShotChildIsDespawnedAfterAnswering proves the lifecycle: a child
+// that answered and subscribes to nothing is finished — its answer is already
+// the call's result and no command can give it another task — so it is torn
+// down at once. Left alive it would hold one of the parent's ten spawn slots
+// until the idle reaper ran, and a parent delegating repeatedly would hit the
+// spawn limit for children that had all already answered.
+func TestSpawn_OneShotChildIsDespawnedAfterAnswering(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	registry, err := agent.NewRegistry(agent.RegistryConfig{
+		ConfigDir:   t.TempDir(),
+		DBPath:      ":memory:",
+		Logger:      logger,
+		LLMProvider: answeringLLM{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = registry.Close() })
+	registry.RegisterConfig(&loomv1.AgentConfig{Name: "helper", Description: "spawnable helper"})
+
+	srv := setupBroadcastTestServer(t, map[string]*agent.Agent{}, registry)
+	parent := parentSession(t, srv)
+
+	// Delegate more times than the spawn limit allows if nothing is reclaimed.
+	for i := 0; i < 12; i++ {
+		resp, spawnErr := srv.SpawnSubAgent(context.Background(), &builtin.SpawnSubAgentRequest{
+			ParentSessionID: parent,
+			ParentAgentID:   "parent",
+			AgentID:         "helper",
+			InitialMessage:  "task",
+		})
+		require.NoError(t, spawnErr, "delegation %d must not hit the spawn limit", i+1)
+		require.Equal(t, "completed", resp.Status)
+		require.NotEmpty(t, resp.Output, "the answer still comes back")
+	}
+
+	assert.Zero(t, srv.countSpawnedAgentsByParent(parent),
+		"a one-shot child holds no slot once it has answered")
+}
+
+// TestSpawn_SubscribedChildSurvives proves the exception: a child that
+// auto-subscribed is a live topic participant with a real lifetime, so it stays
+// up after answering and remains the parent's to despawn.
+func TestSpawn_SubscribedChildSurvives(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	registry, err := agent.NewRegistry(agent.RegistryConfig{
+		ConfigDir:   t.TempDir(),
+		DBPath:      ":memory:",
+		Logger:      logger,
+		LLMProvider: answeringLLM{},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = registry.Close() })
+	registry.RegisterConfig(&loomv1.AgentConfig{Name: "helper", Description: "spawnable helper"})
+
+	srv := setupBroadcastTestServer(t, map[string]*agent.Agent{}, registry)
+	parent := parentSession(t, srv)
+
+	resp, err := srv.SpawnSubAgent(context.Background(), &builtin.SpawnSubAgentRequest{
+		ParentSessionID: parent,
+		ParentAgentID:   "parent",
+		AgentID:         "helper",
+		InitialMessage:  "task",
+		AutoSubscribe:   []string{"audit-events"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "completed", resp.Status)
+	require.NotEmpty(t, resp.SubscribedTopics)
+
+	assert.Equal(t, 1, srv.countSpawnedAgentsByParent(parent),
+		"a subscribed child stays up as a topic participant")
+}
