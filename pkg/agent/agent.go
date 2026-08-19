@@ -146,6 +146,17 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		a.executor.SetPermissionChecker(a.permissionChecker)
 	}
 
+	// Attach the admission hook chain if provided. A nil chain leaves the
+	// executor as a pure pass-through.
+	if a.admissionChain != nil {
+		a.executor.SetAdmissionChain(a.admissionChain)
+	}
+
+	// Wire the caller-identity resolver so admission requests carry UserID.
+	if a.identityResolver != nil {
+		a.executor.SetIdentityResolver(a.identityResolver)
+	}
+
 	// Set up system prompt function for memory
 	// This allows dynamic prompt loading from PromptRegistry
 	// Context is threaded through for proper RLS user_id propagation in PostgreSQL.
@@ -216,6 +227,11 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 			threshold = a.sharedMemoryThreshold
 		}
 		a.executor.SetSharedMemory(a.sharedMemory, threshold)
+
+		// The approved-set accessor is a dedicated session-keyed membership
+		// store (not the shared-memory cache): authorization state must not be
+		// evictable and renders union rather than replace.
+		a.executor.SetApprovedSet(shuttle.NewApprovedSet())
 	}
 
 	// The findings channel is retired: neither the record_finding tool nor automatic
@@ -489,6 +505,25 @@ func WithCompressionProfile(profile *CompressionProfile) Option {
 func WithPermissionChecker(checker *shuttle.PermissionChecker) Option {
 	return func(a *Agent) {
 		a.permissionChecker = checker
+	}
+}
+
+// WithAdmissionHooks sets the admission hook chain consulted before every tool
+// body runs. The chain carries the name-level permission check as its first
+// hook; a nil chain leaves tool execution as a pure pass-through.
+func WithAdmissionHooks(chain *shuttle.Chain) Option {
+	return func(a *Agent) {
+		a.admissionChain = chain
+	}
+}
+
+// WithIdentityResolver sets the resolver that reads the caller identity
+// (AdmissionRequest.UserID) from the call context. The value lookup is injected
+// by the composition root because pkg/agent cannot import the storage layer
+// that owns the user-id context key without an import cycle.
+func WithIdentityResolver(resolver func(context.Context) string) Option {
+	return func(a *Agent) {
+		a.identityResolver = resolver
 	}
 }
 
@@ -1178,6 +1213,15 @@ func (a *Agent) getSystemPrompt(ctx context.Context) string {
 		basePrompt = `Use available tools to help the user accomplish their goals. Never fabricate data - only report what tools actually return.`
 	}
 
+	// Temporal grounding does NOT live here. A wall-clock anchor baked into the
+	// ROM slot would freeze the model's "now" at session creation (warm sessions
+	// span days; a DB-restored session would re-anchor to a different instant),
+	// and — because ROM has its own cross-session cache breakpoint — a
+	// per-session timestamp would defeat prompt-cache reuse across an agent's
+	// sessions. Instead, each user turn carries its arrival time, rendered into
+	// the compiled view only (see renderLocked): the newest user turn always
+	// supplies current time, and inter-turn gaps stay visible.
+
 	// Inject task context (current tasks, ready front, board stats).
 	// Rendered once into ROM at session creation — the ROM slot is
 	// byte-stable for the session, so this is a snapshot, not a live view.
@@ -1806,13 +1850,16 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	// This is the Chat()-entry persist site — the only turn-incrementing event
 	// (HLD §4.5) — hence turnStart=true.
 	//
-	// Time enters the session here, written into the turn at arrival: temporal
-	// words ("today", "this month") resolve at utterance time, and a value
-	// written once is durable content like any other row — the whole session
-	// stays byte-stable. Nothing renders time dynamically anywhere.
+	// Content is the canonical, user-visible message body: it is persisted and
+	// returned verbatim to clients.
+	// Do NOT prepend a timestamp here — that leaks a "[Mon 2006-01-02 15:04 MST]"
+	// prefix into every displayed user message. Arrival time is captured durably
+	// in the Timestamp field; per-turn temporal grounding ("today", "this month")
+	// is restored by rendering that Timestamp into the compiled view only
+	// (renderLocked), never into the stored body.
 	userMsg := a.appendMessage(ctx, session, Message{
 		Role:          "user",
-		Content:       time.Now().Format("[Mon 2006-01-02 15:04 MST] ") + userMessage,
+		Content:       userMessage,
 		ContentBlocks: p.contentBlocks,
 		AgentID:       a.id, // Track which agent received this message
 		Timestamp:     time.Now(),
@@ -1964,6 +2011,13 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 // arrival. turnStart is true only at the Chat() entry — the only
 // turn-incrementing event (HLD §4.5). Persist failures are logged, never fatal.
 func (a *Agent) appendMessage(ctx context.Context, session *Session, msg Message, turnStart bool) Message {
+	// A replay/import override (WeaveRequest.occurred_at → WithOccurredAt)
+	// anchors every row persisted during the call at the conversation's
+	// historical time; without one, the caller-stamped wall clock stands.
+	if at, ok := occurredAtFromContext(ctx); ok {
+		msg.Timestamp = at
+	}
+
 	// In-memory derivation, identical arithmetic to the store's subquery — the
 	// only derivation for storeless sessions and unpersisted rows.
 	t := sessionCurrentTurn(session)
@@ -2008,6 +2062,25 @@ type ToolExecution struct {
 	Input    map[string]interface{}
 	Result   *shuttle.Result
 	Error    error
+
+	// AdmissionDecision is the audit verdict ("allow"|"deny"|"ask") for a call
+	// matched by an audit binding, stamped by the executor onto
+	// Result.Metadata["admission.decision"]. Empty means the call was not
+	// audited; empty rows are not counted as audit records (SC-004).
+	AdmissionDecision string
+}
+
+// admissionDecisionOf reads the audit verdict the executor stamps onto a
+// governed call's Result.Metadata["admission.decision"]. An ungoverned or
+// unaudited call carries no such key, yielding "".
+func admissionDecisionOf(result *shuttle.Result) string {
+	if result == nil || result.Metadata == nil {
+		return ""
+	}
+	if v, ok := result.Metadata["admission.decision"].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // emitProgress sends a progress event if a callback is configured.
@@ -2711,10 +2784,11 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 
 			// Record execution
 			execution := ToolExecution{
-				ToolName: toolCall.Name,
-				Input:    toolCall.Input,
-				Result:   result,
-				Error:    err,
+				ToolName:          toolCall.Name,
+				Input:             toolCall.Input,
+				Result:            result,
+				Error:             err,
+				AdmissionDecision: admissionDecisionOf(result),
 			}
 			allToolExecutions = append(allToolExecutions, execution)
 
@@ -3398,6 +3472,12 @@ func (a *Agent) ListSessions() []*Session {
 // DeleteSession removes a session.
 func (a *Agent) DeleteSession(sessionID string) {
 	a.memory.DeleteSession(sessionID)
+	// Drop the session's recorded approvals alongside its other per-session
+	// state: the approved set is bounded by live sessions only because every
+	// retirement path frees its buckets.
+	if as := a.executor.ApprovedSet(); as != nil {
+		as.ForgetSession(sessionID)
+	}
 	// Drop the session's advertised-tool ledger too, or it grows unbounded on a
 	// long-running multi-session server. scopedToolNames is process-global (a
 	// name is scoped once any session scopes it) and is intentionally not pruned.
@@ -3409,9 +3489,34 @@ func (a *Agent) DeleteSession(sessionID string) {
 	a.dropInTurnSQLite(sessionID)
 }
 
+// ApprovedSet returns the executor's approved-set accessor; nil until one is
+// wired.
+func (a *Agent) ApprovedSet() shuttle.ApprovedSetAccessor {
+	return a.executor.ApprovedSet()
+}
+
+// AdoptApprovedSet hands this agent an existing approved-set accessor. The
+// hot-reload path carries the outgoing agent's set onto its replacement so
+// live sessions' recorded approvals survive the swap — an agent rebuild is an
+// operator action on the agent, not on its sessions, and must not falsify an
+// approval a human already gave. A nil accessor is ignored.
+func (a *Agent) AdoptApprovedSet(s shuttle.ApprovedSetAccessor) {
+	if s != nil {
+		a.executor.SetApprovedSet(s)
+	}
+}
+
 // ClearAllSessions removes all sessions from memory.
 // Used by the benchmark server to free memory between scenarios.
 func (a *Agent) ClearAllSessions() {
+	// Every retirement path frees the sessions' approved-set buckets — the
+	// set's growth is bounded by live sessions only if this sibling of
+	// DeleteSession retires them too.
+	if as := a.executor.ApprovedSet(); as != nil {
+		for _, s := range a.memory.ListSessions() {
+			as.ForgetSession(s.ID)
+		}
+	}
 	a.memory.ClearAll()
 	a.mu.Lock()
 	a.sessionToolLedger = make(map[string]map[string]bool)
@@ -3667,6 +3772,15 @@ func (a *Agent) SetSharedMemory(sharedMemory *storage.SharedMemoryStore) {
 			threshold = a.sharedMemoryThreshold
 		}
 		a.executor.SetSharedMemory(sharedMemory, threshold)
+
+		// The approved-set accessor is a dedicated session-keyed membership
+		// store (not the shared-memory cache): authorization state must not be
+		// evictable and renders union rather than replace. Create it only when
+		// absent — replacing an existing set would silently discard live
+		// sessions' recorded approvals.
+		if a.executor.ApprovedSet() == nil {
+			a.executor.SetApprovedSet(shuttle.NewApprovedSet())
+		}
 	}
 
 	// Inject into memory manager (which handles all sessions)
