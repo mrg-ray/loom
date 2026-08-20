@@ -390,7 +390,7 @@ func DefaultConfig() *Config {
 		BackendConfig:     make(map[string]interface{}),
 		Retry: RetryConfig{
 			Enabled:      true,
-			MaxRetries:   3,
+			MaxRetries:   5,
 			InitialDelay: 100 * time.Millisecond,
 			MaxDelay:     5 * time.Second,
 			Multiplier:   2.0,

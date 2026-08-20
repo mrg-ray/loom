@@ -39,23 +39,31 @@ func (a *Agent) chatWithRetry(ctx Context, messages []Message, tools []shuttle.T
 	progressCallback := ctx.ProgressCallback()
 	useStreaming := supportsStreaming && progressCallback != nil
 
-	// If using streaming, bypass retry logic (streaming already handles errors)
-	if useStreaming {
-		return a.chatWithStreaming(ctx, messages, tools, progressCallback)
+	// Unified call: streaming or plain. Both flow through the retry loop below.
+	// Previously the streaming path bypassed retry entirely ("streaming already
+	// handles errors" — it does not; chatWithStreaming returns the error raw), so a
+	// transient provider failure (e.g. internalServerException or a mid-stream
+	// disconnect) killed the whole conversation. A failed ChatStream returns
+	// (nil, err) without mutating messages, so re-issuing the turn is safe; only
+	// progress events repeat, which is cosmetic.
+	call := func() (*LLMResponse, error) {
+		if useStreaming {
+			return a.chatWithStreaming(ctx, messages, tools, progressCallback)
+		}
+		return a.llm.Chat(ctx, messages, tools)
 	}
 
-	// Non-streaming path with retry logic
-	// If retry is disabled, call LLM directly
+	// If retry is disabled, call directly.
 	if !a.config.Retry.Enabled || a.config.Retry.MaxRetries == 0 {
-		return a.llm.Chat(ctx, messages, tools)
+		return call()
 	}
 
 	var lastErr error
 	delay := a.config.Retry.InitialDelay
 
 	for attempt := 0; attempt <= a.config.Retry.MaxRetries; attempt++ {
-		// Attempt LLM call
-		response, err := a.llm.Chat(ctx, messages, tools)
+		// Attempt LLM call (streaming or plain, via the unified closure)
+		response, err := call()
 		if err == nil {
 			// Success! Log if we had previous failures
 			if attempt > 0 {
