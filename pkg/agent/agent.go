@@ -2489,6 +2489,8 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 	var allToolExecutions []ToolExecution
 	var turnUsage Usage                         // sum of every successful LLM call this turn → Response.TurnUsage
 	emptyRetried := false                       // one-shot flag: retry empty LLM response at most once per conversation
+	foldPending := false                        // in-loop fold: this call carries the fold instruction; its reply is the summary
+	foldRetries := 0                            // malformed fold replies re-asked at most once; then the pressure path is the failsafe
 	hygieneRetries := 0                         // capped count of REQUIRE_FIX retries the end-of-turn auditor has triggered
 	var hygieneLast *hygiene.EnforcementOutcome // last outcome, surfaced into Response.Metadata
 
@@ -2611,7 +2613,18 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// loom's own estimate (§5.1) — a no-op under the start mark, otherwise it
 		// sheds to the release mark. On a shed, recompile messages and the
 		// advertised tool set so a fold-deactivated skill's tools do not linger.
-		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+		// In-loop fold first: past the start mark, the next call carries the
+		// fold instruction and its reply is consumed as the summary — the
+		// agent summarises itself on its own warm cache. The pressure path
+		// below stays as the failsafe, entered only after the in-loop fold
+		// has failed its retries.
+		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil && !foldPending && foldRetries < 2 && segMem.NeedsFold() {
+			foldPending = true
+			zap.L().Info("inloopFold: armed",
+				zap.String("session_id", session.ID),
+				zap.Int("attempt", foldRetries+1))
+		}
+		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil && !foldPending {
 			if shed, estimate, target := segMem.ReleasePressure(ctx, 0); shed {
 				zap.L().Info("relief: shed before send",
 					zap.String("session_id", session.ID),
@@ -2650,7 +2663,11 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// context-too-long still comes back (loom's estimate under-counted), shed
 		// and resend once; a second refusal ends the turn with the recoverable
 		// context_exhausted error.
-		llmResp, err := a.chatWithRetry(ctx, withReminder(messages), tools)
+		sendMsgs := withReminder(messages)
+		if foldPending {
+			sendMsgs = append(sendMsgs, Message{Role: "user", Content: foldInstruction})
+		}
+		llmResp, err := a.chatWithRetry(ctx, sendMsgs, tools)
 		if err != nil && errors.Is(err, llm.ErrContextTooLong) {
 			if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
 				_, estimate, target := segMem.ReleasePressure(ctx, pressureRecoveryPenalty)
@@ -2840,6 +2857,41 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 					"stop_reason": llmResp.StopReason,
 				})
 			}
+		}
+
+		// In-loop fold reply: consumed by the harness — parsed, applied,
+		// never appended, never streamed onward, never returned. The loop
+		// continues on the collapsed context. A model that answered with
+		// tool calls instead ignored the instruction: execute them normally
+		// and re-arm at the next seam. A malformed reply is re-asked once;
+		// after that the pressure path is the failsafe.
+		if foldPending {
+			foldPending = false
+			if len(llmResp.ToolCalls) == 0 {
+				if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+					if summary, okParse := parseFoldReply(llmResp.Content); okParse {
+						if applied, estimate := segMem.ApplyFoldReply(ctx, summary); applied {
+							foldRetries = 0
+							zap.L().Info("inloopFold: applied",
+								zap.String("session_id", session.ID),
+								zap.Int("estimate_tokens", estimate))
+							messages = session.GetMessages()
+							tools = a.advertisedTools(session)
+							tools = recovery.activeTools(tools)
+							segMem.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
+							continue
+						}
+					}
+					foldRetries++
+					zap.L().Warn("inloopFold: reply unusable — will retry or fall back to pressure relief",
+						zap.String("session_id", session.ID),
+						zap.Int("fold_retries", foldRetries))
+					continue
+				}
+			}
+			// Tool calls came back: the model kept working. Fall through and
+			// execute them; the fold re-arms at the next seam.
+			foldRetries = 0
 		}
 
 		// If LLM returned text (no tool calls), we're done — unless the response
