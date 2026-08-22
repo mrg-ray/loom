@@ -74,10 +74,20 @@ func (sm *SegmentedMemory) compileLocked() []Message {
 		out = append(out, Message{Role: "system", Content: sm.romContent, CacheBreakpoint: true})
 	}
 
-	// Step 3: the summary's newest version, one system message. Its own cache
-	// breakpoint — stable until the next fold rewrites it.
+	// Step 3: the summary's newest version — CONVERSATION content, not system.
+	// The summary is the folded past, the model's own testimony; it renders as
+	// a user-role reminder at the head of the conversation region (loom's
+	// established harness-message pattern). Deliberately NO cache breakpoint
+	// and no system role: a summary block in the system region consumed a
+	// marker slot, and the client cap (4 minus the tool list) then dropped
+	// till-NOW — the only marker that caches the session tail in a one-turn
+	// (one-shot CLI) session, so every post-fold call re-billed its whole
+	// tail as raw input. As a conversation message it is covered by the
+	// lastStable/till-NOW markers like any other row, and a fold invalidates
+	// from HERE down — ROM and the tool schemas stay cached across folds.
 	if sm.summary.text != "" {
-		out = append(out, Message{Role: "system", Content: sm.summary.text, CacheBreakpoint: true})
+		out = append(out, Message{Role: "user",
+			Content: "<system-reminder>\nSession summary — the work so far:\n\n" + sm.summary.text + "\n</system-reminder>"})
 	}
 
 	// Step 5: T — the session's current turn number.

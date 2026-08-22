@@ -444,15 +444,22 @@ func TestCompile_SyntheticFailedResultForMissingPair(t *testing.T) {
 	assert.Equal(t, syntheticFailedResult, got.Content)
 }
 
-func TestCompile_SummaryEmittedAsSystemMessage(t *testing.T) {
+func TestCompile_SummaryEmittedAsConversationReminder(t *testing.T) {
+	// The summary is the folded PAST — conversation content, not system. It
+	// renders as a user-role reminder with no cache breakpoint of its own, so
+	// it never consumes a marker slot (a system summary block displaced the
+	// till-NOW marker and uncached the session tail after every fold).
 	sm := newCompileMemory(t)
 	sm.setSummary(2, "covers msg:1-9\nstate of work")
 	out := sm.GetMessagesForLLM()
 	require.GreaterOrEqual(t, len(out), 2)
 	assert.Equal(t, "system", out[0].Role)
 	assert.Equal(t, "ROM-CONTENT", out[0].Content)
-	assert.Equal(t, "system", out[1].Role)
-	assert.Equal(t, "covers msg:1-9\nstate of work", out[1].Content)
+	assert.Equal(t, "user", out[1].Role)
+	assert.Contains(t, out[1].Content, "Session summary")
+	assert.Contains(t, out[1].Content, "covers msg:1-9\nstate of work")
+	// The summary carries no DEDICATED marker; the walk may still park the
+	// ordinary lastStable marker on it — that is budget-neutral.
 }
 
 // --- §5.2 releasePressure over a real store ----------------------------------
