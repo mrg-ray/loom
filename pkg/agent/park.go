@@ -82,7 +82,11 @@ type TurnParkedError struct {
 	RequestID string
 	SessionID string
 	ExpiresAt time.Time
+	// Usage is the parking call's own usage (the batch's assistant row carries
+	// it). TurnUsage is the sum of every LLM call the turn made before it
+	// parked — see Response.TurnUsage; a metering embedder reads this one.
 	Usage     Usage
+	TurnUsage Usage
 }
 
 func (e *TurnParkedError) Error() string {
@@ -621,7 +625,7 @@ type parkItem struct {
 // item, an Ask as an approval item. With no items it returns nil and the
 // serial dispatch loop runs exactly as today. With items it persists ONE
 // grouped request and ends the turn with TurnParkedError.
-func (a *Agent) maybeParkBatch(ctx Context, sess *Session, llmResp *LLMResponse) error {
+func (a *Agent) maybeParkBatch(ctx Context, sess *Session, llmResp *LLMResponse, turnUsage Usage) error {
 	var items []parkItem
 	for i, call := range llmResp.ToolCalls {
 		d := a.executor.Preflight(ctx, call.Name, call.Input)
@@ -709,6 +713,7 @@ func (a *Agent) maybeParkBatch(ctx Context, sess *Session, llmResp *LLMResponse)
 		SessionID: sess.ID,
 		ExpiresAt: hr.ExpiresAt,
 		Usage:     llmResp.Usage,
+		TurnUsage: turnUsage,
 	}
 }
 
