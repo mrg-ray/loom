@@ -78,21 +78,19 @@ prompt:
   instructions: |
     LIVE-PROFILE-BODY-SENTINEL. Profile a table in three steps: row count, column types, null counts.
 `)
+	// No trigger block at all — the shape nearly every shipped skill has. It
+	// must stay model-pullable, or enforcing MANUAL would retire the library.
 	write("live-notes-skill.yaml", `apiVersion: loom/v1
 kind: Skill
 metadata:
   name: live-notes-skill
   title: Note Taking
-  description: Note taking. TRIGGER when the user asks to take, format or summarize notes.
+  description: Note taking. TRIGGER when the user asks to take, format or summarize notes, or to turn something into bullet points.
   domain: general
   risk_level: LOW
-trigger:
-  mode: HYBRID
-  slash_commands:
-    - /live-notes-skill
 prompt:
   instructions: |
-    LIVE-NOTES-BODY-SENTINEL. Write notes as short bullets.
+    LIVE-NOTES-BODY-SENTINEL. Write notes as short bullets, newest first.
 `)
 
 	newRig := func() (*Agent, *skills.Orchestrator) {
@@ -138,6 +136,24 @@ prompt:
 			"a MANUAL skill must not activate without the user's command")
 		assert.NotContains(t, resp.Content, "LIVE-PROFILE-BODY-SENTINEL",
 			"the skill body never reached the model")
+		t.Logf("model replied: %s", strings.TrimSpace(resp.Content))
+	})
+
+	// The other half of the rule, and the one that decides whether this is
+	// shippable: a skill that declares no mode keeps working the way it does
+	// today. Nearly every skill on a deployed site is that shape, so if the
+	// undeclared default withheld them, enforcing MANUAL would empty the
+	// library instead of fixing the bug.
+	t.Run("a skill with no declared mode is still pulled by the model", func(t *testing.T) {
+		ag, orch := newRig()
+		const sessionID = "live-undeclared"
+
+		resp, err := ag.Chat(context.Background(), sessionID,
+			"Please turn this into short bullet notes: we shipped the parser, fixed two bugs, and the deploy is tomorrow.")
+		require.NoError(t, err)
+
+		assert.Contains(t, active(orch, sessionID), "live-notes-skill",
+			"an undeclared mode must leave the skill model-pullable")
 		t.Logf("model replied: %s", strings.TrimSpace(resp.Content))
 	})
 
