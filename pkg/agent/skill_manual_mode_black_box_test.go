@@ -194,6 +194,55 @@ func TestManualMode_ListOmitsManualSkill(t *testing.T) {
 	assert.NotContains(t, rendered, "manual-skill")
 }
 
+// TestManualMode_ListSeesRegisteredSkills asserts the listing reports the
+// session's real library. An embedder that injects skills with Register() — the
+// cloud does, for every database-backed and marketplace skill, and for an
+// admin's draft under test — was invisible to the old index-backed listing, so
+// the model was told it had a different set of skills than it actually ran.
+func TestManualMode_ListSeesRegisteredSkills(t *testing.T) {
+	registered := &skills.Skill{
+		Name:        "registered-skill",
+		Title:       "Registered Skill",
+		Description: "Injected the way an embedder injects database-backed skills.",
+		Domain:      "general",
+		Trigger:     skills.SkillTrigger{Mode: skills.ActivationHybrid},
+	}
+	listSkills := func(t *testing.T, rig *manualModeRig, sessionID string) string {
+		t.Helper()
+		tool := findRegisteredTool(rig.agent, "manage_skills")
+		require.NotNil(t, tool)
+		res, err := tool.Execute(session.WithSessionID(context.Background(), sessionID),
+			map[string]interface{}{"action": "list"})
+		require.NoError(t, err)
+		require.True(t, res.Success)
+		rendered, ok := res.Data.(string)
+		require.True(t, ok)
+		return rendered
+	}
+
+	// The cloud's shape: a session library whose skills all arrive by Register()
+	// from the database. The index-backed listing reported none of them.
+	t.Run("a registered skill is listed", func(t *testing.T) {
+		rig := buildManualModeRig(t, &mockToolCallingLLM{responses: []mockLLMResponse{finalTurn()}}, false)
+		rig.lib.Register(registered)
+
+		assert.Contains(t, listSkills(t, rig, "sess-registered-only"), "registered-skill")
+	})
+
+	// Mixed shape: on-disk skills already indexed, then an injection on top.
+	// Both belong to the session, so both are listed.
+	t.Run("registered and on-disk skills are listed together", func(t *testing.T) {
+		rig := buildManualModeRig(t, &mockToolCallingLLM{responses: []mockLLMResponse{finalTurn()}}, false)
+		require.Contains(t, listSkills(t, rig, "sess-mixed"), "hybrid-skill")
+
+		rig.lib.Register(registered)
+
+		rendered := listSkills(t, rig, "sess-mixed")
+		assert.Contains(t, rendered, "registered-skill")
+		assert.Contains(t, rendered, "hybrid-skill")
+	})
+}
+
 // --- the user's route in -----------------------------------------------------
 
 // TestManualMode_SlashCommandLoadsManualSkill asserts the user's slash command

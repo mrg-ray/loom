@@ -24,22 +24,6 @@ func isManualSkill(s *skills.Skill) bool {
 	return s != nil && s.Trigger.Mode == skills.ActivationManual
 }
 
-// manualSkillNames is the set of MANUAL skill names in lib, for callers that
-// hold summaries (which carry no trigger mode) rather than skills. A nil
-// library yields an empty set, so a caller with no library filters nothing.
-func manualSkillNames(lib *skills.Library) map[string]bool {
-	out := make(map[string]bool)
-	if lib == nil {
-		return out
-	}
-	for _, s := range lib.List() {
-		if isManualSkill(s) {
-			out[s.Name] = true
-		}
-	}
-	return out
-}
-
 // manualSkillRefusal is what the model is told when it tries to load a MANUAL
 // skill. It names the slash command when the skill declares one, because that
 // is the only thing that activates the skill and the model's useful next move

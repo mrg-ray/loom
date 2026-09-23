@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -327,14 +328,20 @@ type skillListResult struct {
 // list returns the library annotated with which skills are active for this
 // session, rendered as JSON.
 //
+// The library answers "what skills exist" from two stores and neither is the
+// whole truth: ListAll indexes the search paths and the embedded FS, while
+// Register — which is how an embedder injects database-backed, marketplace and
+// admin-draft skills, and how the cloud builds every session library — writes
+// to the skill cache that List reads. Listing from the index alone reported
+// none of a cloud session's skills; listing from the cache alone would drop the
+// on-disk ones until something loaded them. This reads both and merges by name.
+//
 // MANUAL skills are omitted: the model cannot load them (see load's gate), so
 // listing them would only advertise a name every load call refuses. The one
 // exception is a MANUAL skill the user already activated by slash command —
 // it is part of this session's state, so the model's picture of what is active
 // stays complete.
 func (t *ManageSkillsTool) list(sessionID string) (*shuttle.Result, error) {
-	summaries := t.library.ListAll()
-
 	activeSet := make(map[string]bool)
 	for _, as := range t.orch.GetActiveSkills(sessionID) {
 		if as != nil && as.Skill != nil {
@@ -342,20 +349,42 @@ func (t *ManageSkillsTool) list(sessionID string) (*shuttle.Result, error) {
 		}
 	}
 
-	manual := manualSkillNames(t.library)
-
-	entries := make([]skillListEntry, 0, len(summaries))
+	entries := make([]skillListEntry, 0)
 	activeCount := 0
-	for _, s := range summaries {
+	seen := make(map[string]bool)
+	add := func(s *skills.Skill) {
+		if s == nil || s.Name == "" || seen[s.Name] {
+			return
+		}
+		seen[s.Name] = true
 		isActive := activeSet[s.Name]
-		if manual[s.Name] && !isActive {
-			continue
+		if isManualSkill(s) && !isActive {
+			return
 		}
 		if isActive {
 			activeCount++
 		}
-		entries = append(entries, skillListEntry{SkillSummary: s, Active: isActive})
+		entries = append(entries, skillListEntry{SkillSummary: s.Summary(), Active: isActive})
 	}
+
+	for _, s := range t.library.List() {
+		add(s)
+	}
+	// Load resolves an indexed skill from its source and caches it, so the
+	// trigger mode this filter needs is available for index-only entries too.
+	for _, summary := range t.library.ListAll() {
+		if seen[summary.Name] {
+			continue
+		}
+		if s, err := t.library.Load(summary.Name); err == nil {
+			add(s)
+		}
+	}
+
+	// List walks a map, so its order varies per call. The rendered list is part
+	// of the model's context: an unstable order would churn the prompt cache and
+	// make two identical sessions read differently.
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 
 	composite := skillListResult{
 		SessionID:   sessionID,
