@@ -127,7 +127,7 @@ func (t *ManageSkillsTool) Execute(ctx context.Context, params map[string]interf
 	switch action {
 	case "load":
 		name, _ := params["name"].(string)
-		return t.load(ctx, sessionID, name)
+		return t.load(ctx, sessionID, name, loadByModel)
 	case "list":
 		return t.list(sessionID)
 	default:
@@ -141,11 +141,30 @@ func (t *ManageSkillsTool) Execute(ctx context.Context, params map[string]interf
 	}
 }
 
+// loadOrigin distinguishes who asked for a load. The two differ on one rule:
+// a MANUAL skill is the user's to invoke, so the model may not load it while
+// the harness — acting on the user's slash command — may.
+type loadOrigin int
+
+const (
+	// loadByModel is a manage_skills(load) call the model made itself.
+	loadByModel loadOrigin = iota
+	// loadByUser is a load the harness performs on the user's behalf, i.e. the
+	// slash command the user typed (see Agent.loadSkillFromSlashCommand).
+	loadByUser
+)
+
 // load activates a skill for the session and returns its body plus a structured
 // activation marker. High-risk skills are gated on approval. ctx carries the
 // values the detached task emit needs (session, and any tenant identity the
 // storage layer reads); load itself performs no context-bound I/O.
-func (t *ManageSkillsTool) load(ctx context.Context, sessionID, name string) (*shuttle.Result, error) {
+//
+// origin decides whether the MANUAL trigger mode blocks this load: MANUAL means
+// "only the user activates this skill", so a model-issued load is refused and
+// pointed at the skill's slash command. An already-active MANUAL skill loads
+// again freely — the user already activated it this session, so re-reading its
+// body is not a way around the rule.
+func (t *ManageSkillsTool) load(ctx context.Context, sessionID, name string, origin loadOrigin) (*shuttle.Result, error) {
 	if name == "" {
 		return &shuttle.Result{
 			Success: false,
@@ -187,8 +206,9 @@ func (t *ManageSkillsTool) load(ctx context.Context, sessionID, name string) (*s
 		}, nil
 	}
 
-	// One read of the pre-activation set serves both the debug delta below and
-	// the was-it-already-active decision that gates task emission.
+	// One read of the pre-activation set serves three decisions: the MANUAL gate
+	// below, the debug delta further down, and the was-it-already-active check
+	// that gates task emission.
 	beforeSet := t.orch.GetActiveSkills(sessionID)
 	activeBefore := len(beforeSet)
 	wasActive := false
@@ -199,7 +219,31 @@ func (t *ManageSkillsTool) load(ctx context.Context, sessionID, name string) (*s
 		}
 	}
 
-	active := t.orch.ActivatePinned(sessionID, skill, "manual_load", name, 1.0)
+	// MANUAL gate: the skill's author reserved activation for the user, so the
+	// model cannot pull it into the conversation. The refusal names the slash
+	// command because that is the one thing that does activate it, and the model
+	// can relay it to the user. Not an error the model should retry: a MANUAL
+	// skill stays out of the menu and out of list(), so reaching here at all
+	// means the model guessed the name.
+	if origin == loadByModel && isManualSkill(skill) && !wasActive {
+		return &shuttle.Result{
+			Success: false,
+			Error: &shuttle.Error{
+				Code:    "manual_skill",
+				Message: manualSkillRefusal(skill),
+			},
+			Metadata: map[string]interface{}{
+				"skill":     name,
+				"activated": false,
+			},
+		}, nil
+	}
+
+	activationSource := "manual_load"
+	if origin == loadByUser {
+		activationSource = "slash_command"
+	}
+	active := t.orch.ActivatePinned(sessionID, skill, activationSource, name, 1.0)
 
 	// Wire the skill's required tools for this session. The loop re-projects the
 	// advertised tool set per provider call, so they surface this turn.
@@ -280,8 +324,14 @@ type skillListResult struct {
 	Skills      []skillListEntry `json:"skills"`
 }
 
-// list returns the full library annotated with which skills are active for this
+// list returns the library annotated with which skills are active for this
 // session, rendered as JSON.
+//
+// MANUAL skills are omitted: the model cannot load them (see load's gate), so
+// listing them would only advertise a name every load call refuses. The one
+// exception is a MANUAL skill the user already activated by slash command —
+// it is part of this session's state, so the model's picture of what is active
+// stays complete.
 func (t *ManageSkillsTool) list(sessionID string) (*shuttle.Result, error) {
 	summaries := t.library.ListAll()
 
@@ -292,10 +342,15 @@ func (t *ManageSkillsTool) list(sessionID string) (*shuttle.Result, error) {
 		}
 	}
 
+	manual := manualSkillNames(t.library)
+
 	entries := make([]skillListEntry, 0, len(summaries))
 	activeCount := 0
 	for _, s := range summaries {
 		isActive := activeSet[s.Name]
+		if manual[s.Name] && !isActive {
+			continue
+		}
 		if isActive {
 			activeCount++
 		}
