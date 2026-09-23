@@ -38,15 +38,17 @@ import (
 
 // Client implements the LLMProvider interface for OpenAI's API.
 type Client struct {
-	apiKey       string
-	model        string
-	endpoint     string
-	httpClient   *http.Client
-	maxTokens    int
-	temperature  float64
-	rateLimiter  *llm.RateLimiter
-	toolNameMap  map[string]string // sanitized name → original name
-	extraHeaders map[string]string // additional headers sent with every request
+	apiKey                 string
+	model                  string
+	endpoint               string
+	httpClient             *http.Client
+	streamFirstByteTimeout time.Duration
+	streamIdleTimeout      time.Duration
+	maxTokens              int
+	temperature            float64
+	rateLimiter            *llm.RateLimiter
+	toolNameMap            map[string]string // sanitized name → original name
+	extraHeaders           map[string]string // additional headers sent with every request
 	// catalogProvider is the catalog namespace calculateCost prices under.
 	// "openai" unless Config.CatalogProvider overrides it.
 	catalogProvider string
@@ -58,13 +60,19 @@ const DefaultCatalogProvider = "openai"
 
 // Config holds configuration for the OpenAI client.
 type Config struct {
-	APIKey            string
-	Model             string        // Default: gpt-4o
-	Endpoint          string        // Default: https://api.openai.com/v1/chat/completions
-	Timeout           time.Duration // Default: 60s
-	MaxTokens         int           // Default: 4096
-	Temperature       float64       // Default: 1.0
-	RateLimiterConfig llm.RateLimiterConfig
+	APIKey   string
+	Model    string        // Default: gpt-4o
+	Endpoint string        // Default: https://api.openai.com/v1/chat/completions
+	Timeout  time.Duration // Default: 60s
+	// StreamFirstByteTimeout limits the wait for the first response-body bytes in
+	// ChatStream. StreamIdleTimeout limits silence between subsequent network
+	// reads. Non-positive values use DefaultOpenAIStreamFirstByteTimeout and
+	// DefaultOpenAIStreamIdleTimeout.
+	StreamFirstByteTimeout time.Duration
+	StreamIdleTimeout      time.Duration
+	MaxTokens              int     // Default: 4096
+	Temperature            float64 // Default: 1.0
+	RateLimiterConfig      llm.RateLimiterConfig
 	// ExtraHeaders are additional HTTP headers sent with every request.
 	// Useful for proxy-specific metadata (e.g. LiteLLM user tracking tags).
 	//
@@ -90,11 +98,13 @@ type Config struct {
 //   - OPENAI_API_ENDPOINT / LOOM_LLM_OPENAI_ENDPOINT
 const (
 	// DefaultOpenAIModel uses GPT-4.1 (latest general-purpose model as of 2025)
-	DefaultOpenAIModel       = "gpt-4.1"
-	DefaultOpenAIEndpoint    = "https://api.openai.com/v1/chat/completions"
-	DefaultOpenAITimeout     = 60 * time.Second
-	DefaultOpenAIMaxTokens   = 4096
-	DefaultOpenAITemperature = 1.0
+	DefaultOpenAIModel                  = "gpt-4.1"
+	DefaultOpenAIEndpoint               = "https://api.openai.com/v1/chat/completions"
+	DefaultOpenAITimeout                = 60 * time.Second
+	DefaultOpenAIStreamFirstByteTimeout = 90 * time.Second
+	DefaultOpenAIStreamIdleTimeout      = 30 * time.Second
+	DefaultOpenAIMaxTokens              = 4096
+	DefaultOpenAITemperature            = 1.0
 )
 
 // NewClient creates a new OpenAI client.
@@ -122,6 +132,12 @@ func NewClient(config Config) *Client {
 	if config.Timeout == 0 {
 		config.Timeout = DefaultOpenAITimeout
 	}
+	if config.StreamFirstByteTimeout <= 0 {
+		config.StreamFirstByteTimeout = DefaultOpenAIStreamFirstByteTimeout
+	}
+	if config.StreamIdleTimeout <= 0 {
+		config.StreamIdleTimeout = DefaultOpenAIStreamIdleTimeout
+	}
 	if config.MaxTokens == 0 {
 		config.MaxTokens = DefaultOpenAIMaxTokens
 	}
@@ -141,14 +157,16 @@ func NewClient(config Config) *Client {
 	}
 
 	return &Client{
-		apiKey:          config.APIKey,
-		model:           config.Model,
-		endpoint:        config.Endpoint,
-		maxTokens:       config.MaxTokens,
-		temperature:     config.Temperature,
-		rateLimiter:     rateLimiter,
-		extraHeaders:    copyHeaders(config.ExtraHeaders),
-		catalogProvider: config.CatalogProvider,
+		apiKey:                 config.APIKey,
+		model:                  config.Model,
+		endpoint:               config.Endpoint,
+		streamFirstByteTimeout: config.StreamFirstByteTimeout,
+		streamIdleTimeout:      config.StreamIdleTimeout,
+		maxTokens:              config.MaxTokens,
+		temperature:            config.Temperature,
+		rateLimiter:            rateLimiter,
+		extraHeaders:           copyHeaders(config.ExtraHeaders),
+		catalogProvider:        config.CatalogProvider,
 		httpClient: &http.Client{
 			Timeout: config.Timeout,
 			Transport: &http.Transport{
@@ -156,6 +174,7 @@ func NewClient(config Config) *Client {
 				DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 				ForceAttemptHTTP2:     true,
 				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: config.Timeout,
 				ExpectContinueTimeout: 1 * time.Second,
 				MaxIdleConns:          100,
 				// Use a short idle-connection timeout so the pool doesn't
@@ -199,6 +218,37 @@ func isRetryableTransportError(err error) bool {
 }
 
 func (c *Client) sendRequest(ctx context.Context, body []byte) (*http.Response, error) {
+	return c.sendRequestWithClient(ctx, body, c.httpClient, 0, 0)
+}
+
+func (c *Client) streamingHTTPClient() *http.Client {
+	streamClient := *c.httpClient
+	streamClient.Timeout = 0
+	if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
+		streamTransport := transport.Clone()
+		streamTransport.ResponseHeaderTimeout = c.streamFirstByteTimeout
+		streamClient.Transport = streamTransport
+	}
+	return &streamClient
+}
+
+func (c *Client) sendStreamingRequest(ctx context.Context, body []byte) (*http.Response, error) {
+	return c.sendRequestWithClient(
+		ctx,
+		body,
+		c.streamingHTTPClient(),
+		c.streamFirstByteTimeout,
+		c.streamIdleTimeout,
+	)
+}
+
+func (c *Client) sendRequestWithClient(
+	ctx context.Context,
+	body []byte,
+	httpClient *http.Client,
+	streamFirstByteTimeout time.Duration,
+	streamIdleTimeout time.Duration,
+) (*http.Response, error) {
 	newReq := func(ctx context.Context) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
 		if err != nil {
@@ -220,7 +270,7 @@ func (c *Client) sendRequest(ctx context.Context, body []byte) (*http.Response, 
 				if err != nil {
 					return nil, err
 				}
-				resp, err := c.httpClient.Do(req)
+				resp, err := sendHTTPRequest(httpClient, req, streamFirstByteTimeout, streamIdleTimeout)
 				if err != nil {
 					return nil, err
 				}
@@ -250,7 +300,7 @@ func (c *Client) sendRequest(ctx context.Context, body []byte) (*http.Response, 
 		if err != nil {
 			return nil, err
 		}
-		resp, doErr := c.httpClient.Do(req)
+		resp, doErr := sendHTTPRequest(httpClient, req, streamFirstByteTimeout, streamIdleTimeout)
 		if doErr == nil {
 			return resp, nil
 		}
@@ -259,6 +309,19 @@ func (c *Client) sendRequest(ctx context.Context, body []byte) (*http.Response, 
 		}
 	}
 	return nil, fmt.Errorf("HTTP request failed")
+}
+
+func sendHTTPRequest(
+	httpClient *http.Client,
+	req *http.Request,
+	streamFirstByteTimeout time.Duration,
+	streamIdleTimeout time.Duration,
+) (*http.Response, error) {
+	resp, err := httpClient.Do(req)
+	if err == nil && (streamFirstByteTimeout > 0 || streamIdleTimeout > 0) {
+		resp.Body = newStreamReadTimeoutReadCloser(resp.Body, streamFirstByteTimeout, streamIdleTimeout)
+	}
+	return resp, err
 }
 
 // Name returns the provider name.
@@ -811,7 +874,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	// 2. Send request with rate limiting if enabled.
 	// Retry once on transient transport errors (stale keep-alive connection
 	// recycled by the LLM proxy, manifesting as EOF).
-	httpResp, err := c.sendRequest(ctx, body)
+	httpResp, err := c.sendStreamingRequest(ctx, body)
 	if err != nil {
 		return nil, err
 	}
