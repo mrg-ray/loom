@@ -552,6 +552,17 @@ func anthropicFallbackPricing(modelID string) (inputPerM, outputPerM float64, ma
 // cache-aware and authoritative — preferred over any local estimate.
 const providerCostHeader = "x-litellm-response-cost"
 
+// Cache-tier multipliers on the input rate, by rate-card family. Anthropic
+// bills a 5-minute cache write at 1.25x and a cache read at 0.10x. OpenAI bills
+// a cached input token at 0.5x (gpt-4o: $1.25 cached against $2.50) and has no
+// separate write bucket, so a cache-creation token is simply an input token.
+const (
+	anthropicCacheWriteMultiplier = 1.25
+	anthropicCacheReadMultiplier  = 0.10
+	openAICacheWriteMultiplier    = 1.0
+	openAICacheReadMultiplier     = 0.5
+)
+
 // parseProviderCost reads the gateway's reported cost, if it sent one.
 // Returns 0 when absent or unparseable, meaning "fall back to the estimate".
 func parseProviderCost(h http.Header) float64 {
@@ -580,11 +591,19 @@ func costOrEstimate(providerCostUSD float64, estimate func() float64) float64 {
 
 // calculateCost estimates the cost in USD based on token usage.
 //
-// Cache tiers matter: a cache write bills at 1.25x the input rate and a cache
-// read at 0.10x, so a cache-blind total over-charges a cache-heavy workload by
-// several fold. NOTE the OpenAI-compatible semantics: prompt_tokens INCLUDES
-// cached tokens (unlike Anthropic native, where input_tokens excludes them),
-// so the uncached remainder must be derived by subtraction.
+// Cache tiers matter: a cache-blind total over-charges a cache-heavy workload by
+// several fold. The multipliers are family-dependent, so they follow the rate
+// card rather than being fixed:
+//
+//   - Anthropic (including gateway-proxied Claude ids): a cache write bills at
+//     1.25x the input rate (5-minute TTL; a 1-hour write is 2x, which loom does
+//     not request) and a cache read at 0.10x.
+//   - OpenAI: a cached input token bills at 0.5x and there is no separate write
+//     bucket, so cache-creation tokens bill at the plain input rate.
+//
+// NOTE the OpenAI-compatible semantics: prompt_tokens INCLUDES cached tokens
+// (unlike Anthropic native, where input_tokens excludes them), so the uncached
+// remainder must be derived by subtraction.
 //
 // This is the FALLBACK. When the gateway reports its own cost (litellm's
 // x-litellm-response-cost header) that figure is authoritative and is used
@@ -658,13 +677,21 @@ func (c *Client) calculateCost(inputTokens, outputTokens, cacheReadTokens, cache
 		}
 	}
 
+	// The family decides the cache multipliers, independently of which branch
+	// above supplied the rates: anthropicFallbackPricing is a pure matcher on the
+	// model id, so it still identifies a Claude that the catalog priced.
+	cacheReadMult, cacheWriteMult := openAICacheReadMultiplier, openAICacheWriteMultiplier
+	if _, _, isAnthropic := anthropicFallbackPricing(c.model); isAnthropic {
+		cacheReadMult, cacheWriteMult = anthropicCacheReadMultiplier, anthropicCacheWriteMultiplier
+	}
+
 	uncached := inputTokens - cacheReadTokens - cacheCreationTokens
 	if uncached < 0 {
 		uncached = 0
 	}
 	inputCost := float64(uncached) * inputCostPerM / 1_000_000
-	cacheWriteCost := float64(cacheCreationTokens) * inputCostPerM * 1.25 / 1_000_000
-	cacheReadCost := float64(cacheReadTokens) * inputCostPerM * 0.10 / 1_000_000
+	cacheWriteCost := float64(cacheCreationTokens) * inputCostPerM * cacheWriteMult / 1_000_000
+	cacheReadCost := float64(cacheReadTokens) * inputCostPerM * cacheReadMult / 1_000_000
 	outputCost := float64(outputTokens) * outputCostPerM / 1_000_000
 	return inputCost + cacheWriteCost + cacheReadCost + outputCost
 }

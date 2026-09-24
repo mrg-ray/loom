@@ -72,3 +72,41 @@ func TestProviderCostHeaderWins(t *testing.T) {
 		}
 	}
 }
+
+// OpenAI and Anthropic bill cached input differently, so the multipliers follow
+// the rate card rather than being fixed. A genuine gpt-4o reporting
+// cached_tokens must bill those at 0.5x — charging Anthropic's 0.10x would
+// undercharge the cached portion five-fold, and the direct-OpenAI and streaming
+// paths have no gateway cost header to mask it.
+func TestCalculateCost_CacheMultipliersFollowTheRateCard(t *testing.T) {
+	const (
+		promptTokens = 100_000 // inclusive of the cache buckets below
+		cacheRead    = 80_000
+		cacheWrite   = 10_000
+		output       = 1_000
+	)
+
+	t.Run("openai bills cached reads at 0.5x with no write premium", func(t *testing.T) {
+		c := &Client{model: "gpt-4o"}
+		got := c.calculateCost(promptTokens, output, cacheRead, cacheWrite)
+		want := (10_000*2.50 + 10_000*2.50*1.0 + 80_000*2.50*0.5 + 1_000*10.00) / 1e6
+		if math.Abs(got-want) > 1e-9 {
+			t.Fatalf("gpt-4o cost = %.6f, want %.6f", got, want)
+		}
+		// Anthropic's read multiplier here would undercharge by 5x on the cached
+		// portion — the regression this pins.
+		anthropicMult := (10_000*2.50 + 10_000*2.50*1.25 + 80_000*2.50*0.10 + 1_000*10.00) / 1e6
+		if math.Abs(got-anthropicMult) < 1e-9 {
+			t.Fatal("gpt-4o priced with Anthropic cache multipliers")
+		}
+	})
+
+	t.Run("claude keeps 1.25x writes and 0.10x reads", func(t *testing.T) {
+		c := &Client{model: "coding-agent/claude-sonnet-4-6"}
+		got := c.calculateCost(promptTokens, output, cacheRead, cacheWrite)
+		want := (10_000*3.00 + 10_000*3.00*1.25 + 80_000*3.00*0.10 + 1_000*15.00) / 1e6
+		if math.Abs(got-want) > 1e-9 {
+			t.Fatalf("claude cost = %.6f, want %.6f", got, want)
+		}
+	})
+}
