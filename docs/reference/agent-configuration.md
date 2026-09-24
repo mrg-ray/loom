@@ -343,7 +343,7 @@ spec:
 | **Progressively disclosed** (registered dynamically after triggering conditions) | `get_error_details` (after first error), `conversation_memory` (after first L2 swap), `session_memory` (after 3+ sessions), `query_tool_result` (after first large result or first tool result returned by reference) |
 | **Workflow-injected** (auto-added for workflow agents) | `send_message`, `publish`, `shared_memory_read`, `shared_memory_write`, `top_n_query`, `group_by_query` |
 
-The server's tool policy withholds some of these from the model while their subsystems keep running: `tools.minimal` suppresses `graph_memory` and `task_board`; `tools.none` additionally suppresses `conversation_memory`, `session_memory`, `get_error_details`, `query_tool_result`, the workflow-injected tools, and `manage_ephemeral_agents`. `manage_skills` and `load_pattern` are not suppressed by either policy.
+`tools.minimal` suppresses `graph_memory` and `task_board`; `tools.none` additionally suppresses `conversation_memory`, `session_memory`, `get_error_details`, `query_tool_result`, and the workflow-injected tools. `manage_skills` and `load_pattern` are not suppressed by either policy. `manage_ephemeral_agents` is not suppressed by `tools.none`; see the manage_ephemeral_agents section for opt-in/opt-out details.
 
 #### manage_skills
 
@@ -409,12 +409,23 @@ Under `spec.memory` (k8s-style) or `agent.memory` (legacy).
 | `path` | `string` | `""` | SQLite database file path |
 | `dsn` | `string` | `""` | PostgreSQL connection string |
 | `max_history` | `int` | `50` | Max conversation messages to retain |
-| `shared_memory_threshold_bytes` | `int64` | `65536` (64 KiB) | Byte threshold for offloading a tool result: `>0` offloads results of at least N bytes, `-1` selects the 64 KiB default. Only a non-zero value is applied, so `0` in YAML is indistinguishable from unset and leaves the agent on the 64 KiB default; the always-offload mode (threshold 0) is reachable only through the Go API `SetSharedMemoryThreshold`. |
+| `shared_memory_threshold_bytes` | `int64` | `16384` (16 KiB) | One byte threshold, three roles: compile-time offload bound (a current-turn tool result strictly over it renders as an offload stub), persist-time row bound, and retrieval page bound — plus the tool executor's large-parameter offload. `>0` sets the bound (the compile/persist roles floor it at 256 bytes); `-1` keeps the 16 KiB default; `0` in YAML is indistinguishable from unset. `0` through the Go API `SetSharedMemoryThreshold` makes the executor store every tool parameter by reference and leaves the compile-time bound at its default. |
 | `max_tool_results` | `int` | `5` | Max tool results kept in conversation kernel |
 | `memory_compression` | object | optional | See [Memory Compression](#memory-compression-configuration) |
 | `graph_memory` | object | optional | See [Graph Memory](#graph-memory-configuration) |
 
-**Large tool results**: the same byte threshold governs both offload sites (the tool executor and the agent's result formatter). A result at or above it is stored by reference and replaced in the conversation with a preview plus a handle; the model recalls the full data with `query_tool_result`. Three tools are exempt and always enter whole regardless of size: `manage_skills` (its load body is delivered as its own message), `get_tool_result` and `query_tool_result` (re-offloading a recall tool would recurse).
+**Large tool results**: a result always enters the conversation whole — offload is a render condition of context compilation, not an arrival event. When a tool row's content is strictly over the threshold, the copy compiled for the LLM is replaced by a stub. In the producing turn this is the offload stub — tool name, estimated token figure, a 160-byte preview, and a `query_tool_result(message_id=…)` door (`sql=` for tabular payloads); `query_tool_result` resolves only within that turn, and every return is bounded at the same threshold. In later turns, and for rows evicted by memory-pressure relief, it is the evicted stub, whose only door is re-running the call. Rows are persisted truncated to a bounded core plus tail at the same threshold. A session without a persistent store has no `message_id` to print, so its current-turn oversize results render the evicted stub.
+
+**Offload-exempt tools** (Go API only; no YAML field): `Agent.SetOffloadExemptTools(names []string)` names the tools whose current-turn results always render whole regardless of the threshold. Use it for tools whose full output is the product of the call — reference or lookup content the model must read inline in the turn it asked for it — where an offload stub would defeat the call.
+
+```go
+ag.SetOffloadExemptTools([]string{"reference_lookup", "get_syntax_help"})
+```
+
+- Each call replaces the whole set; `nil` or an empty slice clears it; empty-string names are skipped. No tools are exempt by default.
+- Applies to existing and future sessions. Also available on `Memory` and per-session `SegmentedMemory`. Safe for concurrent use.
+- Exemption is a render condition of the producing turn only: prior-turn oversize rows and relief-evicted rows still render the evicted stub, and the persist-time row bound is unchanged.
+- An exempt result counts at full size toward memory-pressure estimates; a very large exempt result spends a correspondingly large share of the producing turn's context window.
 
 ---
 
@@ -608,6 +619,8 @@ spec:
 ### Ephemeral Agents
 
 Defined in proto as `AgentConfig.ephemeral_agents`. Policies for dynamically spawning agents at runtime.
+
+Dynamic spawning is opt-in. The agent must explicitly include `manage_ephemeral_agents` in `spec.tools`; otherwise the server does not register the spawning tool for that agent, even when ephemeral-agent policies are present. The `personal_assistant`, `task_automator`, and `coordinator` built-in presets include this tool. Programmatic `MultiAgentServer` embedders without an agent registry can opt in per agent with `SetAgentSpawnEnabled(agentID, true)`. Other agents should add it only when their instructions require runtime delegation.
 
 > **Note**: Ephemeral agent policies are defined in the proto schema but are **not currently parsed from YAML** by the config loader. They must be set programmatically via the Go API or gRPC. The YAML example below shows the proto schema for reference.
 
@@ -818,8 +831,14 @@ health_check:
 
 ## Environment Variable Expansion
 
-Agent YAML files support `${VAR}` and `$VAR` syntax. Variables are expanded from the process
-environment at load time via `os.Expand`.
+Agent YAML loading supports `${VAR}` and `$VAR` syntax. Variables are expanded
+from the process environment at load time via `os.Expand`.
+
+Trusted server-startup settings for LLM, MCP, and OTLP values use a stricter
+single-pass expander: only `${VAR}` is expanded, bare dollar signs are
+preserved, `$$` emits one literal dollar sign, and an unresolved placeholder is
+preserved for diagnostics. Runtime management APIs do not expand
+caller-supplied configuration.
 
 ```yaml
 spec:

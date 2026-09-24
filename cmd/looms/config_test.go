@@ -510,6 +510,47 @@ func TestValidate_ObservabilityMode(t *testing.T) {
 	})
 }
 
+// TestValidate_DoorKnobs (review finding 5, PR #353): negative door knobs
+// are startup errors, not a silent disable (max_active_conversations) or an
+// unbounded queue (max_door_queue).
+func TestValidate_DoorKnobs(t *testing.T) {
+	validBase := func() *Config {
+		return &Config{
+			Server:  ServerConfig{Port: 60051},
+			LLM:     LLMConfig{Provider: "ollama", OllamaEndpoint: "http://localhost:11434", OllamaModel: "test"},
+			Storage: StorageBackendConfig{Backend: "sqlite", SQLite: SQLiteConfig{Path: "/tmp/test.db"}},
+		}
+	}
+
+	t.Run("zero knobs -> valid (gate off, unbounded queue)", func(t *testing.T) {
+		cfg := validBase()
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("positive knobs -> valid", func(t *testing.T) {
+		cfg := validBase()
+		cfg.LLM.MaxActiveConversations = 8
+		cfg.LLM.MaxDoorQueue = 64
+		assert.NoError(t, cfg.Validate())
+	})
+
+	t.Run("negative max_active_conversations -> error", func(t *testing.T) {
+		cfg := validBase()
+		cfg.LLM.MaxActiveConversations = -1
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "llm.max_active_conversations")
+	})
+
+	t.Run("negative max_door_queue -> error", func(t *testing.T) {
+		cfg := validBase()
+		cfg.LLM.MaxDoorQueue = -5
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "llm.max_door_queue")
+	})
+}
+
 func TestValidate_StorageBackend(t *testing.T) {
 	// Helper to create a config with valid LLM settings
 	validBase := func() *Config {
@@ -707,6 +748,19 @@ storage:
 		"LOOM_STORAGE_POSTGRES_DSN should work even without dsn key in YAML")
 }
 
+func TestEnvVar_PatternsDir_NoYAMLKey(t *testing.T) {
+	viper.Reset()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "looms.yaml")
+	require.NoError(t, os.WriteFile(cfgPath, []byte("server:\n  port: 60051\n"), 0o644))
+	t.Setenv("LOOM_PATTERNS_DIR", "/opt/loom/patterns")
+
+	cfg, err := LoadConfig(cfgPath)
+	require.NoError(t, err)
+	assert.Equal(t, "/opt/loom/patterns", cfg.PatternsDir)
+}
+
 func TestEnvVar_NestedKeys(t *testing.T) {
 	// Verify SetEnvKeyReplacer works for other nested keys too.
 	viper.Reset()
@@ -730,8 +784,52 @@ server:
 		"LOOM_LOGGING_LEVEL should override logging.level")
 }
 
+func TestEnvVar_SkipEmbeddedAgentsWithoutYAMLKey(t *testing.T) {
+	viper.Reset()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "looms.yaml")
+	err := os.WriteFile(cfgPath, []byte("server:\n  port: 60051\n"), 0o644)
+	require.NoError(t, err)
+	t.Setenv("LOOM_SKIP_EMBEDDED_AGENTS", "true")
+
+	cfg, err := LoadConfig(cfgPath)
+	require.NoError(t, err)
+	assert.True(t, cfg.SkipEmbeddedAgents)
+}
+
 func TestGenerateExampleConfig_ContainsInsecureAdmin(t *testing.T) {
 	exampleConfig := GenerateExampleConfig()
 	assert.Contains(t, exampleConfig, "insecure_admin",
 		"example config should document the insecure_admin option")
+}
+
+// TestLoadConfig_ToolsHooks_DocumentedShape loads the HLD §5.2 config shape —
+// the binding list directly at tools.hooks — and asserts it decodes to one
+// fully-populated binding (loom#300 review finding 14: the squashed field must
+// not require a tools.hooks.hooks nesting).
+func TestLoadConfig_ToolsHooks_DocumentedShape(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "looms.yaml")
+	yaml := `
+tools:
+  hooks:
+    - kind: gated-allowlist
+      scope: execute_sql
+      state_key: approved_grants
+      source_tool: render_grant_read_sql
+      stmt_param: stmt
+      read_pattern: "(?i)\\s*select"
+`
+	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0o600))
+
+	config, err := LoadConfig(cfgPath)
+	require.NoError(t, err)
+	require.Len(t, config.Tools.Hooks.Bindings, 1, "the documented tools.hooks list must decode")
+	b := config.Tools.Hooks.Bindings[0]
+	assert.Equal(t, "gated-allowlist", b.Kind)
+	assert.Equal(t, "execute_sql", b.Scope)
+	assert.Equal(t, "approved_grants", b.StateKey)
+	assert.Equal(t, "render_grant_read_sql", b.SourceTool)
+	assert.Equal(t, "stmt", b.StmtParam)
 }

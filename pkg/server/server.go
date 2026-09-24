@@ -60,6 +60,18 @@ type Server struct {
 	activeProviderName string                       // currently active pool provider
 	evalStore          *evals.Store                 // optional; nil means no persistence
 	judgeServer        *JudgeServer                 // optional; nil means use hardcoded judge
+
+	// allowTimeOverride accepts WeaveRequest.occurred_at (replay/import arrival
+	// times). Default false: client-supplied timestamps can poison temporal
+	// grounding, so honoring them is an explicit operator decision
+	// (server.allow_time_override). Set via SetAllowTimeOverride.
+	allowTimeOverride bool
+}
+
+// SetAllowTimeOverride configures whether WeaveRequest.occurred_at is honored
+// (server.allow_time_override). See applyOccurredAt for the gate semantics.
+func (s *Server) SetAllowTimeOverride(allow bool) {
+	s.allowTimeOverride = allow
 }
 
 // SetJudgeServer wires an in-memory JudgeServer so that ABTest can resolve req.JudgeId.
@@ -109,11 +121,33 @@ func (s *Server) Weave(ctx context.Context, req *loomv1.WeaveRequest) (*loomv1.W
 		return nil, status.Error(codes.InvalidArgument, "query is required")
 	}
 
+	// Replay/import support: validate occurred_at and thread it through the
+	// context so persisted rows anchor at the conversation's historical time.
+	ctx, err := applyOccurredAt(ctx, req, s.allowTimeOverride)
+	if err != nil {
+		return nil, err
+	}
+
 	// Get or create session
 	sessionID := req.SessionId
 	if sessionID == "" {
 		sessionID = GenerateSessionID()
 	}
+
+	// Slot scheduling: install this turn's SlotInfo (origin from the
+	// client's own report — gRPC metadata "loom-slot-origin"; a session that
+	// already has history classifies IN_FLIGHT from its first call).
+	// Installed on every turn-executing entry point, unary and streaming.
+	_, sessionResumed := s.agent.GetSession(sessionID)
+	ctx = installTurnSlotInfo(ctx, sessionResumed, sessionID, s.agent.GetID())
+
+	// Door admission (see enterTurnDoor): batch turns queue at the front
+	// door when the active ceiling is reached; interactive turns bypass.
+	releaseDoor, doorErr := enterTurnDoor(ctx, nil)
+	if doorErr != nil {
+		return nil, doorErr
+	}
+	defer releaseDoor()
 
 	// Reset context window if requested (before processing the message)
 	if req.ResetContext {
@@ -123,7 +157,7 @@ func (s *Server) Weave(ctx context.Context, req *loomv1.WeaveRequest) (*loomv1.W
 	// Execute agent chat
 	resp, err := s.agent.Chat(ctx, sessionID, req.Query)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "agent execution failed: %v", err)
+		return nil, wrapAgentError(err)
 	}
 
 	// Build context state snapshot (after response, reflects post-conversation state)
@@ -166,11 +200,31 @@ func (s *Server) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.LoomService
 		return status.Error(codes.InvalidArgument, "query cannot be empty")
 	}
 
+	// Replay/import support: validate occurred_at and thread it through the
+	// context used for the agent call (see applyOccurredAt).
+	ctx, err := applyOccurredAt(stream.Context(), req, s.allowTimeOverride)
+	if err != nil {
+		return err
+	}
+
 	// Generate session ID if not provided
 	sessionID := req.SessionId
 	if sessionID == "" {
 		sessionID = GenerateSessionID()
 	}
+
+	// Slot scheduling: install this turn's SlotInfo (see Weave — every
+	// turn-executing entry point installs it).
+	_, sessionResumed := s.agent.GetSession(sessionID)
+	ctx = installTurnSlotInfo(ctx, sessionResumed, sessionID, s.agent.GetID())
+
+	// Door admission (see enterTurnDoor): batch turns queue at the front
+	// door when the active ceiling is reached; interactive turns bypass.
+	releaseDoor, doorErr := enterTurnDoor(ctx, nil)
+	if doorErr != nil {
+		return doorErr
+	}
+	defer releaseDoor()
 
 	// Reset context window if requested (before processing the message)
 	if req.ResetContext {
@@ -188,17 +242,11 @@ func (s *Server) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.LoomService
 	progressChan := make(chan agent.ProgressEvent, DefaultProgressBufferSize)
 
 	// Create progress callback that sends events to channel
-	progressCallback := func(event agent.ProgressEvent) {
-		select {
-		case progressChan <- event:
-		case <-stream.Context().Done():
-			// Context cancelled, stop sending
-		}
-	}
+	progressCallback := newProgressSender(progressChan, stream.Context().Done())
 
 	// Execute agent with progress callback
 	go func() {
-		resp, err := s.agent.ChatWithProgress(stream.Context(), sessionID, req.Query, progressCallback)
+		resp, err := s.agent.ChatWithProgress(ctx, sessionID, req.Query, progressCallback)
 		resultChan <- agentResult{resp: resp, err: err}
 		close(progressChan) // Signal no more progress events
 	}()
@@ -564,7 +612,10 @@ func (s *Server) GetTrace(ctx context.Context, req *loomv1.GetTraceRequest) (*lo
 	return nil, status.Error(codes.Unimplemented, "trace retrieval not yet implemented")
 }
 
-// GetHealth performs a health check by pinging each configured LLM provider.
+// GetHealth performs a health check against each configured LLM provider,
+// preferring each provider's lightweight HealthCheck (see pingProvider in
+// health.go) over a real chat completion so transient LLM latency/rate
+// limits don't falsely report a live agent as unhealthy.
 // Returns per-component status in the components map with keys like "llm.agent", "llm.judge", etc.
 // Overall status is "healthy" if all pass, "degraded" if some fail, "unhealthy" if all fail.
 func (s *Server) GetHealth(ctx context.Context, req *loomv1.GetHealthRequest) (*loomv1.HealthStatus, error) {
@@ -579,9 +630,7 @@ func (s *Server) GetHealth(ctx context.Context, req *loomv1.GetHealthRequest) (*
 
 		// Send minimal health check with short timeout
 		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := llmProvider.Chat(checkCtx, []types.Message{
-			{Role: "user", Content: "ping"},
-		}, nil)
+		err := pingProvider(checkCtx, llmProvider)
 		cancel()
 
 		latency := time.Since(start).Milliseconds()

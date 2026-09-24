@@ -27,6 +27,7 @@ import (
 
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"github.com/teradata-labs/loom/pkg/observability"
+	"github.com/teradata-labs/loom/pkg/types"
 )
 
 // --- write rule §4.1: truncation ---------------------------------------------
@@ -112,6 +113,89 @@ func TestCompile_AtThresholdRendersFull(t *testing.T) {
 	}
 }
 
+func TestCompile_UserTurnRendersArrivalStampInViewOnly(t *testing.T) {
+	sm := newCompileMemory(t)
+	ts := time.Date(2026, 8, 10, 14, 5, 0, 0, time.UTC)
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "what ran today?", Turn: 1, Timestamp: ts})
+
+	out := sm.GetMessagesForLLM()
+	var rendered string
+	for _, m := range out {
+		if m.Role == "user" {
+			rendered = m.Content
+		}
+	}
+	assert.Equal(t, "[Mon 2026-08-10 14:05 UTC] what ran today?", rendered,
+		"the compiled user turn carries the arrival stamp, rendered from Timestamp in UTC")
+
+	// The stored row is untouched — the stamp is a pure render condition.
+	stored := sm.GetRecentConversationTurns(1)
+	require.Len(t, stored, 1)
+	assert.Equal(t, "what ran today?", stored[0].Content,
+		"stored Content stays verbatim; only the view is stamped")
+}
+
+func TestCompile_UserTurnWithoutTimestampRendersVerbatim(t *testing.T) {
+	sm := newCompileMemory(t)
+	// Legacy row with a zero Timestamp must render unchanged.
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "legacy turn", Turn: 1})
+
+	out := sm.GetMessagesForLLM()
+	for _, m := range out {
+		if m.Role == "user" {
+			assert.Equal(t, "legacy turn", m.Content, "no stamp is invented for a timestamp-less row")
+		}
+	}
+}
+
+// TestCompile_MultimodalUserTurnStampsLeadingTextBlock verifies the arrival
+// stamp reaches multimodal providers: they build the request from ContentBlocks,
+// so the stamp must land on the leading text block too, not just Content. The
+// stored blocks stay verbatim — only the compiled view is stamped.
+func TestCompile_MultimodalUserTurnStampsLeadingTextBlock(t *testing.T) {
+	sm := newCompileMemory(t)
+	ts := time.Date(2026, 8, 10, 14, 5, 0, 0, time.UTC)
+	blocks := []ContentBlock{
+		{Type: "text", Text: "what is in this image?"},
+		{Type: "image", Image: &types.ImageContent{Type: "image", Source: types.ImageSource{Type: "base64", MediaType: "image/png", Data: "aGVsbG8="}}},
+	}
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "what is in this image?", ContentBlocks: blocks, Turn: 1, Timestamp: ts})
+
+	out := sm.GetMessagesForLLM()
+	var rendered Message
+	for _, m := range out {
+		if m.Role == "user" {
+			rendered = m
+		}
+	}
+	require.Len(t, rendered.ContentBlocks, 2)
+	assert.Equal(t, "[Mon 2026-08-10 14:05 UTC] what is in this image?", rendered.ContentBlocks[0].Text,
+		"the leading text block carries the stamp so multimodal providers see it")
+	assert.Equal(t, "image", rendered.ContentBlocks[1].Type, "the image block is untouched")
+
+	// The stored blocks are untouched — the stamp is a pure render condition.
+	stored := sm.GetRecentConversationTurns(1)
+	require.Len(t, stored, 1)
+	require.Len(t, stored[0].ContentBlocks, 2)
+	assert.Equal(t, "what is in this image?", stored[0].ContentBlocks[0].Text,
+		"stored blocks stay verbatim; only the view is stamped")
+}
+
+func TestCompile_TwoCompilesAreByteIdentical(t *testing.T) {
+	sm := newCompileMemory(t)
+	ts := time.Date(2026, 8, 10, 14, 5, 0, 0, time.UTC)
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "hello", Turn: 1, Timestamp: ts})
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Content: "hi", Turn: 1})
+
+	first := sm.GetMessagesForLLM()
+	second := sm.GetMessagesForLLM()
+	require.Equal(t, len(first), len(second))
+	for i := range first {
+		assert.Equal(t, first[i].Content, second[i].Content,
+			"the compiled view is byte-stable across calls (Timestamp is write-once)")
+	}
+}
+
 func TestCompile_LegacyOversizePriorTurnRendersEvictedStub(t *testing.T) {
 	sm := newCompileMemory(t)
 	big := strings.Repeat("L", 5000)
@@ -129,6 +213,156 @@ func TestCompile_LegacyOversizePriorTurnRendersEvictedStub(t *testing.T) {
 	}
 	want := fmt.Sprintf(evictedStubFormat, "execute_sql", tokenFigure(len(big)), "", previewOf(big))
 	assert.Equal(t, want, rendered, "a legacy unbounded prior-turn row renders the evicted stub")
+}
+
+// --- §5.2 step 6: offload-exempt carve-out -----------------------------------
+
+func TestCompile_OffloadExemptToolRendersWholeCurrentTurn(t *testing.T) {
+	sm := newCompileMemory(t)
+	sm.SetOffloadExemptTools([]string{"reference_lookup"})
+	exemptBig := strings.Repeat("e", 5000)
+	plainBig := strings.Repeat("p", 5000)
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "q", Turn: 1})
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+		ToolCalls: []ToolCall{
+			{ID: "c1", Name: "reference_lookup"},
+			{ID: "c2", Name: "web_search"},
+		}})
+	sm.AddMessage(context.Background(), Message{Role: "tool", ID: "41", ToolUseID: "c1", Content: exemptBig, Turn: 1})
+	sm.AddMessage(context.Background(), Message{Role: "tool", ID: "42", ToolUseID: "c2", Content: plainBig, Turn: 1})
+
+	rendered := map[string]string{}
+	for _, m := range sm.GetMessagesForLLM() {
+		if m.Role == "tool" {
+			rendered[m.ToolUseID] = m.Content
+		}
+	}
+	assert.Equal(t, exemptBig, rendered["c1"],
+		"an exempt tool's current-turn oversize result renders whole")
+	want := fmt.Sprintf(offloadStubFormat, "web_search", tokenFigure(len(plainBig)), int64(42), "", previewOf(plainBig))
+	assert.Equal(t, want, rendered["c2"],
+		"a non-exempt tool in the same compile still renders the offload stub")
+}
+
+func TestCompile_OffloadExemptPriorTurnStillRendersEvictedStub(t *testing.T) {
+	sm := newCompileMemory(t)
+	sm.SetOffloadExemptTools([]string{"reference_lookup"})
+	big := strings.Repeat("e", 5000)
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+		ToolCalls: []ToolCall{{ID: "c1", Name: "reference_lookup"}}})
+	sm.AddMessage(context.Background(), Message{Role: "tool", ID: "3", ToolUseID: "c1", Content: big, Turn: 1})
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "next", Turn: 2})
+
+	var rendered string
+	for _, m := range sm.GetMessagesForLLM() {
+		if m.Role == "tool" {
+			rendered = m.Content
+		}
+	}
+	want := fmt.Sprintf(evictedStubFormat, "reference_lookup", tokenFigure(len(big)), "", previewOf(big))
+	assert.Equal(t, want, rendered,
+		"exemption is a render condition of the producing turn only — prior turns evict as usual")
+}
+
+func TestCompile_OffloadExemptEvictedFlagStillRendersEvictedStub(t *testing.T) {
+	sm := newCompileMemory(t)
+	sm.SetOffloadExemptTools([]string{"reference_lookup"})
+	big := strings.Repeat("e", 5000)
+	sm.AddMessage(context.Background(), Message{Role: "user", Content: "q", Turn: 1})
+	sm.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+		ToolCalls: []ToolCall{{ID: "c1", Name: "reference_lookup"}}})
+	sm.AddMessage(context.Background(), Message{Role: "tool", ID: "5", ToolUseID: "c1", Content: big, Turn: 1, Evicted: true})
+
+	var rendered string
+	for _, m := range sm.GetMessagesForLLM() {
+		if m.Role == "tool" {
+			rendered = m.Content
+		}
+	}
+	want := fmt.Sprintf(evictedStubFormat, "reference_lookup", tokenFigure(len(big)), "", previewOf(big))
+	assert.Equal(t, want, rendered,
+		"relief's evicted flag wins over exemption — the exempt set never blocks pressure release")
+}
+
+func TestSetOffloadExemptTools_ReplaceClearsAndSkipsEmptyNames(t *testing.T) {
+	sm := newCompileMemory(t)
+	big := strings.Repeat("e", 5000)
+	addBig := func() {
+		sm.AddMessage(context.Background(), Message{Role: "user", Content: "q", Turn: 1})
+		sm.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+			ToolCalls: []ToolCall{{ID: "c1", Name: "reference_lookup"}}})
+		sm.AddMessage(context.Background(), Message{Role: "tool", ID: "9", ToolUseID: "c1", Content: big, Turn: 1})
+	}
+	toolContent := func() string {
+		var s string
+		for _, m := range sm.GetMessagesForLLM() {
+			if m.Role == "tool" {
+				s = m.Content
+			}
+		}
+		return s
+	}
+
+	addBig()
+	sm.SetOffloadExemptTools([]string{"", "reference_lookup"})
+	assert.Equal(t, big, toolContent(), "empty names are skipped, real names apply")
+
+	sm.SetOffloadExemptTools([]string{"other_tool"})
+	assert.NotEqual(t, big, toolContent(), "SetOffloadExemptTools replaces the set — the old name no longer exempts")
+
+	sm.SetOffloadExemptTools(nil)
+	assert.NotEqual(t, big, toolContent(), "a nil slice clears the set")
+}
+
+func TestMemory_SetOffloadExemptTools_PropagatesToExistingAndFutureSessions(t *testing.T) {
+	m := NewMemory()
+	m.SetThresholdBytes(1024)
+	big := strings.Repeat("e", 5000)
+
+	existing := m.GetOrCreateSession(context.Background(), "sess-existing")
+	m.SetOffloadExemptTools([]string{"reference_lookup"})
+	future := m.GetOrCreateSession(context.Background(), "sess-future")
+
+	for name, session := range map[string]*Session{"existing": existing, "future": future} {
+		segMem, ok := session.SegmentedMem.(*SegmentedMemory)
+		require.True(t, ok, "%s session carries a SegmentedMemory", name)
+		segMem.AddMessage(context.Background(), Message{Role: "user", Content: "q", Turn: 1})
+		segMem.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+			ToolCalls: []ToolCall{{ID: "c1", Name: "reference_lookup"}}})
+		segMem.AddMessage(context.Background(), Message{Role: "tool", ID: "11", ToolUseID: "c1", Content: big, Turn: 1})
+		var rendered string
+		for _, msg := range segMem.GetMessagesForLLM() {
+			if msg.Role == "tool" {
+				rendered = msg.Content
+			}
+		}
+		assert.Equal(t, big, rendered, "%s session honors the exempt set", name)
+	}
+}
+
+func TestAgent_SetOffloadExemptTools_ForwardsToMemory(t *testing.T) {
+	a := &Agent{memory: NewMemory()}
+	a.memory.SetThresholdBytes(1024)
+	a.SetOffloadExemptTools([]string{"reference_lookup"})
+
+	session := a.memory.GetOrCreateSession(context.Background(), "sess-agent")
+	segMem, ok := session.SegmentedMem.(*SegmentedMemory)
+	require.True(t, ok)
+	big := strings.Repeat("e", 5000)
+	segMem.AddMessage(context.Background(), Message{Role: "user", Content: "q", Turn: 1})
+	segMem.AddMessage(context.Background(), Message{Role: "assistant", Turn: 1,
+		ToolCalls: []ToolCall{{ID: "c1", Name: "reference_lookup"}}})
+	segMem.AddMessage(context.Background(), Message{Role: "tool", ID: "12", ToolUseID: "c1", Content: big, Turn: 1})
+	var rendered string
+	for _, msg := range segMem.GetMessagesForLLM() {
+		if msg.Role == "tool" {
+			rendered = msg.Content
+		}
+	}
+	assert.Equal(t, big, rendered, "the agent-level setter reaches sessions through Memory")
+
+	// nil memory must not panic.
+	(&Agent{}).SetOffloadExemptTools([]string{"reference_lookup"})
 }
 
 // TestCompile_CurrentTurnQueryPairSitsBehindCacheBreakpoint proves the cache

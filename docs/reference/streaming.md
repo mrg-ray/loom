@@ -75,6 +75,29 @@ looms serve
 # Log output includes: {"level":"info","msg":"HTTP/REST+SSE endpoints available","sse_endpoint":"http://0.0.0.0:5006/v1/weave:stream"}
 ```
 
+**Request headers**:
+
+| Header | Values | Meaning |
+|--------|--------|---------|
+| `X-Loom-Slot-Origin` | `interactive`, `batch` (default when absent) | Asserts this turn's scheduling band for the LLM slot scheduler and door admission control. |
+
+When door admission is enabled (`llm.max_active_conversations` > 0),
+batch-origin turns queue FIFO at the admission door once the active-turn
+ceiling is reached. Send `X-Loom-Slot-Origin: interactive` when a human is
+actively waiting on the response: interactive turns bypass the door and ride
+the scheduler's interactive band. The value is client-asserted and trusted
+as-is — the same trust model as the gRPC metadata key `loom-slot-origin`
+used by the CLI/TUI. A full door queue rejects the request with
+`RESOURCE_EXHAUSTED` (retry later).
+
+```bash
+# A human-facing web client marks its turns interactive:
+curl -N -X POST http://localhost:5006/v1/weave:stream \
+  -H "Content-Type: application/json" \
+  -H "X-Loom-Slot-Origin: interactive" \
+  -d '{"query": "What is 2+2?", "session_id": "sess_123"}'
+```
+
 
 ## Progress Events
 
@@ -492,8 +515,19 @@ message WeaveRequest {
   bool enable_trace = 8;              // Optional: Enable tracing for this request
   string agent_id = 9;               // Optional: Agent ID to route request to (uses default if empty)
   bool reset_context = 10;            // Optional: Clear context window before processing
+  google.protobuf.Timestamp occurred_at = 11; // Optional: historical arrival time for replayed/imported conversations
 }
 ```
+
+**`occurred_at` (replay/import only):** when set, every message persisted
+during the call — user turn, assistant reply, tool rows — carries this
+timestamp instead of the server wall clock, so temporal grounding
+(graph-memory extraction anchoring, arrival stamps) reflects when the
+conversation actually happened. The server rejects the field with
+`FAILED_PRECONDITION` unless `server.allow_time_override: true` is set in
+`looms.yaml` (default: false — client-supplied timestamps can poison temporal
+grounding), and rejects future-dated values with `INVALID_ARGUMENT`. Live
+conversations should leave it unset.
 
 ### Client Example
 
@@ -1058,7 +1092,7 @@ message SessionStatusUpdate {
 Sent when a new message is added to the session conversation (e.g., from a sub-agent response, tool result, or user input).
 
 **Fields**:
-- `role`: Message role - `user`, `assistant`, or `tool` (only these roles are sent)
+- `role`: Message role - `user`, `assistant`, `tool`, `skill_body`, `hygiene_injection`, `empty_response_retry`, or `synthesis_prompt` (only these roles are sent). `skill_body`, `hygiene_injection`, `empty_response_retry`, and `synthesis_prompt` are synthetic, agent-authored roles — a loaded skill's instructions, a hygiene-retry nudge, an empty-response retry nudge, and a forced-final-answer synthesis prompt, respectively — persisted separately from the literal end user; see `pkg/agent/llm_retry.go`'s `IsSyntheticWireUserRole`.
 - `content`: The message text
 - `message_timestamp`: When the message was created (Unix timestamp)
 - `tool_name`: 🚧 Defined in proto but not yet populated by the server implementation

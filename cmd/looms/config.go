@@ -23,6 +23,8 @@ import (
 	"github.com/spf13/viper"
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	loomconfig "github.com/teradata-labs/loom/pkg/config"
+	"github.com/teradata-labs/loom/pkg/observability"
+	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/zalando/go-keyring"
 	"gopkg.in/yaml.v3"
 )
@@ -102,6 +104,16 @@ type Config struct {
 
 	// Embedding configures vector embeddings for hybrid semantic memory search.
 	Embedding EmbeddingConfig `mapstructure:"embedding"`
+
+	// SkipEmbeddedAgents disables auto-installation of guide, weaver, and bundled
+	// skills into the agents/skills directories on startup. Set to true for runtime
+	// pods that should only serve the explicitly configured agent(s).
+	SkipEmbeddedAgents bool `mapstructure:"skip_embedded_agents"`
+
+	// PatternsDir is the server-level directory containing pattern YAML files.
+	// Per-agent metadata["patterns_dir"] overrides this; agents fall back to
+	// $LOOM_DATA_DIR/patterns when both are empty.
+	PatternsDir string `mapstructure:"patterns_dir"`
 }
 
 // EmbeddingConfig configures the vector embedding provider for hybrid memory search.
@@ -196,15 +208,16 @@ type TUIConfig struct {
 
 // ServerConfig holds server-specific configuration.
 type ServerConfig struct {
-	Port             int                 `mapstructure:"port"`
-	Host             string              `mapstructure:"host"`
-	HTTPPort         int                 `mapstructure:"http_port"` // HTTP/REST+SSE port (default: 5006, 0=disabled)
-	EnableReflection bool                `mapstructure:"enable_reflection"`
-	InsecureAdmin    bool                `mapstructure:"insecure_admin"` // Allow admin endpoints without LOOM_ADMIN_TOKEN (default: false)
-	TLS              TLSConfig           `mapstructure:"tls"`
-	Clarification    ClarificationConfig `mapstructure:"clarification"` // Clarification question timeouts
-	CORS             CORSServerConfig    `mapstructure:"cors"`          // CORS configuration for HTTP endpoints
-	Auth             AuthConfig          `mapstructure:"auth"`          // Endpoint authentication (Supabase JWT)
+	Port              int                 `mapstructure:"port"`
+	Host              string              `mapstructure:"host"`
+	HTTPPort          int                 `mapstructure:"http_port"` // HTTP/REST+SSE port (default: 5006, 0=disabled)
+	EnableReflection  bool                `mapstructure:"enable_reflection"`
+	InsecureAdmin     bool                `mapstructure:"insecure_admin"`      // Allow admin endpoints without LOOM_ADMIN_TOKEN (default: false)
+	AllowTimeOverride bool                `mapstructure:"allow_time_override"` // Honor WeaveRequest.occurred_at for replayed/imported conversations (default: false)
+	TLS               TLSConfig           `mapstructure:"tls"`
+	Clarification     ClarificationConfig `mapstructure:"clarification"` // Clarification question timeouts
+	CORS              CORSServerConfig    `mapstructure:"cors"`          // CORS configuration for HTTP endpoints
+	Auth              AuthConfig          `mapstructure:"auth"`          // Endpoint authentication (Supabase JWT)
 }
 
 // AuthConfig gates JWT authentication of Loom's gRPC/HTTP endpoints. When
@@ -313,6 +326,19 @@ type LLMConfig struct {
 	BedrockProfile         string `mapstructure:"bedrock_profile"`
 	BedrockModelID         string `mapstructure:"bedrock_model_id"`
 
+	// SchedulerEnabled turns on the LLM slot scheduler: per-quota-scope
+	// admission where waiting is a state, not an error
+	// (docs/architecture/llm-slot-scheduler.md). Default off.
+	SchedulerEnabled bool `mapstructure:"scheduler_enabled"`
+
+	// MaxActiveConversations caps concurrently active batch conversation
+	// turns; excess queues FIFO at the door. 0 = unlimited (gate off).
+	MaxActiveConversations int `mapstructure:"max_active_conversations"`
+
+	// MaxDoorQueue caps the door queue; beyond it new batch turns are
+	// rejected with RESOURCE_EXHAUSTED. 0 = unbounded queueing.
+	MaxDoorQueue int `mapstructure:"max_door_queue"`
+
 	// Ollama-specific
 	OllamaEndpoint string `mapstructure:"ollama_endpoint"`
 	OllamaModel    string `mapstructure:"ollama_model"`
@@ -374,8 +400,10 @@ type LLMRateLimitConfig struct {
 	// Max requests per second (0 = default: 2.0).
 	RequestsPerSecond float64 `mapstructure:"requests_per_second"`
 
-	// Max tokens per minute for token-based throttling (0 = default: 40000).
-	// Match your API tier: Anthropic free=30000, Tier1=100000, Bedrock varies.
+	// Max tokens per minute. OBSERVATIONAL ONLY today: token consumption is
+	// tracked and reported in rate-limiter metrics, but this value is never
+	// enforced — only requests_per_second, burst_capacity, and min_delay_ms
+	// gate requests (0 = default: 40000, metrics baseline).
 	TokensPerMinute int64 `mapstructure:"tokens_per_minute"`
 
 	// Max burst size before queuing (0 = default: 5).
@@ -592,7 +620,7 @@ type ObservabilityConfig struct {
 	// OTel mode — exports to any OTLP HTTP backend (Opik, Jaeger, Tempo, etc.)
 	OTLPEndpoint     string            `mapstructure:"otlp_endpoint"`      // Full OTLP HTTP URL
 	OTLPHeaders      map[string]string `mapstructure:"otlp_headers"`       // e.g. Authorization: Bearer <key>
-	OTLPInsecure     bool              `mapstructure:"otlp_insecure"`      // Skip TLS (local dev only)
+	OTLPInsecure     bool              `mapstructure:"otlp_insecure"`      // Use plaintext HTTP (local dev only)
 	OTLPIncludeSpans []string          `mapstructure:"otlp_include_spans"` // Span name prefixes to export; empty = all
 }
 
@@ -709,6 +737,11 @@ type ToolsConfig struct {
 
 	// Permissions holds tool permission configuration
 	Permissions ToolPermissionsConfig `mapstructure:"permissions"`
+
+	// Hooks holds the library admission-policy bindings. Squashed so the
+	// binding list is authored at `tools.hooks` itself (the documented shape),
+	// not nested at `tools.hooks.hooks`.
+	Hooks shuttle.HooksConfig `mapstructure:",squash"`
 
 	// Executor holds tool executor configuration
 	Executor ToolExecutorConfig `mapstructure:"executor"`
@@ -1088,6 +1121,9 @@ func setDefaults() {
 	viper.SetDefault("server.host", "0.0.0.0")
 	viper.SetDefault("server.enable_reflection", true)
 	viper.SetDefault("server.insecure_admin", false)
+	viper.SetDefault("server.allow_time_override", false)
+	viper.SetDefault("skip_embedded_agents", false)
+	viper.SetDefault("patterns_dir", "")
 
 	// Clarification defaults
 	viper.SetDefault("server.clarification.rpc_timeout_seconds", 5)
@@ -1117,6 +1153,9 @@ func setDefaults() {
 
 	// LLM defaults
 	viper.SetDefault("llm.provider", "anthropic")
+	viper.SetDefault("llm.scheduler_enabled", false)
+	viper.SetDefault("llm.max_active_conversations", 0)
+	viper.SetDefault("llm.max_door_queue", 0)
 	viper.SetDefault("llm.anthropic_model", "claude-sonnet-4-5-20250929")
 	viper.SetDefault("llm.bedrock_region", "us-west-2")
 	viper.SetDefault("llm.bedrock_model_id", "us.anthropic.claude-sonnet-4-5-20250929-v1:0") // Cross-region inference profile
@@ -1649,6 +1688,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("unsupported LLM provider: %s (must be anthropic, bedrock, ollama, openai, azure-openai, mistral, gemini, huggingface, or litellm)", c.LLM.Provider)
 	}
 
+	// Door admission knobs: a negative value is a configuration error, not a
+	// silent disable (max_active_conversations) or an unbounded queue
+	// (max_door_queue). Zero keeps its documented meaning: gate off /
+	// unbounded queueing.
+	if c.LLM.MaxActiveConversations < 0 {
+		return fmt.Errorf("llm.max_active_conversations must be >= 0, got %d (0 disables the door gate)", c.LLM.MaxActiveConversations)
+	}
+	if c.LLM.MaxDoorQueue < 0 {
+		return fmt.Errorf("llm.max_door_queue must be >= 0, got %d (0 means unbounded queueing)", c.LLM.MaxDoorQueue)
+	}
+
 	// Validate storage config
 	switch c.Storage.Backend {
 	case "sqlite", "":
@@ -1714,9 +1764,11 @@ func (c *Config) Validate() error {
 			}
 			// Note: HawkAPIKey is optional - not required for local Hawk installations
 		case "otel":
-			// OTel mode: validate endpoint
-			if c.Observability.OTLPEndpoint == "" {
-				return fmt.Errorf("observability.otlp_endpoint is required when mode=otel")
+			// OTel mode: validate endpoint — also accept the platform env var
+			// injected by AgentOpsCore at deploy time (OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).
+			// cmd_serve.go will apply this override before building the tracer.
+			if c.Observability.OTLPEndpoint == "" && observability.ResolveOTLPEndpointEnv() == "" {
+				return fmt.Errorf("observability.otlp_endpoint is required when mode=otel (set otlp_endpoint, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, or LOOM_OTLP_ENDPOINT)")
 			}
 		case "none":
 			// No-op mode: no validation needed
@@ -1817,6 +1869,7 @@ server:
   host: 0.0.0.0
   enable_reflection: true
   # insecure_admin: false  # Set to true to allow admin endpoints without LOOM_ADMIN_TOKEN (NOT recommended for production)
+  # allow_time_override: false  # Set to true to honor WeaveRequest.occurred_at (replayed/imported conversations only)
 
 llm:
   # Provider options: anthropic, bedrock, ollama, openai, azure-openai, mistral

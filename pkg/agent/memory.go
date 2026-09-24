@@ -62,6 +62,7 @@ type Memory struct {
 	compressionProfile   *CompressionProfile        // Optional compression profile for new sessions (nil = use defaults)
 	compressor           MemoryCompressor           // Optional LLM compressor for L2 compaction (nil = heuristic fallback)
 	thresholdBytes       int64                      // Offload / row / page bound in bytes (0 = default; HLD §5.1)
+	offloadExemptTools   []string                   // Tool names whose current-turn results render whole (§5.2 step 6 carve-out)
 
 	// Real-time observers for cross-session updates
 	// Map of agentID -> list of observers
@@ -196,6 +197,20 @@ func (m *Memory) SetThresholdBytes(bytes int64) {
 	}
 }
 
+// SetOffloadExemptTools replaces the set of tool names whose current-turn
+// results always render whole regardless of the threshold (§5.2 step 6
+// carve-out), for existing and future sessions. An empty slice clears the set.
+func (m *Memory) SetOffloadExemptTools(names []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.offloadExemptTools = append([]string(nil), names...)
+	for _, session := range m.sessions {
+		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+			segMem.SetOffloadExemptTools(m.offloadExemptTools)
+		}
+	}
+}
+
 // thresholdOrDefault returns the configured threshold, else the default bound.
 // Never below minThreshold: this value is the persist-time row bound, and a
 // smaller one cannot hold stored = core + tail ≤ threshold (§4.1).
@@ -272,6 +287,7 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 	compProfile := m.compressionProfile
 	compressor := m.compressor
 	thresholdBytes := m.thresholdBytes
+	offloadExemptTools := append([]string(nil), m.offloadExemptTools...)
 	logger := m.logger
 	ctxDebug := m.ctxDebug
 	skillDeactivation := m.skillDeactivation
@@ -381,6 +397,9 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 	if thresholdBytes > 0 {
 		segMem.SetThreshold(thresholdBytes)
 	}
+	if len(offloadExemptTools) > 0 {
+		segMem.SetOffloadExemptTools(offloadExemptTools)
+	}
 	segMem.SetContextDebug(ctxDebug)
 	segMem.SetSkillDeactivationHook(skillDeactivation)
 	if protectedTurns > 0 {
@@ -388,13 +407,18 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 	}
 
 	session := &Session{
-		ID:              sessionID,
-		AgentID:         agentID,
+		ID:      sessionID,
+		AgentID: agentID,
+		// Ownership is stamped at creation from the authenticated context so
+		// every RPC path (Chat, Weave, StreamWeave, workflows) produces owned
+		// sessions; empty on identity-less single-tenant deployments.
+		UserID:          types.UserIDFromContext(ctx),
 		ParentSessionID: parentSessionID,
 		Messages:        []Message{},
 		Context:         make(map[string]interface{}),
 		CreatedAt:       time.Now(),
 		UpdatedAt:       time.Now(),
+		Incarnation:     time.Now().UnixNano(),
 		SegmentedMem:    segMem,
 		FailureTracker:  newConsecutiveFailureTracker(),
 	}
@@ -605,6 +629,9 @@ func (m *Memory) ensureSessionMemory(session *Session, sessionID string,
 		if m.thresholdBytes > 0 {
 			segMem.SetThreshold(m.thresholdBytes)
 		}
+		if len(m.offloadExemptTools) > 0 {
+			segMem.SetOffloadExemptTools(m.offloadExemptTools)
+		}
 		segMem.SetContextDebug(m.ctxDebug)
 		segMem.SetSkillDeactivationHook(m.skillDeactivation)
 		if m.protectedRecentTurns > 0 {
@@ -658,6 +685,14 @@ func (m *Memory) ClearAll() {
 
 	m.sessions = make(map[string]*Session)
 }
+
+// HasStore reports whether a persistent session store is configured. Every
+// Persist* method is a silent no-op returning nil without one, so a caller
+// that needs a message to be DURABLE — not merely "persisted without error" —
+// has to ask this separately. The HITL park pre-scan is the case: it may only
+// raise a durable request row for a batch that will still exist after a
+// restart.
+func (m *Memory) HasStore() bool { return m.store != nil }
 
 // PersistSession saves a session to persistent storage if configured.
 func (m *Memory) PersistSession(ctx context.Context, session *Session) error {
@@ -949,4 +984,13 @@ func (m *Memory) notifyObservers(agentID string, sessionID string, msg Message) 
 			obs.OnMessageAdded(agentID, sessionID, msg)
 		}(observer)
 	}
+}
+
+// Store returns the configured persistent session storage, or nil when the
+// memory is storeless. Read-only accessor: callers must not swap the store.
+func (m *Memory) Store() SessionStorage {
+	if m == nil {
+		return nil
+	}
+	return m.store
 }

@@ -148,6 +148,11 @@ type Message struct {
 	// "perfect place" (ROM, summary, and the last message before any current-turn
 	// offload stub); each provider client honors it.
 	CacheBreakpoint bool
+	// TaskID attributes this message to the task that was claimed when it was
+	// written. Empty is the normal case — not every turn runs under a task —
+	// and is persisted as NULL. Stamped from the ambient task attribution on
+	// the context; see pkg/task.Attribution.
+	TaskID string
 
 	// Timestamp when the message was created
 	Timestamp time.Time
@@ -275,6 +280,18 @@ type Session struct {
 	// Defaults to "default-user" for SQLite backends.
 	UserID string
 
+	// Incarnation distinguishes INCARNATIONS of a session id across its
+	// durable lifetime: a nanosecond-resolution nonce stamped once at
+	// creation and persisted verbatim, never updated. It exists because
+	// CreatedAt persists at SECOND resolution — in memory the implicit-task
+	// epoch used CreatedAt.UnixNano(), but a store round trip truncated it,
+	// so after a restart a same-second delete-and-recreate of a session id
+	// re-derived the previous incarnation's idempotency key and the new
+	// conversation's first turn was declined against the dead task's spent
+	// key. Zero means "no persisted incarnation" (a legacy row, or a
+	// backend that does not store it) and readers fall back to CreatedAt.
+	Incarnation int64
+
 	// Messages is the conversation history (flat, for backward compatibility)
 	Messages []Message
 
@@ -397,8 +414,27 @@ type HITLRequestInfo struct {
 	// Priority is the request priority (low, normal, high, critical)
 	Priority string
 
+	// Kind classifies the request at origin: "approval" (hook-held) or
+	// "question" (contact_human). Empty is treated as "question" by consumers.
+	Kind string
+
+	// Summary is the display digest of the stored request: tool+args for an
+	// approval, the question text for a question.
+	Summary string
+
+	// Params mirrors the stored request's parameter map: the held call's full
+	// parameters for an approval, empty for a question.
+	Params map[string]interface{}
+
+	// ParamsTruncated mirrors the stored request's flag: true when the size
+	// bound cut whole pairs out of Params.
+	ParamsTruncated bool
+
 	// Timeout is how long to wait for human response
 	Timeout time.Duration
+
+	// ExpiresAt is when the request expires, mirroring the stored request.
+	ExpiresAt time.Time
 
 	// Context provides additional context for the request
 	Context map[string]interface{}
@@ -424,6 +460,18 @@ type ProgressEvent struct {
 	// HITLRequest contains HITL request details (only when Stage == StageHumanInTheLoop)
 	HITLRequest *HITLRequestInfo
 
+	// Droppable marks an event whose ONLY purpose is to produce traffic — a
+	// HITL hold heartbeat. A transport under backpressure may discard it
+	// rather than block the emitting goroutine: losing one is harmless,
+	// unlike a card, a token chunk, or a tool lifecycle event, all of which
+	// carry state the consumer cannot reconstruct.
+	//
+	// This is what keeps a heartbeat from deepening the very hang it exists to
+	// prevent. A hold emits from the turn goroutine, so a blocking send on a
+	// wedged consumer stalls the poll loop that would otherwise see the human's
+	// decision. Never set this on an event carrying state.
+	Droppable bool
+
 	// Token streaming fields (for real-time LLM response rendering)
 
 	// PartialContent is the accumulated content so far during streaming
@@ -431,6 +479,12 @@ type ProgressEvent struct {
 
 	// IsTokenStream indicates if this event is a token streaming update
 	IsTokenStream bool
+
+	// IsToolInputStream indicates the provider is streaming tool-input
+	// (function-call argument) bytes. It carries no content — tool input is
+	// never rendered as partial text — and exists so a long tool-argument
+	// generation registers as activity instead of silence. Always Droppable.
+	IsToolInputStream bool
 
 	// TokenCount is the running count of tokens received
 	TokenCount int32

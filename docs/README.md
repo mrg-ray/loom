@@ -1,6 +1,6 @@
 # Loom Documentation
 
-**Version**: v1.3.0
+**Version**: v1.4.0
 
 Welcome to the Loom documentation. Loom is a Go framework for building autonomous LLM agent threads with natural language agent creation, pattern-guided learning, and multi-agent orchestration.
 
@@ -99,6 +99,9 @@ System design documentation for developers extending Loom.
 ### Design Principles
 - **[12-Factor Architecture](architecture/12-factor-architecture.md)** - Cloud-native design analysis
 
+### Design Records
+- **[Capability Leveling design record](plan-capability-leveling.md)** - Measured results and decisions
+
 [View all architecture docs →](architecture/)
 
 ---
@@ -144,6 +147,7 @@ API specifications and command documentation.
 - **[Self-Correction](reference/self-correction.md)** - Error recovery mechanisms
 - **[SQLite Guidance](reference/sqlite-guidance.md)** - Database best practices
 - **[Workflow Iterative](reference/workflow-iterative.md)** - Iterative workflow patterns
+- **[Capability Leveling](reference/workflow-leveling.md)** - Escalate failed stage output up a ladder of stronger models
 
 [View all reference docs →](reference/)
 

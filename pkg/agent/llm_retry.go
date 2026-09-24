@@ -20,20 +20,124 @@ import (
 	"time"
 
 	"github.com/teradata-labs/loom/pkg/llm"
+	"github.com/teradata-labs/loom/pkg/llm/scheduler"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	llmtypes "github.com/teradata-labs/loom/pkg/types"
 	"go.uber.org/zap"
 )
 
-// chatWithRetry wraps LLM Chat calls with exponential backoff retry logic.
-// If the provider supports streaming and a progress callback is configured,
-// it will use streaming with token buffering to emit real-time progress.
-func (a *Agent) chatWithRetry(ctx Context, messages []Message, tools []shuttle.Tool) (*LLMResponse, error) {
+// IsSyntheticWireUserRole reports whether role is a persisted Loom-internal
+// role that must be delivered to the LLM as user-turn content — the
+// skill-body sidecar, a hygiene retry injection, an empty-response retry
+// nudge, or a synthesis prompt — as opposed to the literal end user.
+// Exported so pkg/server's live-streaming gate (isNewMessageUpdateRole)
+// shares this definition instead of maintaining the same string set
+// independently.
+func IsSyntheticWireUserRole(role string) bool {
+	switch role {
+	case "skill_body", "hygiene_injection", "empty_response_retry", "synthesis_prompt":
+		return true
+	default:
+		return false
+	}
+}
+
+// normalizeWireRoles returns a copy of messages where synthetic
+// Loom-internal roles read "user". The persisted and in-memory session
+// messages are never mutated; only this local copy, built immediately
+// before the provider call, changes. Returns the input slice unchanged
+// (no allocation) when nothing needs folding — the common case, since most
+// turns carry no skill-body or hygiene-injection rows at all.
+func normalizeWireRoles(messages []Message) []Message {
+	needsFold := false
+	for _, m := range messages {
+		if IsSyntheticWireUserRole(m.Role) {
+			needsFold = true
+			break
+		}
+	}
+	if !needsFold {
+		return messages
+	}
+
+	out := make([]Message, len(messages))
+	for i, m := range messages {
+		if IsSyntheticWireUserRole(m.Role) {
+			m.Role = "user"
+		}
+		out[i] = m
+	}
+	return out
+}
+
+// chatWithRetry wraps LLM Chat calls with slot scheduling, capacity
+// observation, and exponential backoff retry logic. If the provider supports
+// streaming and a progress callback is configured, it will use streaming
+// with token buffering to emit real-time progress.
+func (a *Agent) chatWithRetry(ctx Context, messages []Message, tools []shuttle.Tool) (resp *LLMResponse, err error) {
+	// Fold synthetic Loom-internal roles to the wire "user" role before
+	// anything else sees this slice — including the debug dump below, which
+	// must capture the true wire-bound view, not the persisted role.
+	messages = normalizeWireRoles(messages)
+
 	// Debug tap: one context dump per provider call, before any dispatch branch.
 	// No-op unless the dump switch is on. Covers streaming, no-retry, and the
 	// retry loop alike since every path fans out from here.
 	a.dumpContext(ctx, messages, tools)
 
+	// Slot scheduling: every LLM call — streaming, retry, and direct alike —
+	// acquires a capacity slot here. Waiting for a slot can only end with a
+	// grant or the caller's own context expiring; it is never a scheduler
+	// timeout (docs/architecture/llm-slot-scheduler.md). A nil grant means
+	// scheduling is disabled or the turn carries no SlotInfo.
+	grant, aerr := scheduler.AcquireForCall(ctx, a.schedulerScope(), a.estimateReservation(messages))
+	if aerr != nil {
+		return nil, aerr
+	}
+	if grant != nil {
+		// Registered before the observation defer so it runs AFTER it:
+		// the outcome must be observed (throttle → ceiling halved, wake
+		// armed) before the released reservation re-dispatches waiters.
+		defer func() {
+			var actual int64
+			if resp != nil {
+				actual = int64(resp.Usage.TotalTokens)
+			}
+			grant.Release(actual)
+		}()
+	}
+	// Provider-agnostic capacity observation: every provider's calls pass
+	// through this funnel, so this one seam calibrates all scopes — with or
+	// without a grant, because an unscheduled call's 429 depletes the same
+	// shared quota (see observeSchedulerOutcome).
+	defer func() { a.observeSchedulerOutcome(err) }()
+
+	return a.dispatchChat(ctx, messages, tools)
+}
+
+// observeSchedulerOutcome feeds the slot scheduler's provider-agnostic AIMD
+// seam from one call's outcome: a clean completion grows the scope's ceiling
+// (until header calibration outranks it), a surfaced throttle — a typed
+// llm.ThrottleError from any HTTP client, or an SDK throttling message
+// (Bedrock) — halves it, at most once per congestion event. Anthropic,
+// Bedrock, OpenAI, Gemini, and Ollama scopes all calibrate through this with
+// zero per-provider wiring; Azure's response-header calibration stays in its
+// client and outranks these observations.
+func (a *Agent) observeSchedulerOutcome(err error) {
+	if !scheduler.Enabled() {
+		return
+	}
+	if err == nil {
+		scheduler.ObserveSuccessForScope(a.schedulerScope())
+		return
+	}
+	if llm.IsThrottle(err) {
+		scheduler.ObserveThrottleForScope(a.schedulerScope(), llm.RetryAfter(err))
+	}
+}
+
+// dispatchChat routes one LLM call to streaming, direct, or the retry loop.
+func (a *Agent) dispatchChat(ctx Context, messages []Message, tools []shuttle.Tool) (*LLMResponse, error) {
 	// Check if provider supports streaming and we have a progress callback
 	supportsStreaming := llmtypes.SupportsStreaming(a.llm)
 	progressCallback := ctx.ProgressCallback()
@@ -121,6 +225,11 @@ func (a *Agent) chatWithRetry(ctx Context, messages []Message, tools []shuttle.T
 		a.config.Retry.MaxRetries+1, lastErr)
 }
 
+// toolInputActivityInterval throttles the IsToolInputStream progress events
+// emitted while a provider streams tool-input deltas: liveness needs a pulse,
+// not one event per JSON fragment.
+const toolInputActivityInterval = time.Second
+
 // chatWithStreaming uses streaming API with token buffering and progress emission.
 func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shuttle.Tool, progressCallback ProgressCallback) (*LLMResponse, error) {
 	streamingProvider, ok := a.llm.(llmtypes.StreamingLLMProvider)
@@ -184,8 +293,40 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 		}
 	}
 
+	// Tool-input (function-call argument) bytes never reach tokenCallback —
+	// the callback is text only, because its tokens become the visible
+	// partial response — so a tool argument the size of a document streams
+	// for minutes with no progress event at all, and anything watching for
+	// activity (an idle-based turn deadline, a proxy inactivity timer) sees a
+	// stalled stream. Providers report those deltas through
+	// NotifyStreamActivity; emit them as a throttled, content-free progress
+	// event so they count as activity without leaking JSON into the text.
+	var lastToolInputEmit time.Time
+	streamCtx := llmtypes.WithStreamActivity(ctx, func() {
+		now := time.Now()
+		if now.Sub(lastToolInputEmit) < toolInputActivityInterval {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		lastToolInputEmit = now
+		progressCallback(ProgressEvent{
+			Stage:             StageLLMGeneration,
+			Progress:          50,
+			Message:           "Generating tool call...",
+			Timestamp:         now,
+			IsToolInputStream: true,
+			Droppable:         true,
+			TokenCount:        tokenCount,
+			TTFT:              ttft,
+		})
+	})
+
 	// Call streaming provider
-	resp, err := streamingProvider.ChatStream(ctx, messages, tools, tokenCallback)
+	resp, err := streamingProvider.ChatStream(streamCtx, messages, tools, tokenCallback)
 	if err != nil {
 		return nil, err
 	}
@@ -205,4 +346,30 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 	}
 
 	return resp, nil
+}
+
+// schedulerScope derives the quota scope of this agent's LLM provider for
+// the slot scheduler: the provider's own boundary when it exposes one,
+// otherwise name|model.
+func (a *Agent) schedulerScope() string {
+	return scheduler.ScopeFor(a.llm.Name(), a.llm.Model(), a.llm)
+}
+
+// estimateReservation mirrors reservation-accounting providers, which debit
+// prompt-estimate + max_tokens at admission: a cheap chars/4 prompt estimate
+// plus the configured completion budget.
+func (a *Agent) estimateReservation(messages []Message) int64 {
+	var chars int
+	for _, m := range messages {
+		chars += len(m.Content)
+	}
+	out := int64(a.config.ReservedOutputTokens)
+	if out <= 0 {
+		out = 4096 // provider-default max_tokens when unconfigured
+	}
+	est := int64(chars/4) + out
+	if est < 1 {
+		est = 1
+	}
+	return est
 }

@@ -23,6 +23,7 @@ import (
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"github.com/teradata-labs/loom/pkg/communication"
 	"github.com/teradata-labs/loom/pkg/fabric"
+	mcpadapter "github.com/teradata-labs/loom/pkg/mcp/adapter"
 	"github.com/teradata-labs/loom/pkg/memory"
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/patterns"
@@ -34,6 +35,7 @@ import (
 	skilltasks "github.com/teradata-labs/loom/pkg/skills/tasks"
 	"github.com/teradata-labs/loom/pkg/storage"
 	"github.com/teradata-labs/loom/pkg/task"
+	"github.com/teradata-labs/loom/pkg/taskctx"
 	"github.com/teradata-labs/loom/pkg/types"
 )
 
@@ -73,6 +75,39 @@ type Agent struct {
 	// Permission checker for tool execution
 	permissionChecker *shuttle.PermissionChecker
 
+	// Admission hook chain consulted before every tool body runs
+	admissionChain *shuttle.Chain
+
+	// hitlPark, when non-nil, enables HITL park-and-resume: a batch needing a
+	// human decision ends the turn (TurnParkedError) instead of holding it.
+	hitlPark *hitlParkConfig
+
+	// resourceAwait, when non-nil (WithResourceAwait), enables resource-await
+	// park: a successful tool result carrying AwaitResource ends the turn
+	// parked until the named resource reaches a terminal state. Requires
+	// hitlPark (the same durable-row machinery finishes the turn).
+	resourceAwait ResourceAwaitHandler
+
+	// parkedHandles holds the MCP session-handle collector of each session's
+	// parked turn, so a same-process resume adopts its handles instead of
+	// finding them released. One slot per session; guardParkedTail now
+	// admits a new turn once a park LAPSES, so a second park can overwrite the
+	// slot — abandonParkedRequest releases before closing a dead turn's row. Pooled embedders — a fresh Agent per call, where
+	// adoption can never happen — drain the slot explicitly at each park via
+	// ReleaseParkedHandles, keeping call-scoped semantics with no leak.
+	// sessionLocks serializes resumes per session inside this process, so two
+	// deliveries of one decision cannot both execute its batch.
+	sessionLocksMu sync.Mutex
+	sessionLocks   map[string]*sync.Mutex
+
+	parkedHandlesMu sync.Mutex
+	parkedHandles   map[string]*mcpadapter.HandleCollector
+
+	// Resolves the caller identity (AdmissionRequest.UserID) from the call
+	// context; injected here because pkg/shuttle cannot import the storage
+	// layer that owns the user-id context key without a cycle
+	identityResolver func(context.Context) string
+
 	// Memory manager for conversation history
 	memory *Memory
 
@@ -109,12 +144,12 @@ type Agent struct {
 	skillOrchestrator *skills.Orchestrator
 	skillDiscovery    *discovery.Discovery
 	// skillTaskEmitter materializes tasks for newly-activated skills onto
-	// the agent's task board. nil means skill activations do not emit tasks
-	// (legacy behavior).
+	// the agent's task board. nil means skill activations do not emit tasks.
+	// Driven from the manage_skills load path via Agent.emitSkillTasksAsync.
 	skillTaskEmitter *skilltasks.Emitter
-	// skillsTurnState tracks which skills were activated in the current
-	// turn so phase D can emit tasks only for the newly-activated set.
-	skillsTurnState map[string]map[string]bool // sessionID -> skillName -> activated-this-turn
+	// skillTaskEmits counts the detached emit goroutines still in flight, so
+	// they can be joined without polling. See Agent.emitSkillTasksAsync.
+	skillTaskEmits sync.WaitGroup
 
 	// End-of-turn hygiene enforcement for skill-emitted tasks. Constructed
 	// when both skillOrchestrator and taskManager are present; runs at the
@@ -130,6 +165,11 @@ type Agent struct {
 
 	// MCP client tracking for cleanup (lazy initialized)
 	mcpClients map[string]MCPClientRef
+
+	// Server-level usage guidance from MCP servers whose tools this agent
+	// registered (InitializeResult.instructions), keyed by server name.
+	// Rendered into the system prompt by mcpInstructionsPromptSupplement.
+	mcpServerInstructions map[string]string
 
 	// Dynamic tool discovery for MCP servers (lazy tool loading)
 	dynamicDiscovery *DynamicToolDiscovery
@@ -190,6 +230,13 @@ type Agent struct {
 	baseToolNames     map[string]bool
 	baseToolsOnce     sync.Once
 
+	// Per-session resource-lease ledger: the scarce backend resources each
+	// session's conversation currently holds, tracked from backend-declared
+	// lease events on tool results and mirrored onto the LLM slot scheduler's
+	// RESOURCE_HOLDER class. Self-guarded (own mutex); zero value ready.
+	// Retired with the session, like sessionToolLedger. See lease_ledger.go.
+	leases leaseLedger
+
 	// Graph-backed episodic memory (optional).
 	graphMemoryStore  memory.GraphMemoryStore
 	graphMemoryConfig *loomv1.GraphMemoryConfig
@@ -199,6 +246,15 @@ type Agent struct {
 	taskManager     *task.Manager
 	taskDecomposer  *task.Decomposer
 	taskBoardConfig *loomv1.TaskBoardConfig
+
+	// implicitTasks records a task per working turn, deterministically, without
+	// the model electing to call task_board. Nil disables implicit recording.
+	//
+	// Separate from taskBoardConfig on purpose: that flag governs whether the
+	// AGENT sees the board, this governs whether the RUNTIME records one. A
+	// board that only fills when a model remembers to ask is a board users
+	// cannot rely on.
+	implicitTasks *task.ImplicitEmitter
 
 	// Graph memory automatic extraction (mirrors finding extraction pattern).
 	enableGraphMemoryExtraction        bool
@@ -447,6 +503,16 @@ type agentContext struct {
 	session          *Session
 	tracer           observability.Tracer
 	progressCallback ProgressCallback
+
+	// taskBinding is this turn's lazily-filled task attribution slot. Nil when
+	// implicit task recording is off or no store is wired.
+	taskBinding *taskctx.Binding
+	// turnIndex is the session turn this conversation belongs to, taken from
+	// the turn the store derived for the opening user message.
+	turnIndex int64
+	// userMessage seeds an implicit task's title, so a board reads as work
+	// rather than as a numbered log.
+	userMessage string
 }
 
 func (c *agentContext) Session() *Session {
@@ -460,3 +526,12 @@ func (c *agentContext) Tracer() observability.Tracer {
 func (c *agentContext) ProgressCallback() ProgressCallback {
 	return c.progressCallback
 }
+
+// TaskBinding returns this turn's lazily-filled task attribution slot.
+func (c *agentContext) TaskBinding() *taskctx.Binding { return c.taskBinding }
+
+// TurnIndex returns the session turn this conversation belongs to.
+func (c *agentContext) TurnIndex() int64 { return c.turnIndex }
+
+// UserMessage returns the turn's opening user message.
+func (c *agentContext) UserMessage() string { return c.userMessage }

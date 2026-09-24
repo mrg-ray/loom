@@ -164,7 +164,34 @@ func hasQueryToolResultCall(m *Message) bool {
 // renderLocked applies §5.2 step 6's five render cases — first matching case
 // wins. Conversation is never stubbed; offload is a pure render condition of
 // the current turn; evicted and legacy-oversize rows render the evicted stub.
+// The offload case carves out the exempt set (SetOffloadExemptTools): an
+// exempt tool's current-turn result renders whole — exemption never reaches
+// the evicted cases, so relief and prior turns behave identically for every
+// tool.
 func (sm *SegmentedMemory) renderLocked(m *Message, t int64, callName map[string]string) Message {
+	// User turns carry their arrival time into the compiled view ONLY, so the
+	// model keeps per-turn temporal grounding ("today", "this month") while the
+	// stored, client-visible Content stays verbatim. Timestamp is write-once and
+	// persisted as Unix seconds, so every compile — including after restart —
+	// renders identical bytes: byte-stability and all cache breakpoints hold.
+	// Rendered in UTC so a server timezone change across restart cannot alter
+	// the bytes. Legacy rows without a Timestamp render unchanged.
+	//
+	// Multimodal turns need the stamp inside ContentBlocks too: providers build
+	// the request exclusively from ContentBlocks when present (agent.go), so a
+	// stamp on Content alone would never reach the model for an image turn. Stamp
+	// the leading text block (deep-copying so the stored row is untouched); if a
+	// turn somehow carries no text block, fall back to a stamp-only Content so
+	// grounding is never silently dropped.
+	if m.Role == "user" && !m.Timestamp.IsZero() {
+		stamp := "[" + m.Timestamp.UTC().Format("Mon 2006-01-02 15:04 MST") + "] "
+		r := *m
+		r.Content = stamp + m.Content
+		if len(m.ContentBlocks) > 0 {
+			r.ContentBlocks = stampLeadingTextBlock(m.ContentBlocks, stamp)
+		}
+		return r
+	}
 	if m.Role != "tool" {
 		return *m
 	}
@@ -174,6 +201,9 @@ func (sm *SegmentedMemory) renderLocked(m *Message, t int64, callName map[string
 		r.Content = sm.evictedStub(m, callName)
 		return r
 	case len(m.Content) > sm.threshold && m.Turn == t:
+		if sm.offloadExempt[callName[m.ToolUseID]] {
+			return *m
+		}
 		r := *m
 		r.Content = sm.offloadStub(m, callName)
 		return r
@@ -184,6 +214,23 @@ func (sm *SegmentedMemory) renderLocked(m *Message, t int64, callName map[string
 	default:
 		return *m
 	}
+}
+
+// stampLeadingTextBlock returns a copy of blocks with stamp prepended to the
+// first text block, so the arrival stamp reaches multimodal providers (which
+// build the request from ContentBlocks). The input slice and its blocks are
+// never mutated — only the compiled view is stamped. If no text block exists,
+// blocks are returned unchanged; renderLocked's stamped Content is the fallback.
+func stampLeadingTextBlock(blocks []ContentBlock, stamp string) []ContentBlock {
+	for i := range blocks {
+		if blocks[i].Type == "text" {
+			out := make([]ContentBlock, len(blocks))
+			copy(out, blocks)
+			out[i].Text = stamp + out[i].Text
+			return out
+		}
+	}
+	return blocks
 }
 
 // offloadStub renders the §5.5 offload stub for a current-turn result strictly
