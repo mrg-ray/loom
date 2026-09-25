@@ -20,6 +20,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -136,7 +137,13 @@ func startEmbeddedServer(port int, llmProvider, llmAPIKey, llmModel string, temp
 	tracer := observability.NewNoOpTracer()
 
 	// Create temporary session store
-	dbPath := fmt.Sprintf("/tmp/loom-standalone-%d.db", time.Now().Unix())
+	// Session store path from the environment, defaulting inside the OS temp dir
+	// rather than a hardcoded absolute /tmp (which is not writable everywhere and
+	// is not where a non-Unix host puts scratch files).
+	dbPath := os.Getenv("LOOM_STANDALONE_DB_PATH")
+	if dbPath == "" {
+		dbPath = filepath.Join(os.TempDir(), fmt.Sprintf("loom-standalone-%d.db", time.Now().Unix()))
+	}
 	store, err := agent.NewSessionStore(dbPath, tracer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session store: %w", err)

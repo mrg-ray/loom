@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -45,6 +46,15 @@ var rootCmd = &cobra.Command{
 	Long:    `Loom Terminal UI - Chat with your Loom agent threads via gRPC. Provides interactive chat with session management, streaming, and real-time cost tracking.`,
 	Version: version.Get(),
 	Run:     runChat,
+}
+
+// cliDebugLogPath is the TUI's debug log. From the environment when set, otherwise
+// inside the OS temp dir — not a hardcoded absolute /tmp path.
+func cliDebugLogPath() string {
+	if p := os.Getenv("LOOM_CLI_DEBUG_LOG"); p != "" {
+		return p
+	}
+	return filepath.Join(os.TempDir(), "loom-cli-debug.log")
 }
 
 func init() {
@@ -127,7 +137,7 @@ func runChat(cmd *cobra.Command, args []string) {
 	}
 
 	// Debug: Log the agent ID being set
-	if f, err := os.OpenFile("/tmp/loom-cli-debug.log", os.O_APPEND|os.O_WRONLY, 0600); err == nil {
+	if f, err := os.OpenFile(cliDebugLogPath(), os.O_APPEND|os.O_WRONLY, 0600); err == nil {
 		_, _ = fmt.Fprintf(f, "Setting agentID on application: '%s' (serverAvailable=%v)\n", agentID, serverAvailable)
 		_ = f.Close()
 	}
@@ -148,7 +158,7 @@ func runChat(cmd *cobra.Command, args []string) {
 	application.SetAgentID(agentID)
 
 	// Debug: Verify it was set
-	if f, err := os.OpenFile("/tmp/loom-cli-debug.log", os.O_APPEND|os.O_WRONLY, 0600); err == nil {
+	if f, err := os.OpenFile(cliDebugLogPath(), os.O_APPEND|os.O_WRONLY, 0600); err == nil {
 		_, _ = fmt.Fprintf(f, "Agent ID set on application\n")
 		_ = f.Close()
 	}
