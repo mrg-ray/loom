@@ -81,6 +81,9 @@ cols = [d[0] for d in cur.description] if cur.description else []
 rows = cur.fetchmany(limit)
 print(json.dumps({"cols": cols, "rows": [[None if v is None else str(v) for v in r] for r in rows]}))
 `
+	// #nosec G204 -- argv is a constant script plus the operator-configured
+	// database paths this backend was built with; the query is never an
+	// argument, it travels on stdin.
 	cmd := exec.CommandContext(ctx, "python3", "-c", script, strings.Join(b.paths, ","), fmt.Sprint(maxRows))
 	cmd.Stdin = strings.NewReader(query)
 	out, err := cmd.Output()
