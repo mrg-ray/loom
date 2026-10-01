@@ -296,7 +296,7 @@ Schema Request → Check Cache
 
 **Content**: Recent messages, verbatim.
 
-**Size**: Uncapped. L1 is not bounded by a message count or by an L1 token ceiling — it grows until overall token budget pressure triggers compaction, and shrinks by whole batches when it does. The floor is `protectedRecentTurns`, the recency floor that compaction will not compress below (`minL1Messages` is a vestigial parsed field that drives nothing).
+**Size**: Uncapped. L1 is not bounded by a message count or by an L1 token ceiling — it grows until overall token budget pressure triggers compaction, and shrinks by whole batches when it does. The floor is `protectedRecentTurns`, the recency window relief will not compress below; `minL1Messages` is a per-profile figure that gates nothing.
 
 **Eviction Policy**: FIFO (First-In-First-Out) to L2, driven by budget pressure
 

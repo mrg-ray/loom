@@ -16,6 +16,7 @@ package manager
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +43,22 @@ func TestNewManager(t *testing.T) {
 	assert.NotNil(t, mgr.logger)
 	assert.NotNil(t, mgr.clients)
 	assert.False(t, mgr.started)
+}
+
+func TestManager_AddServerDoesNotExpandEnvironment(t *testing.T) {
+	t.Setenv("MCP_TEST_URL", "http://127.0.0.1:1")
+	manager, err := NewManager(Config{
+		ClientInfo: ClientInfo{Name: "test-client", Version: "1.0.0"},
+	}, zap.NewNop())
+	require.NoError(t, err)
+	err = manager.AddServer(context.Background(), "remote", ServerConfig{
+		Enabled:   true,
+		Transport: "streamable-http",
+		URL:       "${MCP_TEST_URL}",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "MCP_TEST_URL")
+	assert.NotContains(t, err.Error(), "127.0.0.1:1")
 }
 
 func TestNewManager_InvalidConfig(t *testing.T) {
@@ -166,6 +183,8 @@ func TestManager_GetClient_NonExistent(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, client)
 	assert.Contains(t, err.Error(), "server not found")
+	assert.ErrorIs(t, err, ErrServerNotFound,
+		"GetClient must wrap the sentinel so callers can errors.Is it (issue #334)")
 }
 
 func TestManager_GetServerConfig(t *testing.T) {
@@ -197,6 +216,51 @@ func TestManager_GetServerConfig(t *testing.T) {
 	_, err = mgr.GetServerConfig("nonexistent")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "server not found")
+}
+
+// TestManager_GetServerConfig_ConcurrentWithAddRemove is a -race regression:
+// GetServerConfig used to read m.config.Servers without holding m.mu while
+// AddServer/RemoveServer mutate the map under the write lock.
+func TestManager_GetServerConfig_ConcurrentWithAddRemove(t *testing.T) {
+	mgr, err := NewManager(Config{
+		Servers:    map[string]ServerConfig{},
+		ClientInfo: ClientInfo{Name: "test", Version: "0.1.0"},
+	}, zap.NewNop())
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	// A disabled server is never started, so AddServer only mutates the
+	// config map — exactly the write the unlocked read raced with.
+	cfg := ServerConfig{Enabled: false, Transport: "stdio", Command: "echo"}
+
+	const iterations = 500
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = mgr.AddServer(ctx, "racer", cfg)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = mgr.RemoveServer("racer")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			// Both outcomes are valid mid-race; the assertion is the race
+			// detector staying quiet.
+			if config, err := mgr.GetServerConfig("racer"); err == nil {
+				assert.False(t, config.Enabled)
+			}
+		}
+	}()
+
+	wg.Wait()
 }
 
 func TestManager_Stop_NotStarted(t *testing.T) {
@@ -444,4 +508,17 @@ func TestManager_Integration_MultipleServers(t *testing.T) {
 	health := mgr.HealthCheck(ctx)
 	assert.True(t, health["fs1"])
 	assert.True(t, health["fs2"])
+}
+
+func TestUnresolvedEnvVariables(t *testing.T) {
+	t.Setenv("MCP_SET", "configured")
+	missing := unresolvedEnvVariables(
+		"${MCP_ENDPOINT_MISSING}",
+		map[string]string{
+			"Authorization": "Bearer ${MCP_TOKEN_MISSING}",
+			"X-Configured":  "${MCP_SET}",
+			"X-Duplicate":   "${MCP_ENDPOINT_MISSING}",
+		},
+	)
+	assert.Equal(t, []string{"MCP_ENDPOINT_MISSING", "MCP_TOKEN_MISSING"}, missing)
 }

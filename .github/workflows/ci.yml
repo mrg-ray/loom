@@ -12,6 +12,12 @@ permissions:
   checks: write
   security-events: write  # Required for SARIF upload to code scanning
 
+env:
+  # Authenticates buf's BSR traffic (module downloads and remote plugin
+  # execution) when the BUF_TOKEN repository secret exists; empty is ignored
+  # by buf and requests stay anonymous (rate-limited).
+  BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+
 jobs:
   # ============================================================================
   # Job 1: Proto Linting & Breaking Change Detection
@@ -25,6 +31,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0  # Fetch all history for breaking change detection
+
+      - name: Cache buf modules
+        uses: ./.github/actions/buf-cache
 
       - name: Setup Buf
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
@@ -77,6 +86,9 @@ jobs:
           go-version: '1.26'
           cache: true
 
+      - name: Cache buf modules
+        uses: ./.github/actions/buf-cache
+
       - name: Setup Buf
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
@@ -112,6 +124,24 @@ jobs:
     strategy:
       matrix:
         go-version: ['1.26']
+    services:
+      # The postgres storage backend is a deployed configuration; its store
+      # behavior (HITL resolve CAS, tenant scoping, ExpireRequest) must be
+      # asserted against a real postgres, not compile-checked. Tests gate on
+      # TEST_POSTGRES_URL and skip when it is unset (local runs without one).
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: loom
+          POSTGRES_PASSWORD: loom_ci
+          POSTGRES_DB: loom_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U loom"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -121,6 +151,9 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
           cache: true
+
+      - name: Cache buf modules
+        uses: ./.github/actions/buf-cache
 
       - name: Setup Buf
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
@@ -152,13 +185,19 @@ jobs:
           done || true
 
       - name: Run tests with race detection
+        env:
+          # Points the postgres-backed store tests at the service container;
+          # they skip when this is unset.
+          TEST_POSTGRES_URL: postgres://loom:loom_ci@localhost:5432/loom_test?sslmode=disable
         run: |
           # pipefail so a non-zero `go test` exit is not masked by `tee`.
+          # ./cmd/... is in the gate: the CLI is the standalone respond door,
+          # and a test that does not gate is not coverage.
           set -euo pipefail
           go test -tags fts5 -race -v -timeout=10m \
             -coverprofile=coverage.out \
             -covermode=atomic \
-            ./pkg/... ./internal/... \
+            ./pkg/... ./internal/... ./cmd/... \
             | tee test-output.log
 
       - name: Run example tests
@@ -192,7 +231,7 @@ jobs:
 
       - name: Upload coverage
         if: matrix.go-version == '1.26'
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v5
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v5
         with:
           files: ./coverage.out
           flags: unittests
@@ -215,6 +254,28 @@ jobs:
   # Job 4: Fuzz Tests (OSSF Scorecard Compliance)
   # Failures fail the job (no swallowed exit codes).
   # ============================================================================
+  mcp-interop:
+    name: MCP SDK Interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26'
+          cache: true
+
+      # The official MCP Go SDK runs as the counterpart peer in both
+      # directions (SDK client vs Loom server, Loom client vs SDK server) —
+      # the continuous check that pkg/mcp tracks the specification rather
+      # than our reading of it. It already caught two conformance bugs
+      # (unstamped discover probe; supportedVersions field drift).
+      - name: Run MCP interop suite
+        run: go test -tags "fts5 interop" -race -run Interop ./pkg/mcp/conformance/
+
   fuzz:
     name: Fuzz Tests
     runs-on: ubuntu-latest
@@ -228,6 +289,9 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
+
+      - name: Cache buf modules
+        uses: ./.github/actions/buf-cache
 
       - name: Setup Buf
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
@@ -308,6 +372,9 @@ jobs:
           go-version: ${{ matrix.go-version }}
           cache: true
 
+      - name: Cache buf modules
+        uses: ./.github/actions/buf-cache
+
       - name: Setup Buf
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
@@ -366,7 +433,33 @@ jobs:
           path: bin/
 
   # ============================================================================
-  # Job 6: Security Scan
+  # Job 6: Runtime Image Build
+  # ============================================================================
+  runtime-image:
+    name: Runtime Image Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build runtime image for supported platforms
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="$(cat VERSION)" \
+            --output type=oci,dest=/tmp/loom-runtime.tar \
+            -f docker/Dockerfile.runtime \
+            .
+
+  # ============================================================================
+  # Job 7: Security Scan
   # ============================================================================
   security:
     name: Security Scan
@@ -382,6 +475,9 @@ jobs:
           go-version: '1.26'
           cache: true
 
+      - name: Cache buf modules
+        uses: ./.github/actions/buf-cache
+
       - name: Setup Buf
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
@@ -394,7 +490,7 @@ jobs:
         run: go run ./cmd/generate-weaver
 
       - name: Run Gosec Security Scanner
-        uses: securego/gosec@9e75c0576c9878035d4221392108d458abe10fc3 # v2.28.0
+        uses: securego/gosec@deb54465fea23d19a77f037e11e6589021f8501d # v2.29.0
         with:
           args: '-no-fail -fmt sarif -out results.sarif -exclude-dir=gen ./...'
 
@@ -407,7 +503,7 @@ jobs:
           mv results-fixed.sarif results.sarif
 
       - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         continue-on-error: true  # Don't fail the build if code scanning is not enabled
         with:
           sarif_file: results.sarif

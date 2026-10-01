@@ -22,6 +22,7 @@ package catalog
 
 import (
 	"context"
+	"strings"
 
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 )
@@ -40,31 +41,6 @@ func BuildCatalog() map[string][]*loomv1.ModelInfo {
 		// Verified against https://platform.claude.com/docs/en/docs/about-claude/models/overview
 		// on 2026-04-22. Deprecated Sonnet 4 / Opus 4 (20250514) intentionally omitted.
 		"anthropic": {
-			{
-				// Claude Opus 5. Adaptive thinking. $5/$25 like the 4.x Opus line.
-				Id:                  "claude-opus-5",
-				Name:                "Claude Opus 5",
-				Provider:            "anthropic",
-				Capabilities:        []string{"text", "vision", "tool-use", "thinking"},
-				ContextWindow:       1_000_000,
-				MaxOutputTokens:     128_000,
-				CostPer_1MInputUsd:  5.0,
-				CostPer_1MOutputUsd: 25.0,
-				IsReasoning:         true,
-				ShowInDropdown:      true,
-			},
-			{
-				Id:                  "claude-sonnet-5",
-				Name:                "Claude Sonnet 5",
-				Provider:            "anthropic",
-				Capabilities:        []string{"text", "vision", "tool-use", "thinking"},
-				ContextWindow:       1_000_000,
-				MaxOutputTokens:     64_000,
-				CostPer_1MInputUsd:  3.0,
-				CostPer_1MOutputUsd: 15.0,
-				IsReasoning:         true,
-				ShowInDropdown:      true,
-			},
 			{
 				// Current flagship. Uses adaptive thinking (not extended thinking).
 				Id:                  "claude-opus-4-7",
@@ -763,151 +739,6 @@ func BuildCatalog() map[string][]*loomv1.ModelInfo {
 		// Both us.* (regional) and global.* (dynamic routing) forms are listed where
 		// applicable so ProviderFactory.normalizeModelID only needs to strip prefixes.
 		"bedrock": {
-			// Non-Anthropic families served through Converse. Rates are the
-			// published us-west-2 on-demand card (AWS Price List, Aug 2026);
-			// none of them offer prompt caching on Bedrock, so cache lanes stay
-			// zero and the whole prompt volume prices as plain input.
-			{
-				Id:                  "zai.glm-5",
-				Name:                "GLM-5 (Bedrock)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "tool-use"},
-				ContextWindow:       200_000,
-				MaxOutputTokens:     96_000,
-				CostPer_1MInputUsd:  1.0,
-				CostPer_1MOutputUsd: 3.2,
-				ShowInDropdown:      false,
-			},
-			{
-				Id:                  "zai.glm-4.7",
-				Name:                "GLM-4.7 (Bedrock)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "tool-use"},
-				ContextWindow:       200_000,
-				MaxOutputTokens:     96_000,
-				CostPer_1MInputUsd:  0.6,
-				CostPer_1MOutputUsd: 2.2,
-				ShowInDropdown:      false,
-			},
-			{
-				Id:                  "zai.glm-4.7-flash",
-				Name:                "GLM-4.7 Flash (Bedrock)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "tool-use"},
-				ContextWindow:       200_000,
-				MaxOutputTokens:     96_000,
-				CostPer_1MInputUsd:  0.07,
-				CostPer_1MOutputUsd: 0.4,
-				ShowInDropdown:      false,
-			},
-			{
-				Id:                  "deepseek.v3.2",
-				Name:                "DeepSeek V3.2 (Bedrock)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "tool-use"},
-				ContextWindow:       128_000,
-				MaxOutputTokens:     32_000,
-				CostPer_1MInputUsd:  0.62,
-				CostPer_1MOutputUsd: 1.85,
-				ShowInDropdown:      false,
-			},
-			{
-				Id:                  "deepseek.v3-v1:0",
-				Name:                "DeepSeek V3.1 (Bedrock)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "tool-use"},
-				ContextWindow:       128_000,
-				MaxOutputTokens:     32_000,
-				CostPer_1MInputUsd:  0.58,
-				CostPer_1MOutputUsd: 1.68,
-				ShowInDropdown:      false,
-			},
-			{
-				Id:                  "us.deepseek.r1-v1:0",
-				Name:                "DeepSeek R1 (Bedrock)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "thinking"},
-				ContextWindow:       128_000,
-				MaxOutputTokens:     32_000,
-				CostPer_1MInputUsd:  1.35,
-				CostPer_1MOutputUsd: 5.4,
-				IsReasoning:         true,
-				ShowInDropdown:      false,
-			},
-			{
-				// Rates confirmed from the Bedrock agreement offer card:
-				// $10/M in, $50/M out — exactly 2x Opus 5.
-				Id:                  "us.anthropic.claude-fable-5",
-				Name:                "Claude Fable 5 (Bedrock)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "vision", "tool-use", "thinking"},
-				ContextWindow:       1_000_000,
-				MaxOutputTokens:     128_000,
-				CostPer_1MInputUsd:  10.0,
-				CostPer_1MOutputUsd: 50.0,
-				IsReasoning:         true,
-				ShowInDropdown:      false,
-			},
-			{
-				Id:                  "global.anthropic.claude-fable-5",
-				Name:                "Claude Fable 5 (Bedrock global)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "vision", "tool-use", "thinking"},
-				ContextWindow:       1_000_000,
-				MaxOutputTokens:     128_000,
-				CostPer_1MInputUsd:  10.0,
-				CostPer_1MOutputUsd: 50.0,
-				IsReasoning:         true,
-				ShowInDropdown:      false,
-			},
-			{
-				Id:                  "us.anthropic.claude-opus-5",
-				Name:                "Claude Opus 5 (Bedrock)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "vision", "tool-use", "thinking"},
-				ContextWindow:       1_000_000,
-				MaxOutputTokens:     128_000,
-				CostPer_1MInputUsd:  5.0,
-				CostPer_1MOutputUsd: 25.0,
-				IsReasoning:         true,
-				ShowInDropdown:      false,
-			},
-			{
-				Id:                  "global.anthropic.claude-opus-5",
-				Name:                "Claude Opus 5 (Bedrock global)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "vision", "tool-use", "thinking"},
-				ContextWindow:       1_000_000,
-				MaxOutputTokens:     128_000,
-				CostPer_1MInputUsd:  5.0,
-				CostPer_1MOutputUsd: 25.0,
-				IsReasoning:         true,
-				ShowInDropdown:      false,
-			},
-			{
-				Id:                  "us.anthropic.claude-sonnet-5",
-				Name:                "Claude Sonnet 5 (Bedrock)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "vision", "tool-use", "thinking"},
-				ContextWindow:       1_000_000,
-				MaxOutputTokens:     128_000,
-				CostPer_1MInputUsd:  3.0,
-				CostPer_1MOutputUsd: 15.0,
-				IsReasoning:         true,
-				ShowInDropdown:      false,
-			},
-			{
-				Id:                  "global.anthropic.claude-sonnet-5",
-				Name:                "Claude Sonnet 5 (Bedrock global)",
-				Provider:            "bedrock",
-				Capabilities:        []string{"text", "vision", "tool-use", "thinking"},
-				ContextWindow:       1_000_000,
-				MaxOutputTokens:     128_000,
-				CostPer_1MInputUsd:  3.0,
-				CostPer_1MOutputUsd: 15.0,
-				IsReasoning:         true,
-				ShowInDropdown:      false,
-			},
 			{
 				Id:                  "us.anthropic.claude-opus-4-7-v1:0",
 				Name:                "Claude Opus 4.7 (Bedrock)",
@@ -1116,6 +947,28 @@ func NormalizeProvider(provider string) string {
 	return provider
 }
 
+// BaseModelID strips a trailing ":tag" qualifier from a model ID, returning the
+// bare model name. Ollama identifies installed models as "name:tag"
+// ("llama3.1:latest", "qwen3:30b") while the catalog keys Ollama entries on the
+// bare name, so the two inventories disagree on spelling for the same model.
+//
+// Only the last colon is considered, and only when no "/" follows it, because a
+// colon before a path separator is a registry port rather than a tag separator
+// ("localhost:5000/library/llama3" has no tag). An ID with no tag, or one
+// beginning with a colon, is returned unchanged.
+//
+// The result is a substring of the input, so this allocates nothing.
+func BaseModelID(modelID string) string {
+	i := strings.LastIndexByte(modelID, ':')
+	if i <= 0 {
+		return modelID
+	}
+	if strings.IndexByte(modelID[i:], '/') >= 0 {
+		return modelID
+	}
+	return modelID[:i]
+}
+
 // Lookup returns the ModelInfo for a given provider + model ID, or nil when
 // the pair is not in the currently registered default source. This is the
 // package-level convenience form; it delegates to DefaultSource().Lookup with
@@ -1130,8 +983,39 @@ func NormalizeProvider(provider string) string {
 //	    catalog.StaticSource(),
 //	})
 //
-// This is an exact-match lookup at each source; callers that need prefix or
-// version-suffix matching must handle that above.
+// Each Source performs an exact-match lookup. Lookup adds exactly one fallback
+// on top of that: when the exact ID is not found anywhere in the registered
+// source and the ID carries a ":tag" qualifier, the whole source is consulted a
+// second time with BaseModelID(modelID). An exact match therefore always wins
+// over a tag-stripped one — including an exact match in a later chain entry.
+//
+// The full compatibility contract of that fallback, stated in both directions:
+//
+//   - Lookups that already succeed are unchanged. The fallback runs only after a
+//     nil return, so it can never override or reorder a hit.
+//   - Lookups that previously FAILED may now succeed. That is a behavior change,
+//     not a no-op: a tagged ID such as "llama3.1:latest" used to return nil and
+//     send its callers to their own fallbacks, and now returns the catalog entry
+//     for "llama3.1". Callers that branch on a nil ModelInfo therefore take a
+//     different branch than before for tagged IDs — including the context-limit
+//     and output-reservation paths (agent.ResolveContextLimits,
+//     agent.EffectiveOutputReservation) and the factory's per-request output cap
+//     (ProviderFactory.resolveMaxOutput), which now use the catalog's
+//     ContextWindow / MaxOutputTokens for tagged IDs instead of the legacy
+//     prefix table, provider defaults, or fallbackMaxOutputTokens. Reservations
+//     for tagged models can grow or shrink accordingly.
+//
+// Both passes go through the same Source value so a concurrent Register cannot
+// split them across two different catalogs. Callers needing any other relaxation
+// (prefix or version-suffix matching) must still handle it above this call.
 func Lookup(provider, modelID string) *loomv1.ModelInfo {
-	return DefaultSource().Lookup(context.Background(), provider, modelID)
+	src := DefaultSource()
+	ctx := context.Background()
+	if info := src.Lookup(ctx, provider, modelID); info != nil {
+		return info
+	}
+	if base := BaseModelID(modelID); base != modelID {
+		return src.Lookup(ctx, provider, base)
+	}
+	return nil
 }

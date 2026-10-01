@@ -141,6 +141,32 @@ func (u ChatCompletionUsage) CacheRead() int {
 	return 0
 }
 
+// UncachedPromptTokens returns the prompt tokens that were neither read from
+// nor written to the prompt cache. OpenAI-compatible prompt_tokens INCLUDES
+// both cache buckets (OpenAI's cached_tokens, and litellm's Anthropic-shaped
+// cache_read/cache_creation fields); loom's Usage.InputTokens excludes them,
+// matching Anthropic and Bedrock, so this is what InputTokens must carry.
+// Clamped at zero for a gateway that reports the buckets outside prompt_tokens.
+func (u ChatCompletionUsage) UncachedPromptTokens() int {
+	return max(0, u.PromptTokens-u.CacheRead()-u.CacheCreationInputTokens)
+}
+
+// UncachedTotalTokens is total_tokens with the same cache buckets removed, so
+// Usage.TotalTokens = InputTokens + OutputTokens as on Anthropic and Bedrock.
+func (u ChatCompletionUsage) UncachedTotalTokens() int {
+	return max(0, u.TotalTokens-(u.PromptTokens-u.UncachedPromptTokens()))
+}
+
+// MeteredTokens is what OpenAI-style TPM limits count for the call: the raw,
+// cache-inclusive total_tokens (prompt_tokens + completion_tokens when a
+// gateway omits total_tokens). Carried as Usage.RateLimitTokens.
+func (u ChatCompletionUsage) MeteredTokens() int {
+	if u.TotalTokens > 0 {
+		return u.TotalTokens
+	}
+	return u.PromptTokens + u.CompletionTokens
+}
+
 // OpenAIError represents an error from the OpenAI API.
 type OpenAIError struct {
 	Message string      `json:"message"`

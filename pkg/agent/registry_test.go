@@ -118,6 +118,23 @@ func TestNewRegistry(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestRegistry_CreateLLMProvider_LiteLLM(t *testing.T) {
+	registry, _ := createTestRegistry(t)
+	t.Setenv("LITELLM_ENDPOINT", "http://litellm.example/v1/chat/completions")
+	t.Setenv("LITELLM_API_KEY", "test-key")
+
+	provider, err := registry.createLLMProvider(&loomv1.LLMConfig{
+		Provider:  "litellm",
+		Model:     "openai/test-model",
+		MaxTokens: 2048,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, provider)
+	assert.Equal(t, "litellm", provider.Name())
+	assert.Equal(t, "openai/test-model", provider.Model())
+}
+
 func TestRegistry_LoadAgents(t *testing.T) {
 	registry, tmpDir := createTestRegistry(t)
 	ctx := context.Background()
@@ -1175,7 +1192,7 @@ func TestToolFiltering_NoToolsSection(t *testing.T) {
 	// load_pattern (pattern library always configured) plus query_tool_result
 	// and recall (registered always — HLD §6/§7.1). No shell_execute, no other
 	// builtins, and workspace registers only with an artifact store.
-	assert.ElementsMatch(t, []string{"load_pattern", "query_tool_result", "recall", "task_list"}, registeredTools,
+	assert.ElementsMatch(t, []string{"load_pattern", "query_tool_result", "recall"}, registeredTools,
 		"Expected only the base verbs with no tools section and no artifact store")
 
 	// Verify no unexpected tools

@@ -347,7 +347,7 @@ func TestFileWriteTool_BatchPartialFailure(t *testing.T) {
 }
 
 // Single-file form defaults to overwrite: writing an existing path succeeds.
-func TestFileWriteTool_DefaultOverwrite(t *testing.T) {
+func TestFileWriteTool_DefaultCreateRefusesExisting(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.txt")
 	if err := os.WriteFile(path, []byte("old"), 0600); err != nil {
@@ -357,11 +357,14 @@ func TestFileWriteTool_DefaultOverwrite(t *testing.T) {
 	res, err := tool.Execute(context.Background(), map[string]interface{}{
 		"path": "f.txt", "content": "new",
 	})
-	if err != nil || !res.Success {
-		t.Fatalf("overwrite-by-default failed: %v %+v", err, res)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if res.Success {
+		t.Fatalf("default mode must refuse an existing file; got success %+v", res)
 	}
 	got, _ := os.ReadFile(path)
-	if string(got) != "new" {
-		t.Fatalf("content = %q, want new", got)
+	if string(got) != "old" {
+		t.Fatalf("content = %q, want the original untouched", got)
 	}
 }

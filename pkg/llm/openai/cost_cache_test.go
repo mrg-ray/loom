@@ -73,73 +73,40 @@ func TestProviderCostHeaderWins(t *testing.T) {
 	}
 }
 
-// Genuine-OpenAI cached reads bill at OpenAI's tiers, not Anthropic's: 0.5x on
-// cached input and NO write premium. The regression this pins: a single
-// Anthropic-shaped multiplier (0.10x read) under-charged real gpt-4o cached
-// reads 5x.
-func TestCalculateCost_OpenAIFamilyUsesOpenAICacheTiers(t *testing.T) {
-	c := &Client{model: "gpt-4o"}
+// OpenAI and Anthropic bill cached input differently, so the multipliers follow
+// the rate card rather than being fixed. A genuine gpt-4o reporting
+// cached_tokens must bill those at 0.5x — charging Anthropic's 0.10x would
+// undercharge the cached portion five-fold, and the direct-OpenAI and streaming
+// paths have no gateway cost header to mask it.
+func TestCalculateCost_CacheMultipliersFollowTheRateCard(t *testing.T) {
 	const (
-		promptTokens = 100_000 // includes the cached bucket below
+		promptTokens = 100_000 // inclusive of the cache buckets below
 		cacheRead    = 80_000
+		cacheWrite   = 10_000
 		output       = 1_000
 	)
-	got := c.calculateCost(promptTokens, output, cacheRead, 0)
 
-	// 20k uncached @ $2.50/M + 80k cached @ 0.5x ($1.25/M) + 1k out @ $10/M.
-	want := (20_000*2.50 + 80_000*2.50*0.5 + 1_000*10.00) / 1e6
-	if math.Abs(got-want) > 1e-9 {
-		t.Fatalf("openai cache cost = %.6f, want %.6f (0.5x read, no write premium)", got, want)
-	}
-	// The Anthropic-shaped 0.10x read would be visibly cheaper — pin the gap.
-	if wrong := (20_000*2.50 + 80_000*2.50*0.10 + 1_000*10.00) / 1e6; got <= wrong {
-		t.Fatalf("cost %.6f still at the Anthropic 0.10x read tier (%.6f)", got, wrong)
-	}
-}
-
-// OpenAI's cached-input discount is generational: 90% off from gpt-5/o-series
-// onward, 50% off on gpt-4. Since agentic runs read cache for ~90% of all input,
-// pricing a gpt-5 model at the gpt-4 tier overstates a run roughly four-fold —
-// enough to invert a cheaper-model comparison.
-func TestCalculateCost_GPT5FamilyGetsNinetyPercentCacheDiscount(t *testing.T) {
-	const (
-		promptTokens = 100_000 // includes the cached bucket below
-		cacheRead    = 90_000
-		output       = 2_000
-	)
-	for _, tc := range []struct {
-		model    string
-		in, out  float64
-		readMult float64
-	}{
-		{"gpt-5", 1.25, 10.00, 0.10},
-		{"gpt-5.4", 2.50, 15.00, 0.10},
-		{"gpt-5.4-mini", 0.75, 4.50, 0.10},
-		{"o3", 0, 0, 0.10},    // rate from the catalog; only the tier is pinned here
-		{"gpt-4o", 2.50, 10.00, 0.50},
-	} {
-		if got := openAICacheReadMultiplier(tc.model); got != tc.readMult {
-			t.Fatalf("%s: cache read multiplier = %v, want %v", tc.model, got, tc.readMult)
-		}
-		if tc.in == 0 {
-			continue
-		}
-		got := (&Client{model: tc.model}).calculateCost(promptTokens, output, cacheRead, 0)
-		want := (10_000*tc.in + 90_000*tc.in*tc.readMult + 2_000*tc.out) / 1e6
+	t.Run("openai bills cached reads at 0.5x with no write premium", func(t *testing.T) {
+		c := &Client{model: "gpt-4o"}
+		got := c.calculateCost(promptTokens, output, cacheRead, cacheWrite)
+		want := (10_000*2.50 + 10_000*2.50*1.0 + 80_000*2.50*0.5 + 1_000*10.00) / 1e6
 		if math.Abs(got-want) > 1e-9 {
-			t.Fatalf("%s: cost = %.6f, want %.6f", tc.model, got, want)
+			t.Fatalf("gpt-4o cost = %.6f, want %.6f", got, want)
 		}
-	}
-}
+		// Anthropic's read multiplier here would undercharge by 5x on the cached
+		// portion — the regression this pins.
+		anthropicMult := (10_000*2.50 + 10_000*2.50*1.25 + 80_000*2.50*0.10 + 1_000*10.00) / 1e6
+		if math.Abs(got-anthropicMult) < 1e-9 {
+			t.Fatal("gpt-4o priced with Anthropic cache multipliers")
+		}
+	})
 
-// A garbage litellm cost header ("Inf"/"NaN") parses in ParseFloat and +Inf is
-// not < 0 — both must fall back to the estimate, never poison CostUSD.
-func TestParseProviderCost_RejectsInfAndNaN(t *testing.T) {
-	for _, v := range []string{"Inf", "+Inf", "-Inf", "NaN"} {
-		h := http.Header{}
-		h.Set(providerCostHeader, v)
-		if got := parseProviderCost(h); got != 0 {
-			t.Fatalf("header %q parsed to %v, want 0 (fallback)", v, got)
+	t.Run("claude keeps 1.25x writes and 0.10x reads", func(t *testing.T) {
+		c := &Client{model: "coding-agent/claude-sonnet-4-6"}
+		got := c.calculateCost(promptTokens, output, cacheRead, cacheWrite)
+		want := (10_000*3.00 + 10_000*3.00*1.25 + 80_000*3.00*0.10 + 1_000*15.00) / 1e6
+		if math.Abs(got-want) > 1e-9 {
+			t.Fatalf("claude cost = %.6f, want %.6f", got, want)
 		}
-	}
+	})
 }

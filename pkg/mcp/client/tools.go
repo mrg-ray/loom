@@ -20,6 +20,8 @@ import (
 	"fmt"
 
 	"github.com/teradata-labs/loom/pkg/mcp/protocol"
+	"github.com/teradata-labs/loom/pkg/mcp/transport"
+	"go.uber.org/zap"
 )
 
 // ListTools returns all available tools from the server
@@ -44,15 +46,48 @@ func (c *Client) ListTools(ctx context.Context) ([]protocol.Tool, error) {
 		return nil, fmt.Errorf("failed to parse tools/list result: %w", err)
 	}
 
+	// x-mcp-header handling (SEP-2243) is scoped by the specification:
+	// clients using the Streamable HTTP transport MUST reject tool
+	// definitions with invalid annotations — rejection means excluding the
+	// tool from tools/list, so one malformed definition cannot block the
+	// rest — while clients on other transports (e.g. stdio) MAY ignore the
+	// annotations entirely, and must not hide tools over them. The
+	// annotation also only exists under the 2026-07-28 revision, so
+	// legacy-negotiated connections ignore it on every transport. The
+	// validated annotations are cached for CallTool to mirror into
+	// Mcp-Param-* headers; when enforcement is off the cache stays empty
+	// and nothing is mirrored.
+	enforceHeaderAnnotations := c.IsStateless() && c.transportCarriesHeaders()
+
+	valid := make([]protocol.Tool, 0, len(result.Tools))
+	headerParams := make(map[string][]protocol.HeaderParam)
+	for _, tool := range result.Tools {
+		if !enforceHeaderAnnotations {
+			valid = append(valid, tool)
+			continue
+		}
+		hp, err := protocol.ToolHeaderParams(tool)
+		if err != nil {
+			c.logger.Warn("rejecting tool with invalid x-mcp-header annotation",
+				zap.String("tool", tool.Name), zap.Error(err))
+			continue
+		}
+		valid = append(valid, tool)
+		if len(hp) > 0 {
+			headerParams[tool.Name] = hp
+		}
+	}
+
 	// Update cache
 	c.toolsMu.Lock()
 	c.tools = make(map[string]protocol.Tool)
-	for _, tool := range result.Tools {
+	for _, tool := range valid {
 		c.tools[tool.Name] = tool
 	}
+	c.toolHeaderParams = headerParams
 	c.toolsMu.Unlock()
 
-	return result.Tools, nil
+	return valid, nil
 }
 
 // CallTool invokes a tool with given arguments
@@ -67,6 +102,21 @@ func (c *Client) CallTool(ctx context.Context, name string, arguments map[string
 	// Validate arguments against schema
 	if err := protocol.ValidateToolArguments(tool, arguments); err != nil {
 		return nil, fmt.Errorf("invalid arguments for tool %s: %w", name, err)
+	}
+
+	// Mirror x-mcp-header-annotated parameters into Mcp-Param-* headers
+	// (SEP-2243). The annotations were validated and cached by ListTools.
+	c.toolsMu.RLock()
+	hps := c.toolHeaderParams[name]
+	c.toolsMu.RUnlock()
+	if len(hps) > 0 {
+		hdrs, err := protocol.HeaderValuesForCall(hps, arguments)
+		if err != nil {
+			return nil, fmt.Errorf("invalid header parameter for tool %s: %w", name, err)
+		}
+		if len(hdrs) > 0 {
+			ctx = transport.WithExtraHeaders(ctx, hdrs)
+		}
 	}
 
 	// Create params
@@ -102,11 +152,10 @@ func (c *Client) CallTool(ctx context.Context, name string, arguments map[string
 
 	// Check if tool returned error
 	if result.IsError {
-		// Extract error message from content
-		if len(result.Content) > 0 && result.Content[0].Type == "text" {
-			return nil, fmt.Errorf("tool error: %s", result.Content[0].Text)
-		}
-		return nil, fmt.Errorf("tool returned error")
+		// Preserve the full result: error content may carry more than the
+		// message — e.g. a resource_link marking a watchable retry condition
+		// (issue #343). The rendered message is unchanged.
+		return nil, &ToolResultError{Result: &result}
 	}
 
 	return &result, nil
@@ -138,4 +187,84 @@ func (c *Client) getTool(ctx context.Context, name string) (protocol.Tool, error
 	}
 
 	return tool, nil
+}
+
+// ToolResultError is a tool-level failure (CallToolResult.isError) that
+// preserves the full result, so callers can inspect error content beyond the
+// message — notably a resource_link marking a watchable retry condition
+// (issue #343). Error() renders exactly what the historical flattened error
+// did, so string-matching callers and analytics see no change.
+type ToolResultError struct {
+	Result *protocol.CallToolResult
+}
+
+func (e *ToolResultError) Error() string {
+	if e.Result != nil && len(e.Result.Content) > 0 && e.Result.Content[0].Type == "text" {
+		return fmt.Sprintf("tool error: %s", e.Result.Content[0].Text)
+	}
+	return "tool returned error"
+}
+
+// BackpressureHint is the machine-readable park-and-wake contract a server
+// may embed in a tool error's payload (JSON in the first text content block):
+//
+//	{"code": "session_handle_budget_full", "message": "…",
+//	 "retryable": true, "retry_after_s": 42,
+//	 "wait_param": "wait_s", "max_wait_s": 300}
+//
+// retryable marks capacity backpressure: the identical call, re-issued after
+// a wait, is expected to succeed once load drains or a slot frees — flow
+// control, not a fault, so a runtime freezes the calling conversation and
+// re-invokes instead of surfacing the error to a model. retry_after_s is the
+// server's worst-case estimate of when (capacity may free sooner). wait_param
+// names a tool argument that parks the retry server-side for up to max_wait_s
+// seconds, waking on freed capacity instead of polling.
+type BackpressureHint struct {
+	Code        string
+	RetryAfterS int64
+	WaitParam   string
+	MaxWaitS    int64
+}
+
+// Backpressure parses the contract from the failed result. Nil when the
+// error does not declare retryable: true — task-level failures (SQL errors,
+// timeouts, deadlocks) never carry the contract and must reach the model.
+func (e *ToolResultError) Backpressure() *BackpressureHint {
+	if e.Result == nil || len(e.Result.Content) == 0 || e.Result.Content[0].Type != "text" {
+		return nil
+	}
+	var payload struct {
+		Code        string `json:"code"`
+		Retryable   bool   `json:"retryable"`
+		RetryAfterS int64  `json:"retry_after_s"`
+		WaitParam   string `json:"wait_param"`
+		MaxWaitS    int64  `json:"max_wait_s"`
+	}
+	if err := json.Unmarshal([]byte(e.Result.Content[0].Text), &payload); err != nil || !payload.Retryable {
+		return nil
+	}
+	return &BackpressureHint{
+		Code:        payload.Code,
+		RetryAfterS: payload.RetryAfterS,
+		WaitParam:   payload.WaitParam,
+		MaxWaitS:    payload.MaxWaitS,
+	}
+}
+
+// RetryResourceURI returns the URI of a resource the failed result links as
+// its retry condition: the first resource_link in the error content. Empty
+// when the result links nothing — the convention is opt-in per server, per
+// error, and only resource_link content declares it. An embedded plain
+// resource in error content is payload (e.g. diagnostic data), not a
+// watchable retry condition, and never triggers a park.
+func (e *ToolResultError) RetryResourceURI() string {
+	if e.Result == nil {
+		return ""
+	}
+	for _, c := range e.Result.Content {
+		if c.Type == "resource_link" && c.URI != "" {
+			return c.URI
+		}
+	}
+	return ""
 }

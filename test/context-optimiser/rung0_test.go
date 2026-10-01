@@ -79,6 +79,9 @@ func TestRung0_SingleTurnEvictShedsToTarget(t *testing.T) {
 func TestRung0_FoldLastResort(t *testing.T) {
 	requireGate(t)
 	r := newRig(t, routeOutDir(t, "rung0-fold"), nil, 12000, 2000, 16384)
+	// Production agents always carry the compaction prompt; the rig builds a
+	// bare agent, so attach the same summariser the harness uses elsewhere.
+	r.setCompressor(&countingCompressor{})
 	sid := "rung0-fold"
 
 	reasoning := strings.Repeat("thinking through the step in detail. ", 55) // ~2k chars, unevictable

@@ -16,6 +16,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -23,6 +24,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type wrappedRoundTripper struct{}
+
+func (wrappedRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("not used")
+}
 
 // TestStreamableHTTPTransport_SendsCustomHeaders verifies that custom headers
 // (e.g. an Authorization bearer token for an authenticated remote MCP server
@@ -48,6 +55,192 @@ func TestStreamableHTTPTransport_SendsCustomHeaders(t *testing.T) {
 	require.NoError(t, tr.Send(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`)))
 	assert.Equal(t, "Bearer od_live_test", gotAuth,
 		"custom Authorization header must be applied to the outgoing request")
+}
+
+func TestHTTPTransport_SendAppliesCustomHeaders(t *testing.T) {
+	requestReceived := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/messages":
+			requestReceived <- r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusAccepted)
+		case "/sse":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	transport, err := NewHTTPTransport(HTTPConfig{
+		Endpoint: server.URL,
+		Headers:  map[string]string{"Authorization": "Bearer legacy-token"},
+	})
+	require.NoError(t, err)
+	defer func() { _ = transport.Close() }()
+
+	require.NoError(t, transport.Send(context.Background(), []byte(`{"jsonrpc":"2.0"}`)))
+	assert.Equal(t, "Bearer legacy-token", <-requestReceived)
+}
+
+// TestStreamableHTTPTransport_CapturesSessionIDWithoutEnableSessions is a
+// regression test for the Atlassian remote MCP HTTP 400 failure: a session-based
+// streamable-http server issues an Mcp-Session-Id on the initialize response and
+// requires the client to echo it on every subsequent request (including the
+// initialized notification). Per the MCP spec, a server-issued session ID must
+// be echoed regardless of the client's enable_sessions setting, so the transport
+// must capture and replay it even when EnableSessions is false. Previously the
+// capture was gated on EnableSessions, so the follow-up notification was sent
+// without the session ID and the server rejected it with
+// "Request must be an initialize request if no session ID is provided" (400).
+func TestStreamableHTTPTransport_CapturesSessionIDWithoutEnableSessions(t *testing.T) {
+	const sessionID = "sess-abc-123"
+	var followUpSession string
+	var deletedSession string
+	var reqCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deletedSession = r.Header.Get("Mcp-Session-Id")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		reqCount++
+		if reqCount == 1 {
+			// initialize response establishes the session
+			w.Header().Set("Mcp-Session-Id", sessionID)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+			return
+		}
+		// every subsequent request must carry the session id
+		followUpSession = r.Header.Get("Mcp-Session-Id")
+		if followUpSession == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32600,"message":"Request must be an initialize request if no session ID is provided."}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":{}}`))
+	}))
+	defer srv.Close()
+
+	tr, err := NewStreamableHTTPTransport(StreamableHTTPConfig{
+		Endpoint:       srv.URL,
+		EnableSessions: false, // deliberately off — server still mandates the session id
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, tr.Send(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`)))
+	require.Equal(t, sessionID, tr.GetSessionID(),
+		"session id from the initialize response must be captured even when EnableSessions is false")
+
+	require.NoError(t, tr.Send(context.Background(), []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)))
+	assert.Equal(t, sessionID, followUpSession,
+		"follow-up request must echo the server-issued Mcp-Session-Id")
+	require.NoError(t, tr.Close())
+	assert.Equal(t, sessionID, deletedSession,
+		"Close must terminate a server-issued session even when EnableSessions is false")
+}
+
+// TestStreamableHTTPTransportReestablishesExpiredSession verifies that the transport
+// clears an expired session (HTTP 404) and re-establishes a new session on the next request.
+func TestStreamableHTTPTransportReestablishesExpiredSession(t *testing.T) {
+	const oldSession = "session-old"
+	const newSession = "session-new"
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		switch requestCount {
+		case 1:
+			w.Header().Set("Mcp-Session-Id", oldSession)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+		case 2:
+			assert.Equal(t, oldSession, r.Header.Get("Mcp-Session-Id"))
+			w.WriteHeader(http.StatusNotFound)
+		case 3:
+			assert.Empty(t, r.Header.Get("Mcp-Session-Id"))
+			w.Header().Set("Mcp-Session-Id", newSession)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":{}}`))
+		default:
+			assert.Equal(t, newSession, r.Header.Get("Mcp-Session-Id"))
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}))
+	defer server.Close()
+
+	transport, err := NewStreamableHTTPTransport(StreamableHTTPConfig{Endpoint: server.URL})
+	require.NoError(t, err)
+	defer func() { _ = transport.Close() }()
+
+	require.NoError(t, transport.Send(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`)))
+	assert.Equal(t, oldSession, transport.GetSessionID())
+	require.ErrorIs(t, transport.Send(context.Background(), []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)), ErrSessionExpired)
+	require.NoError(t, transport.Send(context.Background(), []byte(`{"jsonrpc":"2.0","id":2,"method":"initialize"}`)))
+	assert.Equal(t, newSession, transport.GetSessionID())
+	require.NoError(t, transport.Send(context.Background(), []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)))
+}
+
+func TestNewStreamableHTTPTransportHandlesWrappedDefaultTransport(t *testing.T) {
+	original := http.DefaultTransport
+	http.DefaultTransport = wrappedRoundTripper{}
+	t.Cleanup(func() { http.DefaultTransport = original })
+
+	transport, err := NewStreamableHTTPTransport(StreamableHTTPConfig{Endpoint: "http://localhost"})
+	require.NoError(t, err)
+	require.NotNil(t, transport.client.Transport)
+	_ = transport.Close()
+}
+
+// TestStreamableHTTPTransport_Accepts202PlainTextAck reproduces the Atlassian
+// remote MCP behaviour: a notification (e.g. notifications/initialized) is
+// acknowledged with 202 Accepted and Content-Type text/plain, which must be
+// treated as a successful acknowledgment rather than an unexpected Content-Type.
+func TestStreamableHTTPTransport_Accepts202PlainTextAck(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("Accepted"))
+	}))
+	defer srv.Close()
+
+	tr, err := NewStreamableHTTPTransport(StreamableHTTPConfig{
+		Endpoint: srv.URL,
+	})
+	require.NoError(t, err)
+	defer func() { _ = tr.Close() }()
+
+	require.NoError(t, tr.Send(context.Background(), []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)),
+		"a 202 Accepted with text/plain body must be treated as a successful acknowledgment")
+}
+
+func TestStreamableHTTPTransport_Rejects202ForRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	t.Run("rejects 202 for JSON-RPC request with method and id", func(t *testing.T) {
+		tr, err := NewStreamableHTTPTransport(StreamableHTTPConfig{Endpoint: srv.URL})
+		require.NoError(t, err)
+		defer func() { _ = tr.Close() }()
+
+		err = tr.Send(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		require.EqualError(t, err, "unexpected 202 response for JSON-RPC request")
+	})
+
+	t.Run("does not reject 202 for message with id but no method (response)", func(t *testing.T) {
+		tr, err := NewStreamableHTTPTransport(StreamableHTTPConfig{Endpoint: srv.URL})
+		require.NoError(t, err)
+		defer func() { _ = tr.Close() }()
+
+		// A message with id but no method is a client response to a server-initiated request,
+		// not a request itself — it must not trigger the JSON-RPC request error.
+		err = tr.Send(context.Background(), []byte(`{"jsonrpc":"2.0","id":1}`))
+		require.NoError(t, err)
+	})
 }
 
 func TestNewStreamableHTTPTransport(t *testing.T) {
@@ -141,61 +334,6 @@ func TestSessionManager(t *testing.T) {
 	})
 }
 
-func TestStreamResumption(t *testing.T) {
-	t.Run("add and retrieve events", func(t *testing.T) {
-		sr := NewStreamResumption(5)
-
-		// Add events
-		event1 := SSEEvent{ID: "event1", Data: []byte(`{"id":1}`)}
-		event2 := SSEEvent{ID: "event2", Data: []byte(`{"id":2}`)}
-		event3 := SSEEvent{ID: "event3", Data: []byte(`{"id":3}`)}
-
-		sr.AddEvent(event1)
-		sr.AddEvent(event2)
-		sr.AddEvent(event3)
-
-		assert.Equal(t, "event3", sr.GetLastEventID())
-
-		// Get events after event1
-		events := sr.GetEventsAfter("event1")
-		assert.Len(t, events, 2)
-		assert.Equal(t, "event2", events[0].ID)
-		assert.Equal(t, "event3", events[1].ID)
-	})
-
-	t.Run("event not in buffer", func(t *testing.T) {
-		sr := NewStreamResumption(5)
-		sr.AddEvent(SSEEvent{ID: "event1", Data: []byte(`{"id":1}`)})
-
-		events := sr.GetEventsAfter("nonexistent")
-		assert.Nil(t, events)
-	})
-
-	t.Run("circular buffer overflow", func(t *testing.T) {
-		sr := NewStreamResumption(3)
-
-		// Add more events than buffer size
-		for i := 1; i <= 5; i++ {
-			sr.AddEvent(SSEEvent{
-				ID:   string(rune('a' + i - 1)),
-				Data: []byte(`{}`),
-			})
-		}
-
-		// Should only have last 3 events
-		assert.Equal(t, "e", sr.GetLastEventID())
-	})
-
-	t.Run("clear resumption", func(t *testing.T) {
-		sr := NewStreamResumption(5)
-		sr.AddEvent(SSEEvent{ID: "event1", Data: []byte(`{}`)})
-		assert.Equal(t, "event1", sr.GetLastEventID())
-
-		sr.Clear()
-		assert.Equal(t, "", sr.GetLastEventID())
-	})
-}
-
 func TestSSEParser(t *testing.T) {
 	t.Run("parse single event", func(t *testing.T) {
 		data := "id: event1\nevent: message\ndata: {\"jsonrpc\":\"2.0\"}\n\n"
@@ -283,4 +421,54 @@ func TestStreamableHTTPConfig_Validation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSessionAdoptedAfterProbePrecedesInitialize is review finding 3's
+// scenario: with Connect-style negotiation the server/discover probe is the
+// first POST, so the legacy initialize response — the only response that
+// mints an Mcp-Session-Id — is no longer the first exchange. The transport
+// must adopt the session whenever a legacy server offers one and none is
+// held, not only on the first request, and echo it on every later POST.
+func TestSessionAdoptedAfterProbePrecedesInitialize(t *testing.T) {
+	var (
+		requests    int
+		sessionSeen []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		sessionSeen = append(sessionSeen, r.Header.Get("Mcp-Session-Id"))
+		w.Header().Set("Content-Type", "application/json")
+		switch requests {
+		case 1:
+			// Legacy server answering the server/discover probe: JSON-RPC
+			// MethodNotFound (no session minted here).
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}`))
+		case 2:
+			// initialize: mint the session.
+			w.Header().Set("Mcp-Session-Id", "legacy-session-42")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"legacy","version":"1"}}}`))
+		default:
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":3,"result":{}}`))
+		}
+	}))
+	defer srv.Close()
+
+	tr, err := NewStreamableHTTPTransport(StreamableHTTPConfig{
+		Endpoint:       srv.URL,
+		EnableSessions: true,
+	})
+	require.NoError(t, err)
+	defer func() { _ = tr.Close() }()
+
+	ctx := context.Background()
+	require.NoError(t, tr.Send(ctx, []byte(`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{}}}`)))
+	require.NoError(t, tr.Send(ctx, []byte(`{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}`)))
+	require.NoError(t, tr.Send(ctx, []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}`)))
+
+	require.Len(t, sessionSeen, 3)
+	assert.Empty(t, sessionSeen[0], "no session before the server minted one")
+	assert.Empty(t, sessionSeen[1], "initialize itself carries no session yet")
+	assert.Equal(t, "legacy-session-42", sessionSeen[2],
+		"the session minted by the initialize response must be echoed on subsequent requests even though initialize was not the first POST")
+	assert.Equal(t, "legacy-session-42", tr.GetSessionID())
 }

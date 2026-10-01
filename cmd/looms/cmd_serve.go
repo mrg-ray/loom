@@ -29,7 +29,7 @@ import (
 	"github.com/spf13/viper"
 	"github.com/teradata-labs/loom/embedded"
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
-	_ "github.com/teradata-labs/loom/internal/sqlitedriver"
+	"github.com/teradata-labs/loom/internal/sqlitedriver"
 	"github.com/teradata-labs/loom/pkg/agent"
 	"github.com/teradata-labs/loom/pkg/artifacts"
 	"github.com/teradata-labs/loom/pkg/communication"
@@ -49,6 +49,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/llm/mistral"
 	"github.com/teradata-labs/loom/pkg/llm/ollama"
 	"github.com/teradata-labs/loom/pkg/llm/openai"
+	llmscheduler "github.com/teradata-labs/loom/pkg/llm/scheduler"
 	"github.com/teradata-labs/loom/pkg/mcp/apps"
 	"github.com/teradata-labs/loom/pkg/mcp/manager"
 	"github.com/teradata-labs/loom/pkg/memory"
@@ -64,6 +65,7 @@ import (
 	skillindex "github.com/teradata-labs/loom/pkg/skills/index"
 	"github.com/teradata-labs/loom/pkg/storage"
 	"github.com/teradata-labs/loom/pkg/storage/backend"
+	"github.com/teradata-labs/loom/pkg/storage/postgres"
 	"github.com/teradata-labs/loom/pkg/task"
 	"github.com/teradata-labs/loom/pkg/tls"
 	toolregistry "github.com/teradata-labs/loom/pkg/tools/registry"
@@ -143,8 +145,9 @@ func builtinToolsToSuppress() []string {
 			"shared_memory_write",
 			"top_n_query",
 			"group_by_query",
-			// Orchestration tool registered per-session by MultiAgentServer.Weave.
-			"manage_ephemeral_agents",
+			// manage_ephemeral_agents is intentionally NOT suppressed here: it is a
+			// per-session opt-in tool (agent declares it in spec.tools). Suppressing
+			// it under tools.none would silently break agents that explicitly request it.
 		)
 	}
 	return suppressed
@@ -282,6 +285,42 @@ func createPermissionChecker(config *Config, logger *zap.Logger) *shuttle.Permis
 	return nil
 }
 
+// createAdmissionChain builds the admission chain from the permission checker
+// and the tools.hooks bindings. It returns nil (a pure pass-through) when there
+// is neither a permission checker nor any binding. Each built binding is logged
+// once (kind, scope, matcher) so a governed write/dispatch path is visible in
+// the serve log and an uncovered one is detectable (L-Cfg-2). A malformed
+// binding is an error, aborting serve (fail-closed, L-Cfg-1).
+func createAdmissionChain(config *Config, deps shuttle.ChainDeps, logger *zap.Logger) (*shuttle.Chain, error) {
+	bindings := config.Tools.Hooks.Bindings
+	if deps.Perm == nil && len(bindings) == 0 {
+		return nil, nil
+	}
+
+	for i, b := range bindings {
+		logger.Info("Admission hook binding",
+			zap.Int("index", i),
+			zap.String("kind", b.Kind),
+			zap.String("scope", b.Scope),
+			zap.String("matcher", describeMatcher(b.Matcher)))
+	}
+
+	chain, err := shuttle.BuildChainFromConfig(config.Tools.Hooks, deps)
+	if err != nil {
+		return nil, err
+	}
+	return chain, nil
+}
+
+// describeMatcher renders a binding's matcher for the coverage log. An empty
+// matcher governs every call to the scoped tool and is shown as "*".
+func describeMatcher(m shuttle.MatcherSpec) string {
+	if m.ParamPath == "" && m.Op == "" && m.Value == "" {
+		return "*"
+	}
+	return fmt.Sprintf("%s %s %q", m.ParamPath, m.Op, m.Value)
+}
+
 // createPromptRegistry creates a PromptRegistry based on configuration.
 // Returns nil if prompts are not configured (agents will use hardcoded fallbacks).
 func createPromptRegistry(config *Config, logger *zap.Logger) (prompts.PromptRegistry, error) {
@@ -334,6 +373,65 @@ type evalStoreSetter interface {
 // judgeServerSetter is an optional interface for wiring the JudgeServer into the main service.
 type judgeServerSetter interface {
 	SetJudgeServer(js *server.JudgeServer)
+}
+
+// registrySubsystemSink is the subset of *agent.Registry that receives the
+// server-level subsystems. Extracted so wireRegistrySubsystems is unit-testable
+// with a spy.
+type registrySubsystemSink interface {
+	SetTaskManager(manager *task.Manager, decomposer *task.Decomposer)
+	SetGraphMemoryStore(store memory.GraphMemoryStore, embedder memory.Embedder)
+	SetSuppressedBuiltinTools(names []string)
+}
+
+// resolveJudgeFallback picks the judge's fallback LLM: the pool's active
+// provider when one is configured and names a real pool entry, else the
+// server's default provider — so judge evaluations work identically on
+// pooled and single-provider servers. A misspelled active_provider falls
+// back instead of handing the judge a nil provider.
+func resolveJudgeFallback(pool map[string]agent.LLMProvider, active string, fallback agent.LLMProvider) agent.LLMProvider {
+	if p, ok := pool[active]; ok && p != nil {
+		return p
+	}
+	return fallback
+}
+
+// wireRegistrySubsystems injects the server-level subsystems (task manager,
+// graph-memory store, tool-surface policy) into the agent registry so that
+// registry-built agents — gRPC-created, config-hot-reloaded, or benchmark
+// --isolate temp agents — receive them.
+//
+// This MUST run independently of whether a provider pool is configured. These
+// injections previously lived inside the `providerPool != nil` branch of the
+// serve wiring, so a single-provider server silently gave every registry-built
+// agent a nil graph-memory store (no extraction, no cross-session recall), a
+// nil task manager, and no tool-surface policy. The per-agent YAML flags
+// (memory.graph_memory.enabled, memory.task_board.enabled) still gate behavior;
+// these calls only make the subsystems reachable.
+func wireRegistrySubsystems(
+	reg registrySubsystemSink,
+	taskManager *task.Manager,
+	taskDecomposer *task.Decomposer,
+	graphMemoryStore memory.GraphMemoryStore,
+	memoryEmbedder memory.Embedder,
+	suppressed []string,
+	logger *zap.Logger,
+) {
+	if taskManager != nil {
+		reg.SetTaskManager(taskManager, taskDecomposer)
+		logger.Info("Task manager injected into agent registry",
+			zap.Bool("decomposer_present", taskDecomposer != nil))
+	}
+	if graphMemoryStore != nil {
+		reg.SetGraphMemoryStore(graphMemoryStore, memoryEmbedder)
+		logger.Info("Graph memory store injected into agent registry",
+			zap.Bool("embedder_present", memoryEmbedder != nil))
+	}
+	if len(suppressed) > 0 {
+		reg.SetSuppressedBuiltinTools(suppressed)
+		logger.Info("Suppressed builtin tools propagated to agent registry",
+			zap.Strings("tools", suppressed))
+	}
 }
 
 // buildProviderPool constructs a named provider pool from the server configuration.
@@ -427,6 +525,22 @@ func inheritCredentials(dst, src LLMConfig) LLMConfig {
 	return dst
 }
 
+// resolveBedrockCredentials returns the explicit AWS credentials to pass to the
+// Bedrock client. When a named profile is configured the caller should let the
+// AWS SDK resolve credentials from the profile chain — returning empty strings
+// here prevents explicit key/secret values (including ambient env vars) from
+// overriding the profile. Without a profile the fields are expanded for
+// ${ENV_VAR} placeholders and returned directly; ambient env vars that are not
+// referenced in the config fields are not injected.
+func resolveBedrockCredentials(cfg LLMConfig) (accessKeyID, secretAccessKey, sessionToken string) {
+	if cfg.BedrockProfile != "" {
+		return "", "", ""
+	}
+	return loomconfig.ExpandEnvPlaceholders(cfg.BedrockAccessKeyID),
+		loomconfig.ExpandEnvPlaceholders(cfg.BedrockSecretAccessKey),
+		loomconfig.ExpandEnvPlaceholders(cfg.BedrockSessionToken)
+}
+
 func buildProviderPool(cfg *Config, _ *factory.ProviderFactory, logger *zap.Logger) (map[string]agent.LLMProvider, error) {
 	if len(cfg.Providers) == 0 {
 		return nil, nil
@@ -491,11 +605,12 @@ func createProviderWithRateLimit(cfg LLMConfig, logger *zap.Logger) (agent.LLMPr
 		// NewClientForModel routes Anthropic Claude models to the streaming +
 		// caching SDK client and others to the Converse client (single source of
 		// truth for Bedrock client selection — see bedrock.NewClientForModel).
+		accessKeyID, secretAccessKey, sessionToken := resolveBedrockCredentials(cfg)
 		client, err := bedrock.NewClientForModel(bedrock.Config{
 			Region:            cfg.BedrockRegion,
-			AccessKeyID:       cfg.BedrockAccessKeyID,
-			SecretAccessKey:   cfg.BedrockSecretAccessKey,
-			SessionToken:      cfg.BedrockSessionToken,
+			AccessKeyID:       accessKeyID,
+			SecretAccessKey:   secretAccessKey,
+			SessionToken:      sessionToken,
 			BearerToken:       cfg.BedrockBearerToken,
 			Profile:           cfg.BedrockProfile,
 			ModelID:           cfg.BedrockModelID,
@@ -614,18 +729,23 @@ func createProviderWithRateLimit(cfg LLMConfig, logger *zap.Logger) (agent.LLMPr
 		}), nil
 
 	case "litellm":
-		endpoint := cfg.LiteLLMEndpoint
+		endpoint := loomconfig.ExpandEnvPlaceholders(cfg.LiteLLMEndpoint)
 		if endpoint == "" {
 			endpoint = os.Getenv("LITELLM_ENDPOINT")
 		}
 		if endpoint == "" {
-			endpoint = os.Getenv("LITELLM_BASE_URL")
+			endpoint = os.Getenv("LITELLM_BASE_URL") // injected by avmo-tera-cloud runtime pods
 		}
-		key := apiKey(cfg.LiteLLMAPIKey, "LITELLM_API_KEY")
+		key := apiKey(loomconfig.ExpandEnvPlaceholders(cfg.LiteLLMAPIKey), "LITELLM_API_KEY")
+		extraHeaders := make(map[string]string, len(cfg.LiteLLMExtraHeaders))
+		for k, v := range cfg.LiteLLMExtraHeaders {
+			extraHeaders[k] = loomconfig.ExpandEnvPlaceholders(v)
+		}
 		return litellm.NewClient(litellm.Config{
 			Endpoint:          endpoint,
 			APIKey:            key,
-			Model:             cfg.LiteLLMModel,
+			Model:             loomconfig.ExpandEnvPlaceholders(cfg.LiteLLMModel),
+			ExtraHeaders:      extraHeaders,
 			MaxTokens:         cfg.MaxTokens,
 			Temperature:       cfg.Temperature,
 			Timeout:           time.Duration(cfg.Timeout) * time.Second,
@@ -727,6 +847,11 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 
 	timeout := time.Duration(serverConfig.LLM.Timeout) * time.Second
 
+	// Rate limiting must be attached on THIS path too: a client built without
+	// it is unthrottled and retry-less (429 retry lives inside the limiter),
+	// which produced the 512-agent thundering-herd outage of issue #348.
+	rlCfg := agent.BuildRateLimiterConfig(protoConfig.RateLimit, logger)
+
 	switch protoConfig.Provider {
 	case "anthropic":
 		model := protoConfig.Model
@@ -739,11 +864,12 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 			apiKey = os.Getenv("ANTHROPIC_API_KEY")
 		}
 		return anthropic.NewClient(anthropic.Config{
-			APIKey:      apiKey,
-			Model:       model,
-			MaxTokens:   maxTokens,
-			Temperature: temperature,
-			Timeout:     timeout,
+			APIKey:            apiKey,
+			Model:             model,
+			MaxTokens:         maxTokens,
+			Temperature:       temperature,
+			Timeout:           timeout,
+			RateLimiterConfig: rlCfg,
 		}), nil
 
 	case "bedrock":
@@ -755,15 +881,16 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 		// caching SDK client and others to the Converse client (single source of
 		// truth for Bedrock client selection — see bedrock.NewClientForModel).
 		return bedrock.NewClientForModel(bedrock.Config{
-			Region:          serverConfig.LLM.BedrockRegion,
-			AccessKeyID:     serverConfig.LLM.BedrockAccessKeyID,
-			SecretAccessKey: serverConfig.LLM.BedrockSecretAccessKey,
-			SessionToken:    serverConfig.LLM.BedrockSessionToken,
-			BearerToken:     serverConfig.LLM.BedrockBearerToken,
-			Profile:         serverConfig.LLM.BedrockProfile,
-			ModelID:         modelID,
-			MaxTokens:       maxTokens,
-			Temperature:     temperature,
+			Region:            serverConfig.LLM.BedrockRegion,
+			AccessKeyID:       serverConfig.LLM.BedrockAccessKeyID,
+			SecretAccessKey:   serverConfig.LLM.BedrockSecretAccessKey,
+			SessionToken:      serverConfig.LLM.BedrockSessionToken,
+			BearerToken:       serverConfig.LLM.BedrockBearerToken,
+			Profile:           serverConfig.LLM.BedrockProfile,
+			ModelID:           modelID,
+			MaxTokens:         maxTokens,
+			Temperature:       temperature,
+			RateLimiterConfig: rlCfg,
 		})
 
 	case "ollama":
@@ -772,11 +899,12 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 			model = serverConfig.LLM.OllamaModel
 		}
 		return ollama.NewClient(ollama.Config{
-			Endpoint:    serverConfig.LLM.OllamaEndpoint,
-			Model:       model,
-			MaxTokens:   maxTokens,
-			Temperature: temperature,
-			Timeout:     timeout,
+			Endpoint:          serverConfig.LLM.OllamaEndpoint,
+			Model:             model,
+			MaxTokens:         maxTokens,
+			Temperature:       temperature,
+			Timeout:           timeout,
+			RateLimiterConfig: rlCfg,
 		}), nil
 
 	case "openai":
@@ -790,11 +918,12 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 			apiKey = os.Getenv("OPENAI_API_KEY")
 		}
 		return openai.NewClient(openai.Config{
-			APIKey:      apiKey,
-			Model:       model,
-			MaxTokens:   maxTokens,
-			Temperature: temperature,
-			Timeout:     timeout,
+			APIKey:            apiKey,
+			Model:             model,
+			MaxTokens:         maxTokens,
+			Temperature:       temperature,
+			Timeout:           timeout,
+			RateLimiterConfig: rlCfg,
 		}), nil
 
 	case "azure-openai", "azureopenai":
@@ -802,15 +931,38 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 		if deploymentID == "" {
 			deploymentID = serverConfig.LLM.AzureOpenAIDeploymentID
 		}
-		return azureopenai.NewClient(azureopenai.Config{
-			Endpoint:     serverConfig.LLM.AzureOpenAIEndpoint,
-			DeploymentID: deploymentID,
-			APIKey:       serverConfig.LLM.AzureOpenAIAPIKey,
-			EntraToken:   serverConfig.LLM.AzureOpenAIEntraToken,
-			MaxTokens:    maxTokens,
-			Temperature:  temperature,
-			Timeout:      timeout,
-		})
+		// Env fallbacks for parity with the anthropic/openai branches and the
+		// registry path — without them an env-only key fails this path and
+		// silently changes which construction path (and rate-limit behavior)
+		// an agent gets (issue #348).
+		azEndpoint := serverConfig.LLM.AzureOpenAIEndpoint
+		if azEndpoint == "" {
+			azEndpoint = os.Getenv("AZURE_OPENAI_ENDPOINT")
+		}
+		azAPIKey := serverConfig.LLM.AzureOpenAIAPIKey
+		if azAPIKey == "" {
+			azAPIKey = os.Getenv("AZURE_OPENAI_API_KEY")
+		}
+		azEntraToken := serverConfig.LLM.AzureOpenAIEntraToken
+		if azEntraToken == "" {
+			azEntraToken = os.Getenv("AZURE_OPENAI_ENTRA_TOKEN")
+		}
+		cfg := azureopenai.Config{
+			Endpoint:          azEndpoint,
+			DeploymentID:      deploymentID,
+			APIKey:            azAPIKey,
+			EntraToken:        azEntraToken,
+			MaxTokens:         maxTokens,
+			Temperature:       temperature,
+			Timeout:           timeout,
+			RateLimiterConfig: rlCfg,
+		}
+		if llmscheduler.Enabled() {
+			// Feed provider ratelimit telemetry into this scope's scheduler.
+			cfg.CapacityObserver = llmscheduler.Default().For(
+				"azure-openai|"+azEndpoint+"|"+deploymentID, llmscheduler.Config{})
+		}
+		return azureopenai.NewClient(cfg)
 
 	case "mistral":
 		model := protoConfig.Model
@@ -818,11 +970,12 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 			model = serverConfig.LLM.MistralModel
 		}
 		return mistral.NewClient(mistral.Config{
-			APIKey:      serverConfig.LLM.MistralAPIKey,
-			Model:       model,
-			MaxTokens:   maxTokens,
-			Temperature: temperature,
-			Timeout:     timeout,
+			APIKey:            serverConfig.LLM.MistralAPIKey,
+			Model:             model,
+			MaxTokens:         maxTokens,
+			Temperature:       temperature,
+			Timeout:           timeout,
+			RateLimiterConfig: rlCfg,
 		}), nil
 
 	case "gemini":
@@ -831,11 +984,12 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 			model = serverConfig.LLM.GeminiModel
 		}
 		return gemini.NewClient(gemini.Config{
-			APIKey:      serverConfig.LLM.GeminiAPIKey,
-			Model:       model,
-			MaxTokens:   maxTokens,
-			Temperature: temperature,
-			Timeout:     timeout,
+			APIKey:            serverConfig.LLM.GeminiAPIKey,
+			Model:             model,
+			MaxTokens:         maxTokens,
+			Temperature:       temperature,
+			Timeout:           timeout,
+			RateLimiterConfig: rlCfg,
 		}), nil
 
 	case "huggingface":
@@ -844,11 +998,12 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 			model = serverConfig.LLM.HuggingFaceModel
 		}
 		return huggingface.NewClient(huggingface.Config{
-			Token:       serverConfig.LLM.HuggingFaceToken,
-			Model:       model,
-			MaxTokens:   maxTokens,
-			Temperature: temperature,
-			Timeout:     timeout,
+			Token:             serverConfig.LLM.HuggingFaceToken,
+			Model:             model,
+			MaxTokens:         maxTokens,
+			Temperature:       temperature,
+			Timeout:           timeout,
+			RateLimiterConfig: rlCfg,
 		}), nil
 
 	case "litellm":
@@ -856,13 +1011,36 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 		if model == "" {
 			model = serverConfig.LLM.LiteLLMModel
 		}
+		// Endpoint and API key are frequently injected via environment
+		// variables (e.g. avmo-tera-cloud runtime pods set LITELLM_BASE_URL /
+		// LITELLM_API_KEY) rather than the config file, and Viper's
+		// AutomaticEnv does not bind nested secret keys that are absent from
+		// the config. Fall back to the environment so agent-config-driven
+		// providers get the same credentials as the primary LLM.
+		endpoint := loomconfig.ExpandEnvPlaceholders(serverConfig.LLM.LiteLLMEndpoint)
+		if endpoint == "" {
+			endpoint = os.Getenv("LITELLM_ENDPOINT")
+		}
+		if endpoint == "" {
+			endpoint = os.Getenv("LITELLM_BASE_URL")
+		}
+		apiKey := loomconfig.ExpandEnvPlaceholders(serverConfig.LLM.LiteLLMAPIKey)
+		if apiKey == "" {
+			apiKey = os.Getenv("LITELLM_API_KEY")
+		}
+		extraHeaders := make(map[string]string, len(serverConfig.LLM.LiteLLMExtraHeaders))
+		for k, v := range serverConfig.LLM.LiteLLMExtraHeaders {
+			extraHeaders[k] = loomconfig.ExpandEnvPlaceholders(v)
+		}
 		return litellm.NewClient(litellm.Config{
-			Endpoint:    serverConfig.LLM.LiteLLMEndpoint,
-			APIKey:      serverConfig.LLM.LiteLLMAPIKey,
-			Model:       model,
-			MaxTokens:   maxTokens,
-			Temperature: temperature,
-			Timeout:     timeout,
+			Endpoint:          endpoint,
+			APIKey:            apiKey,
+			Model:             loomconfig.ExpandEnvPlaceholders(model),
+			ExtraHeaders:      extraHeaders,
+			MaxTokens:         maxTokens,
+			Temperature:       temperature,
+			Timeout:           timeout,
+			RateLimiterConfig: rlCfg,
 		}), nil
 
 	default:
@@ -914,6 +1092,12 @@ func runServe(cmd *cobra.Command, args []string) {
 
 	artifacts.SetSessionMetadataEnabled(config.Artifacts.SessionMetadataEnabled)
 
+	// LLM slot scheduler enablement must precede EVERY LLM client
+	// construction: clients attach their CapacityObserver at build time,
+	// and agents are loaded well before gRPC service registration.
+	llmscheduler.SetEnabled(config.LLM.SchedulerEnabled)
+	llmscheduler.SetDoorLimits(config.LLM.MaxActiveConversations, config.LLM.MaxDoorQueue)
+
 	// Export config values to environment variables for tools
 	exportConfigToEnv(config)
 
@@ -942,12 +1126,21 @@ func runServe(cmd *cobra.Command, args []string) {
 	defer func() { _ = logger.Sync() }()
 
 	// Replace the zap global so library packages that log via zap.L()
-	// (Agent.runConversationLoop Phase D, skill required-tool warnings,
-	// task context errors, etc.) reach the same sink as the structured
-	// server logger. Without this, those diagnostics go to the default
-	// Nop and silently disappear — which is what hid the original
-	// skills-overhaul Phase D wiring gap during initial diagnosis.
+	// (Agent.emitSkillTasksAsync, skill required-tool warnings, task context
+	// errors, etc.) reach the same sink as the structured server logger.
+	// Without this, those diagnostics go to the default Nop and silently
+	// disappear — which is what hid the original skill task emission wiring
+	// gap during initial diagnosis.
 	zap.ReplaceGlobals(logger)
+
+	// The scheduler registry's logger must be installed BEFORE any agent or
+	// LLM client is constructed: scopes are created lazily at client build
+	// time, and Registry.SetLogger only affects schedulers created after the
+	// call — installing it at gRPC registration (as before) left every
+	// boot-created scope logging calibration events into a no-op.
+	if config.LLM.SchedulerEnabled {
+		llmscheduler.Default().SetLogger(logger)
+	}
 
 	logger.Info("Starting Loom Server", zap.String("version", rootCmd.Version))
 
@@ -962,6 +1155,9 @@ func runServe(cmd *cobra.Command, args []string) {
 
 	// Create tracer based on mode
 	var tracer observability.Tracer
+
+	applyOTLPEnvOverride(&config.Observability, logger)
+
 	if config.Observability.Enabled {
 		mode := config.Observability.Mode
 		if mode == "" {
@@ -1032,7 +1228,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				Endpoint:       config.Observability.OTLPEndpoint,
 				Headers:        config.Observability.OTLPHeaders,
 				Insecure:       config.Observability.OTLPInsecure,
-				ServiceName:    "looms",
+				ServiceName:    otlpServiceName("looms"),
 				ServiceVersion: rootCmd.Version,
 				Privacy: observability.PrivacyConfig{
 					RedactCredentials: true,
@@ -1158,18 +1354,35 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 	logger.Info("Scratchpad directory initialized", zap.String("path", scratchpadDir))
 
-	// Initialize shared HITL (Human-in-the-Loop) request store
-	// This SQLite store is shared between the server (contact_human tool) and the CLI (hitl list/respond)
-	hitlDBPath := filepath.Join(loomDataDir, "hitl.db")
-	hitlStore, err := shuttle.NewSQLiteHumanRequestStore(shuttle.SQLiteConfig{
-		Path:   hitlDBPath,
-		Tracer: tracer,
-	})
-	if err != nil {
-		logger.Fatal("Failed to create HITL request store", zap.Error(err))
+	// Initialize the HITL (Human-in-the-Loop) request store. This row is
+	// AUTHORIZATION state — it decides whether a held tool call executes — so it
+	// must live in the configured storage backend: under Postgres that store is
+	// tenant-scoped (user_id RLS), replicated with the rest of the data, and
+	// inside the transactional/backup boundary. Only the SQLite backend keeps
+	// the standalone node-local hitl.db (shared with the CLI's hitl list/respond).
+	// hitlStoreDesc travels to every log line that names where holds live, so
+	// the operator's evidence always points at the store the server writes.
+	var hitlStore shuttle.HumanRequestStore
+	var hitlStoreDesc string
+	if config.Storage.Backend == "postgres" {
+		hitlStore = storageBackend.HumanRequestStore()
+		hitlStoreDesc = "postgres (storage backend)"
+		logger.Info("HITL request store initialized on the storage backend",
+			zap.String("backend", config.Storage.Backend))
+	} else {
+		hitlDBPath := filepath.Join(loomDataDir, "hitl.db")
+		sqliteHITL, err := shuttle.NewSQLiteHumanRequestStore(shuttle.SQLiteConfig{
+			Path:   hitlDBPath,
+			Tracer: tracer,
+		})
+		if err != nil {
+			logger.Fatal("Failed to create HITL request store", zap.Error(err))
+		}
+		defer func() { _ = sqliteHITL.Close() }()
+		hitlStore = sqliteHITL
+		hitlStoreDesc = hitlDBPath
+		logger.Info("HITL request store initialized", zap.String("path", hitlDBPath))
 	}
-	defer func() { _ = hitlStore.Close() }()
-	logger.Info("HITL request store initialized", zap.String("path", hitlDBPath))
 
 	// Copy documentation from docs to loom data directory
 	docsDestDir := filepath.Join(loomDataDir, "documentation")
@@ -1228,101 +1441,106 @@ func runServe(cmd *cobra.Command, args []string) {
 		logger.Warn("Examples source not found, skipping copy")
 	}
 
-	// Copy default weaver agent to loom data directory (if not exists)
-	agentsDir := filepath.Join(loomDataDir, "agents")
-	weaverDestPath := filepath.Join(agentsDir, "weaver.yaml")
-	if _, err := os.Stat(weaverDestPath); os.IsNotExist(err) {
-		// Ensure agents directory exists
-		if err := os.MkdirAll(agentsDir, 0750); err != nil {
-			logger.Warn("Failed to create agents directory", zap.Error(err))
-		}
-
-		// Get weaver from embedded files
-		weaverData := embedded.GetWeaver()
-		logger.Info("Using embedded weaver.yaml")
-
-		// Write to destination
-		if err := os.WriteFile(weaverDestPath, weaverData, 0600); err != nil {
-			logger.Warn("Failed to copy weaver.yaml to agents directory", zap.Error(err))
-		} else {
-			logger.Info("Weaver agent installed",
-				zap.String("source", "embedded"),
-				zap.String("dest", weaverDestPath),
-				zap.Int("size", len(weaverData)))
-		}
-	} else {
-		logger.Debug("Weaver agent already exists", zap.String("path", weaverDestPath))
-	}
-
-	// Copy default guide agent to loom data directory (if not exists)
-	guideDestPath := filepath.Join(agentsDir, "guide.yaml")
-	if _, err := os.Stat(guideDestPath); os.IsNotExist(err) {
-		// Ensure agents directory exists
-		if err := os.MkdirAll(agentsDir, 0750); err != nil {
-			logger.Warn("Failed to create agents directory", zap.Error(err))
-		}
-
-		// Get guide from embedded files
-		guideData := embedded.GetGuide()
-		logger.Info("Using embedded guide.yaml")
-
-		// Write to destination
-		if err := os.WriteFile(guideDestPath, guideData, 0600); err != nil {
-			logger.Warn("Failed to copy guide.yaml to agents directory", zap.Error(err))
-		} else {
-			logger.Info("Guide agent installed",
-				zap.String("source", "embedded"),
-				zap.String("dest", guideDestPath),
-				zap.Int("size", len(guideData)))
-		}
-	} else {
-		logger.Debug("Guide agent already exists", zap.String("path", guideDestPath))
-	}
-
-	// Deploy bundled weaver skills (if not exists). One block per skill so
-	// users can delete an individual file to opt out without losing the
-	// others.
 	skillsDir := filepath.Join(loomDataDir, "skills")
-	weaverBundledSkills := []struct {
-		name string
-		data []byte
-	}{
-		{name: "weaver-creation.yaml", data: embedded.GetWeaverCreationSkill()},
-		{name: "weaver-presets.yaml", data: embedded.GetWeaverPresetsSkill()},
-		{name: "weaver-templates.yaml", data: embedded.GetWeaverTemplatesSkill()},
-		{name: "weaver-from-scratch.yaml", data: embedded.GetWeaverFromScratchSkill()},
-	}
-	for _, s := range weaverBundledSkills {
-		path := filepath.Join(skillsDir, s.name)
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			if err := os.MkdirAll(skillsDir, 0750); err != nil {
-				logger.Warn("Failed to create skills directory", zap.Error(err))
+	if config.SkipEmbeddedAgents {
+		logger.Info("Skipping embedded agent/skill installation (skip_embedded_agents=true)")
+	} else {
+		// Copy default weaver and guide agents + bundled skills to loom data directory
+		// (skipped when skip_embedded_agents is set — e.g. runtime pods that serve only the deployed agent)
+		agentsDir := filepath.Join(loomDataDir, "agents")
+		weaverDestPath := filepath.Join(agentsDir, "weaver.yaml")
+		if _, err := os.Stat(weaverDestPath); os.IsNotExist(err) {
+			// Ensure agents directory exists
+			if err := os.MkdirAll(agentsDir, 0750); err != nil {
+				logger.Warn("Failed to create agents directory", zap.Error(err))
 			}
-			if err := os.WriteFile(path, s.data, 0600); err != nil {
-				logger.Warn("Failed to deploy weaver skill",
-					zap.String("name", s.name), zap.Error(err))
-			} else {
-				logger.Info("Weaver skill installed",
-					zap.String("name", s.name),
-					zap.String("dest", path),
-					zap.Int("size", len(s.data)))
-			}
-		} else {
-			logger.Debug("Weaver skill already exists",
-				zap.String("name", s.name), zap.String("path", path))
-		}
-	}
 
-	// Create agent guide in loom data directory (visible to agents)
-	agentGuidePath := filepath.Join(loomDataDir, "START_HERE.md")
-	if _, err := os.Stat(agentGuidePath); os.IsNotExist(err) {
-		agentGuide := embedded.GetStartHere()
-		if err := os.WriteFile(agentGuidePath, agentGuide, 0600); err != nil {
-			logger.Warn("Failed to create agent guide", zap.Error(err))
+			// Get weaver from embedded files
+			weaverData := embedded.GetWeaver()
+			logger.Info("Using embedded weaver.yaml")
+
+			// Write to destination
+			if err := os.WriteFile(weaverDestPath, weaverData, 0600); err != nil {
+				logger.Warn("Failed to copy weaver.yaml to agents directory", zap.Error(err))
+			} else {
+				logger.Info("Weaver agent installed",
+					zap.String("source", "embedded"),
+					zap.String("dest", weaverDestPath),
+					zap.Int("size", len(weaverData)))
+			}
 		} else {
-			logger.Info("Agent guide created", zap.String("path", agentGuidePath))
+			logger.Debug("Weaver agent already exists", zap.String("path", weaverDestPath))
 		}
-	}
+
+		// Copy default guide agent to loom data directory (if not exists)
+		guideDestPath := filepath.Join(agentsDir, "guide.yaml")
+		if _, err := os.Stat(guideDestPath); os.IsNotExist(err) {
+			// Ensure agents directory exists
+			if err := os.MkdirAll(agentsDir, 0750); err != nil {
+				logger.Warn("Failed to create agents directory", zap.Error(err))
+			}
+
+			// Get guide from embedded files
+			guideData := embedded.GetGuide()
+			logger.Info("Using embedded guide.yaml")
+
+			// Write to destination
+			if err := os.WriteFile(guideDestPath, guideData, 0600); err != nil {
+				logger.Warn("Failed to copy guide.yaml to agents directory", zap.Error(err))
+			} else {
+				logger.Info("Guide agent installed",
+					zap.String("source", "embedded"),
+					zap.String("dest", guideDestPath),
+					zap.Int("size", len(guideData)))
+			}
+		} else {
+			logger.Debug("Guide agent already exists", zap.String("path", guideDestPath))
+		}
+
+		// Deploy bundled weaver skills (if not exists). One block per skill so
+		// users can delete an individual file to opt out without losing the
+		// others.
+		weaverBundledSkills := []struct {
+			name string
+			data []byte
+		}{
+			{name: "weaver-creation.yaml", data: embedded.GetWeaverCreationSkill()},
+			{name: "weaver-presets.yaml", data: embedded.GetWeaverPresetsSkill()},
+			{name: "weaver-templates.yaml", data: embedded.GetWeaverTemplatesSkill()},
+			{name: "weaver-from-scratch.yaml", data: embedded.GetWeaverFromScratchSkill()},
+		}
+		for _, s := range weaverBundledSkills {
+			path := filepath.Join(skillsDir, s.name)
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				if err := os.MkdirAll(skillsDir, 0750); err != nil {
+					logger.Warn("Failed to create skills directory", zap.Error(err))
+				}
+				if err := os.WriteFile(path, s.data, 0600); err != nil {
+					logger.Warn("Failed to deploy weaver skill",
+						zap.String("name", s.name), zap.Error(err))
+				} else {
+					logger.Info("Weaver skill installed",
+						zap.String("name", s.name),
+						zap.String("dest", path),
+						zap.Int("size", len(s.data)))
+				}
+			} else {
+				logger.Debug("Weaver skill already exists",
+					zap.String("name", s.name), zap.String("path", path))
+			}
+		}
+
+		// Create agent guide in loom data directory (visible to agents)
+		agentGuidePath := filepath.Join(loomDataDir, "START_HERE.md")
+		if _, err := os.Stat(agentGuidePath); os.IsNotExist(err) {
+			agentGuide := embedded.GetStartHere()
+			if err := os.WriteFile(agentGuidePath, agentGuide, 0600); err != nil {
+				logger.Warn("Failed to create agent guide", zap.Error(err))
+			} else {
+				logger.Info("Agent guide created", zap.String("path", agentGuidePath))
+			}
+		}
+	} // end skip_embedded_agents else block
 
 	// Get artifact store from storage backend
 	artifactStore := storageBackend.ArtifactStore()
@@ -1399,17 +1617,26 @@ func runServe(cmd *cobra.Command, args []string) {
 		// Create MCP indexer if MCP manager is available
 		var indexers []toolregistry.Indexer
 		indexers = append(indexers, builtinIndexer)
+		// Search results only surface MCP tools whose server currently
+		// exists; with no manager, no MCP tool is servable at all (#334).
+		liveMCPServers := func() []string { return nil }
 		if mcpManager != nil {
-			mcpIndexer := toolregistry.NewMCPIndexer(mcpManager.GetManager(), tracer)
+			mgr := mcpManager.GetManager()
+			mcpIndexer := toolregistry.NewMCPIndexer(mgr, tracer)
 			indexers = append(indexers, mcpIndexer)
+			liveMCPServers = func() []string {
+				return enabledMCPServerNames(mgr, logger)
+			}
 		}
 
 		var err error
 		toolRegistry, err = toolregistry.New(toolregistry.Config{
-			DBPath:   toolDBPath,
-			LLM:      llmProvider,
-			Tracer:   tracer,
-			Indexers: indexers,
+			DBPath:         toolDBPath,
+			LLM:            llmProvider,
+			Tracer:         tracer,
+			Logger:         logger,
+			Indexers:       indexers,
+			LiveMCPServers: liveMCPServers,
 		})
 		if err != nil {
 			logger.Warn("Failed to create tool registry", zap.Error(err))
@@ -1424,6 +1651,7 @@ func runServe(cmd *cobra.Command, args []string) {
 					zap.Int32("builtin_tools", resp.BuiltinCount),
 					zap.Int32("mcp_tools", resp.McpCount),
 					zap.Int32("total_tools", resp.TotalCount),
+					zap.Int32("pruned_stale_tools", resp.PrunedCount),
 					zap.Int64("duration_ms", resp.DurationMs))
 			}
 		}
@@ -1499,6 +1727,27 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Create PermissionChecker (if configured)
 	permissionChecker := createPermissionChecker(config, logger)
 
+	// Build the admission chain: the name-level permission check folded in as the
+	// first hook, then the library policies from tools.hooks. A malformed binding
+	// aborts startup so a path is never left silently ungoverned (fail-closed).
+	// An `ask` decision defers to the HITL store — the same SQLite store
+	// contact_human uses — so a human resolves the approval out of band. Timeout
+	// mirrors tools.permissions; the poll interval matches ContactHumanConfig (1s).
+	// The ask hold window falls back to the resolver's default (300s) when no
+	// tools.permissions block sets a timeout — a zero here would otherwise make
+	// every ask binding deny instantly with "approval timed out".
+	askTimeout := time.Duration(config.Tools.Permissions.TimeoutSeconds) * time.Second
+	askResolver := shuttle.NewHITLAskResolver(
+		hitlStore,
+		askTimeout,
+		time.Second,
+		hitlNotifier(),
+	)
+	admissionChain, err := createAdmissionChain(config, shuttle.ChainDeps{Perm: permissionChecker, Ask: askResolver, Custom: shuttle.ProcessCustomHookRegistry()}, logger)
+	if err != nil {
+		logger.Fatal("Failed to build admission chain", zap.Error(err))
+	}
+
 	// Initialize empty agents map - all agents loaded from $LOOM_DATA_DIR/agents/ via registry below
 	agents := initializeAgentsMap()
 	logger.Info("Agents will be loaded from $LOOM_DATA_DIR/agents/ directory via registry system")
@@ -1527,6 +1776,12 @@ func runServe(cmd *cobra.Command, args []string) {
 		Tracer:       tracer,
 		ToolRegistry: toolRegistry,
 		SessionStore: store,
+		// Governance travels to EVERY agent build path: the registry builds
+		// agents at runtime-create and hot-reload, and an agent rebuilt without
+		// the chain would silently become ungoverned (C-007).
+		PermissionChecker: permissionChecker,
+		AdmissionChain:    admissionChain,
+		IdentityResolver:  postgres.UserIDFromContext,
 	})
 	if err != nil {
 		logger.Warn("Failed to create agent registry", zap.Error(err))
@@ -1669,11 +1924,13 @@ func runServe(cmd *cobra.Command, args []string) {
 					}
 				}
 
-				// Set PatternsDir from metadata or default to $LOOM_DATA_DIR/patterns.
+				// Set PatternsDir from metadata or the server-level default.
 				// Patterns are enabled by default (DefaultPatternConfig), so all agents
 				// need a patterns directory to find filesystem patterns.
 				if pd, ok := cfg.Metadata["patterns_dir"]; ok && pd != "" {
 					agentCfg.PatternsDir = pd
+				} else if config.PatternsDir != "" {
+					agentCfg.PatternsDir = config.PatternsDir
 				} else {
 					agentCfg.PatternsDir = filepath.Join(loomconfig.GetLoomDataDir(), "patterns")
 				}
@@ -1744,6 +2001,12 @@ func runServe(cmd *cobra.Command, args []string) {
 				if permissionChecker != nil {
 					agentOpts = append(agentOpts, agent.WithPermissionChecker(permissionChecker))
 				}
+
+				// Attach the admission chain and, unconditionally, the identity
+				// resolver so AdmissionRequest.UserID is populated for every
+				// deployment. A nil chain leaves tool execution a pass-through.
+				agentOpts = append(agentOpts, agent.WithAdmissionHooks(admissionChain))
+				agentOpts = append(agentOpts, agent.WithIdentityResolver(postgres.UserIDFromContext))
 
 				// Determine LLM provider for this agent
 				// If agent has specific LLM config, use it; otherwise use server default
@@ -1865,18 +2128,19 @@ func runServe(cmd *cobra.Command, args []string) {
 				// paths cannot drift.
 				registerYAMLBuiltinTools(ag, cfg, registry, logger, "    ", "agent_management")
 
-				// Register contact_human tool with shared SQLite store (if listed in builtin tools)
+				// Register contact_human tool with the shared HITL store (if listed in builtin tools)
 				if cfg.Tools != nil {
 					for _, toolName := range cfg.Tools.Builtin {
 						if toolName == "contact_human" {
 							humanTool := shuttle.NewContactHumanTool(shuttle.ContactHumanConfig{
-								Store:  hitlStore,
-								Tracer: tracer,
-								Logger: logger,
+								Store:    hitlStore,
+								Notifier: hitlNotifier(),
+								Tracer:   tracer,
+								Logger:   logger,
 							})
 							ag.RegisterTool(humanTool)
-							logger.Info("    Auto-registered contact_human tool (shared SQLite store)",
-								zap.String("db_path", hitlDBPath))
+							logger.Info("    Auto-registered contact_human tool (shared HITL store)",
+								zap.String("store", hitlStoreDesc))
 							break
 						}
 					}
@@ -1937,7 +2201,7 @@ func runServe(cmd *cobra.Command, args []string) {
 					// Enable dynamic tool registration for discovered MCP tools
 					var mcpMgrAdapter shuttle.MCPManager
 					if mcpManager != nil {
-						mcpMgrAdapter = &mcpManagerAdapter{mgr: mcpManager.GetManager()}
+						mcpMgrAdapter = toolregistry.NewShuttleMCPManager(mcpManager.GetManager())
 					}
 					ag.SetToolRegistryForDynamicDiscovery(toolRegistry, mcpMgrAdapter)
 					logger.Info("    Enabled dynamic tool registration")
@@ -2125,7 +2389,19 @@ func runServe(cmd *cobra.Command, args []string) {
 		grpcServer = grpc.NewServer(serverOpts...)
 	}
 	loomService := server.NewMultiAgentServer(agents, store)
+	// Authenticated deployments are multi-tenant: blank identities must not
+	// act as session-ownership wildcards. Unauthenticated deployments keep
+	// the explicit single-tenant compatibility mode.
+	loomService.SetEnforceSessionOwnership(config.Server.Auth.Enabled)
 	loomv1.RegisterLoomServiceServer(grpcServer, loomService)
+
+	// LLM slot scheduler observability/admin surface (enablement and the
+	// registry logger were both installed at startup, before any LLM client
+	// construction).
+	if config.LLM.SchedulerEnabled {
+		logger.Info("LLM slot scheduler enabled")
+	}
+	loomv1.RegisterLLMSchedulerServiceServer(grpcServer, llmscheduler.NewService(llmscheduler.Default()))
 
 	// Register TaskService for gRPC task management and TUI streaming.
 	// Bus wired later via SetBus (two-phase init, bus not yet created).
@@ -2254,15 +2530,30 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Set logger for server operations
 	loomService.SetLogger(logger)
 
+	// Honor WeaveRequest.occurred_at only when the operator opted in —
+	// replay/import arrival times are rejected otherwise (see applyOccurredAt).
+	loomService.SetAllowTimeOverride(config.Server.AllowTimeOverride)
+	if config.Server.AllowTimeOverride {
+		logger.Info("Arrival-time override enabled (server.allow_time_override): WeaveRequest.occurred_at will be honored")
+	}
+
 	// Set provider factory for dynamic model switching
 	loomService.SetProviderFactory(providerFactory)
 	logger.Info("Provider factory configured on server for model switching")
 
 	// Wire provider pool from config.
-	if providerPool, err := buildProviderPool(config, providerFactory, logger); err != nil {
+	// The pool is optional: only the two SetProviderPool calls are inherently
+	// pool features. Everything else below runs regardless, so a
+	// single-provider server still gets its eval store and judge (the
+	// regression this hoisting fixes).
+	providerPool, poolErr := buildProviderPool(config, providerFactory, logger)
+	if poolErr != nil {
 		logger.Warn("Failed to build provider pool from config; pool-based features will be unavailable",
-			zap.String("reason", "provider pool configuration error; check LLM provider settings"))
-	} else if providerPool != nil {
+			zap.String("reason", "provider pool configuration error; check LLM provider settings"),
+			zap.Error(poolErr))
+		providerPool = nil
+	}
+	if providerPool != nil {
 		if pps, ok := interface{}(loomService).(providerPoolSetter); ok {
 			pps.SetProviderPool(providerPool, config.ActiveProvider)
 			logger.Info("Provider pool configured on server",
@@ -2275,58 +2566,42 @@ func runServe(cmd *cobra.Command, args []string) {
 			logger.Info("Provider pool injected into agent registry",
 				zap.Int("providers", len(providerPool)))
 		}
-		// Inject the task subsystem so registry-built agents reach Phase D
-		// (skills-overhaul task emission) and the sticky-while-open-tasks
-		// eviction checker. The per-agent memory.task_board.enabled flag
-		// still controls task_board tool surfacing; emission is always-on.
-		if registry != nil && taskManager != nil {
-			registry.SetTaskManager(taskManager, taskDecomposer)
-			logger.Info("Task manager injected into agent registry",
-				zap.Bool("decomposer_present", taskDecomposer != nil))
+		// NOTE: the task-manager, graph-memory, tool-surface, eval-store, and
+		// judge wiring all moved OUT of this pool-gated branch to the
+		// unconditional blocks after it — they must run whenever their
+		// subsystems exist, not only when a provider pool is configured.
+	}
+
+	// Inject server subsystems into the agent registry UNCONDITIONALLY (not gated
+	// on a provider pool) so registry-built agents on a single-provider server
+	// still receive the graph-memory store, task manager, and tool-surface
+	// policy. See wireRegistrySubsystems for the regression this guards.
+	if registry != nil {
+		wireRegistrySubsystems(registry, taskManager, taskDecomposer,
+			graphMemoryStore, memoryEmbedder, builtinToolsToSuppress(), logger)
+	}
+
+	// Wire the eval store for ABTest result persistence — pool-independent.
+	if ess, ok := interface{}(loomService).(evalStoreSetter); ok {
+		evalDBPath := config.Database.Path
+		if evalDBPath == "" {
+			evalDBPath = "./evals.db"
 		}
-		// Inject the graph memory subsystem so registry-built agents
-		// (gRPC-created or config-hot-reloaded) get the extractor. The
-		// per-agent memory.graph_memory.enabled flag in YAML can still
-		// opt out for a specific agent; the suppressed-tools list below
-		// controls tool surfacing independently.
-		if registry != nil && graphMemoryStore != nil {
-			registry.SetGraphMemoryStore(graphMemoryStore, memoryEmbedder)
-			logger.Info("Graph memory store injected into agent registry",
-				zap.Bool("embedder_present", memoryEmbedder != nil))
+		if store, storeErr := evals.NewStore(evalDBPath); storeErr != nil {
+			logger.Warn("Failed to create eval store; ABTest results will not be persisted",
+				zap.Error(storeErr))
+		} else {
+			ess.SetEvalStore(store)
+			logger.Info("Eval store configured for ABTest persistence", zap.String("path", evalDBPath))
 		}
-		// Push the server-level tool-surface policy into the registry so
-		// gRPC-created agents see the same hidden-tools list as the
-		// statically-loaded ones. See builtinToolsToSuppress().
-		if registry != nil {
-			suppressed := builtinToolsToSuppress()
-			if len(suppressed) > 0 {
-				registry.SetSuppressedBuiltinTools(suppressed)
-				logger.Info("Suppressed builtin tools propagated to agent registry",
-					zap.Strings("tools", suppressed))
-			}
-		}
-		// Wire the eval store for ABTest result persistence.
-		if ess, ok := interface{}(loomService).(evalStoreSetter); ok {
-			evalDBPath := config.Database.Path
-			if evalDBPath == "" {
-				evalDBPath = "./evals.db"
-			}
-			if store, storeErr := evals.NewStore(evalDBPath); storeErr != nil {
-				logger.Warn("Failed to create eval store; ABTest results will not be persisted",
-					zap.Error(storeErr))
-			} else {
-				ess.SetEvalStore(store)
-				logger.Info("Eval store configured for ABTest persistence", zap.String("path", evalDBPath))
-			}
-		}
-		// Wire judgeServer into loomService so ABTest can resolve judge_id.
-		// Provide the active pool provider as the fallback LLM for evaluations.
-		activeProvider := providerPool[config.ActiveProvider]
-		judgeServer.SetProviderPool(providerPool, activeProvider)
-		if jss, ok := interface{}(loomService).(judgeServerSetter); ok {
-			jss.SetJudgeServer(judgeServer)
-			logger.Info("Judge server wired into loom service for ABTest judge_id resolution")
-		}
+	}
+	// Wire judgeServer into loomService so ABTest can resolve judge_id —
+	// pool-independent: without a pool the server's default provider judges,
+	// so single-provider servers get working evaluations too.
+	judgeServer.SetProviderPool(providerPool, resolveJudgeFallback(providerPool, config.ActiveProvider, llmProvider))
+	if jss, ok := interface{}(loomService).(judgeServerSetter); ok {
+		jss.SetJudgeServer(judgeServer)
+		logger.Info("Judge server wired into loom service for ABTest judge_id resolution")
 	}
 
 	// Set agent registry for workflow execution
@@ -2521,7 +2796,9 @@ func runServe(cmd *cobra.Command, args []string) {
 		if learningDBPath == "" {
 			learningDBPath = filepath.Join(loomconfig.GetLoomDataDir(), "learning.db")
 		}
-		learningDB, err := sql.Open("sqlite3", learningDBPath)
+		// busy_timeout rides in the DSN so every pooled connection waits on
+		// lock contention instead of failing instantly with SQLITE_BUSY.
+		learningDB, err := sql.Open("sqlite3", sqlitedriver.DSN(learningDBPath, sqlitedriver.Options{BusyTimeoutMS: 5000}))
 		if err != nil {
 			logger.Fatal("Failed to open database for learning agent", zap.Error(err))
 		}
@@ -2936,9 +3213,11 @@ func runServe(cmd *cobra.Command, args []string) {
 				}
 			}
 
-			// Set PatternsDir from metadata or default to $LOOM_DATA_DIR/patterns
+			// Set PatternsDir from metadata or the server-level default.
 			if pd, ok := agentConfig.Metadata["patterns_dir"]; ok && pd != "" {
 				cfg.PatternsDir = pd
+			} else if config.PatternsDir != "" {
+				cfg.PatternsDir = config.PatternsDir
 			} else {
 				cfg.PatternsDir = filepath.Join(loomconfig.GetLoomDataDir(), "patterns")
 			}
@@ -3047,6 +3326,12 @@ func runServe(cmd *cobra.Command, args []string) {
 				agentOpts = append(agentOpts, agent.WithPermissionChecker(permissionChecker))
 			}
 
+			// Attach the admission chain and, unconditionally, the identity
+			// resolver so AdmissionRequest.UserID is populated for every
+			// deployment. A nil chain leaves tool execution a pass-through.
+			agentOpts = append(agentOpts, agent.WithAdmissionHooks(admissionChain))
+			agentOpts = append(agentOpts, agent.WithIdentityResolver(postgres.UserIDFromContext))
+
 			// Wrap LLM provider with instrumentation for observability
 			if tracer != nil {
 				llmProvider = llm.NewInstrumentedProvider(llmProvider, tracer)
@@ -3096,18 +3381,19 @@ func runServe(cmd *cobra.Command, args []string) {
 			// shell_execute on hot reload under tools.minimal/none.
 			registerYAMLBuiltinTools(newAgent, agentConfig, registry, logger, "  ", "agent_management (reload)")
 
-			// Register contact_human tool with shared SQLite store (if listed in builtin tools)
+			// Register contact_human tool with shared HITL store (if listed in builtin tools)
 			if agentConfig.Tools != nil {
 				for _, toolName := range agentConfig.Tools.Builtin {
 					if toolName == "contact_human" {
 						humanTool := shuttle.NewContactHumanTool(shuttle.ContactHumanConfig{
-							Store:  hitlStore,
-							Tracer: tracer,
-							Logger: logger,
+							Store:    hitlStore,
+							Notifier: hitlNotifier(),
+							Tracer:   tracer,
+							Logger:   logger,
 						})
 						newAgent.RegisterTool(humanTool)
-						logger.Info("  Auto-registered contact_human tool (shared SQLite store)",
-							zap.String("db_path", hitlDBPath))
+						logger.Info("  Auto-registered contact_human tool (shared HITL store)",
+							zap.String("store", hitlStoreDesc))
 						break
 					}
 				}
@@ -3166,7 +3452,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				// Enable dynamic tool registration for discovered MCP tools
 				var mcpMgrAdapter shuttle.MCPManager
 				if mcpManager != nil {
-					mcpMgrAdapter = &mcpManagerAdapter{mgr: mcpManager.GetManager()}
+					mcpMgrAdapter = toolregistry.NewShuttleMCPManager(mcpManager.GetManager())
 				}
 				newAgent.SetToolRegistryForDynamicDiscovery(toolRegistry, mcpMgrAdapter)
 				logger.Info("  Enabled dynamic tool registration")
@@ -3252,9 +3538,10 @@ func runServe(cmd *cobra.Command, args []string) {
 
 		if err := server.ValidateProviders(preflightCtx, agents); err != nil {
 			logger.Fatal("LLM provider preflight check failed", zap.Error(err))
+		} else {
+			logger.Info("All LLM provider preflight checks passed",
+				zap.Int("agents_checked", len(agents)))
 		}
-		logger.Info("All LLM provider preflight checks passed",
-			zap.Int("agents_checked", len(agents)))
 	}
 
 	// Start server
@@ -3374,6 +3661,21 @@ func runServe(cmd *cobra.Command, args []string) {
 		// Stop message queue monitor first (prevents new work from starting)
 		cancelMonitor()
 		logger.Info("Message queue monitor cancelled")
+
+		// Cancel and join background worker goroutines (queue monitor, workflow
+		// notification/broadcast handlers, spawned-agent monitors and message
+		// loops, MCP re-indexers) so none log after the logger is torn down.
+		// This also closes worker admission, so a request racing shutdown
+		// cannot register a worker behind the join. Bounded: a worker
+		// mid-LLM-call may take a moment to observe cancellation.
+		workerCtx, cancelWorkerWait := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := loomService.ShutdownBackgroundWorkers(workerCtx); err != nil {
+			logger.Warn("Timed out waiting for background workers; continuing shutdown",
+				zap.Error(err))
+		} else {
+			logger.Info("Background workers stopped")
+		}
+		cancelWorkerWait()
 
 		// Stop HTTP server
 		if httpSrv != nil {
@@ -3619,24 +3921,13 @@ func initializeMCPManager(config *Config, logger *zap.Logger) (*mcpManager, erro
 		// Enabled defaults are handled by fixMCPEnabledDefault in config loading:
 		// servers without explicit "enabled: false" in YAML default to true.
 
-		// Expand ${ENV_VAR} in header values so secrets (e.g. a bearer token for
-		// an authenticated remote MCP server) come from the environment rather
-		// than being committed to the config file.
-		var headers map[string]string
-		if len(serverConfig.Headers) > 0 {
-			headers = make(map[string]string, len(serverConfig.Headers))
-			for k, v := range serverConfig.Headers {
-				headers[k] = os.ExpandEnv(v)
-			}
-		}
-
 		mcpConfig.Servers[serverName] = manager.ServerConfig{
 			Command:          serverConfig.Command,
 			Args:             serverConfig.Args,
 			Env:              serverConfig.Env,
 			Transport:        transport,
-			URL:              serverConfig.URL,
-			Headers:          headers,
+			URL:              loomconfig.ExpandEnvPlaceholders(serverConfig.URL),
+			Headers:          expandMCPHeaders(serverConfig.Headers),
 			EnableSessions:   serverConfig.EnableSessions,
 			EnableResumption: serverConfig.EnableResumption,
 			Enabled:          enabled,
@@ -3662,15 +3953,38 @@ func initializeMCPManager(config *Config, logger *zap.Logger) (*mcpManager, erro
 	}, nil
 }
 
-// mcpManagerAdapter adapts *manager.Manager to shuttle.MCPManager interface.
-// This is needed because manager.Manager.GetClient returns (*client.Client, error)
-// but the interface requires (interface{}, error) for generic handling.
-type mcpManagerAdapter struct {
-	mgr *manager.Manager
+func expandMCPHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return headers
+	}
+	expanded := make(map[string]string, len(headers))
+	for key, value := range headers {
+		expanded[key] = loomconfig.ExpandEnvPlaceholders(value)
+	}
+	return expanded
 }
 
-func (a *mcpManagerAdapter) GetClient(serverName string) (interface{}, error) {
-	return a.mgr.GetClient(serverName)
+// enabledMCPServerNames returns the names of the manager's servers that are
+// enabled in configuration, connected or not. Disabled servers are excluded:
+// their stale index rows would pass the search liveness filter, yet their
+// tools can never execute, so surfacing them only misleads agents (#334).
+// Skipped servers are logged so filtered-out tools stay traceable.
+func enabledMCPServerNames(mgr *manager.Manager, logger *zap.Logger) []string {
+	servers := mgr.ListServers()
+	names := make([]string, 0, len(servers))
+	var skipped []string
+	for _, s := range servers {
+		if !s.Enabled {
+			skipped = append(skipped, s.Name)
+			continue
+		}
+		names = append(names, s.Name)
+	}
+	if len(skipped) > 0 && logger != nil {
+		logger.Debug("Excluding disabled MCP servers from tool search",
+			zap.Strings("disabled_servers", skipped))
+	}
+	return names
 }
 
 // copyDir recursively copies a directory tree from src to dst.

@@ -822,7 +822,7 @@ func TestAgent_ToolRegistration(t *testing.T) {
 	for i, tl := range tools {
 		names[i] = tl.Name()
 	}
-	expected := map[string]bool{"load_pattern": true, "query_tool_result": true, "recall": true, "task_list": true}
+	expected := map[string]bool{"load_pattern": true, "query_tool_result": true, "recall": true}
 	if len(tools) != len(expected) {
 		t.Fatalf("Expected the four base tools at construction, got: %v", names)
 	}

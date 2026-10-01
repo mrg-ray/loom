@@ -407,13 +407,18 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 	}
 
 	session := &Session{
-		ID:              sessionID,
-		AgentID:         agentID,
+		ID:      sessionID,
+		AgentID: agentID,
+		// Ownership is stamped at creation from the authenticated context so
+		// every RPC path (Chat, Weave, StreamWeave, workflows) produces owned
+		// sessions; empty on identity-less single-tenant deployments.
+		UserID:          types.UserIDFromContext(ctx),
 		ParentSessionID: parentSessionID,
 		Messages:        []Message{},
 		Context:         make(map[string]interface{}),
 		CreatedAt:       time.Now(),
 		UpdatedAt:       time.Now(),
+		Incarnation:     time.Now().UnixNano(),
 		SegmentedMem:    segMem,
 		FailureTracker:  newConsecutiveFailureTracker(),
 	}
@@ -680,6 +685,14 @@ func (m *Memory) ClearAll() {
 
 	m.sessions = make(map[string]*Session)
 }
+
+// HasStore reports whether a persistent session store is configured. Every
+// Persist* method is a silent no-op returning nil without one, so a caller
+// that needs a message to be DURABLE — not merely "persisted without error" —
+// has to ask this separately. The HITL park pre-scan is the case: it may only
+// raise a durable request row for a batch that will still exist after a
+// restart.
+func (m *Memory) HasStore() bool { return m.store != nil }
 
 // PersistSession saves a session to persistent storage if configured.
 func (m *Memory) PersistSession(ctx context.Context, session *Session) error {
@@ -975,4 +988,13 @@ func (m *Memory) notifyObservers(agentID string, sessionID string, msg Message) 
 			obs.OnMessageAdded(agentID, sessionID, msg)
 		}(observer)
 	}
+}
+
+// Store returns the configured persistent session storage, or nil when the
+// memory is storeless. Read-only accessor: callers must not swap the store.
+func (m *Memory) Store() SessionStorage {
+	if m == nil {
+		return nil
+	}
+	return m.store
 }

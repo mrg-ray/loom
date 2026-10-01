@@ -23,7 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/teradata-labs/loom/internal/sqlitedriver"
+	"github.com/teradata-labs/loom/internal/sqlitedriver"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protojson"
 
@@ -113,8 +113,20 @@ type MessageQueue struct {
 	totalFailed   atomic.Int64
 	totalExpired  atomic.Int64
 
+	// idSeq disambiguates IDs minted within the same clock tick. time.Now()'s
+	// resolution varies by OS/hardware; a tight loop can call UnixNano() faster
+	// than the clock advances, which previously produced colliding message IDs.
+	idSeq atomic.Uint64
+
 	// Lifecycle
 	closed atomic.Bool
+}
+
+// nextID returns a process-unique, monotonically distinguishable ID: the
+// current time plus a per-queue sequence number, so two IDs minted within the
+// same clock tick never collide regardless of OS timer resolution.
+func (q *MessageQueue) nextID(prefix string) string {
+	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), q.idSeq.Add(1))
 }
 
 // NewMessageQueue creates a new message queue with SQLite persistence.
@@ -123,17 +135,23 @@ func NewMessageQueue(dbPath string, tracer observability.Tracer, logger *zap.Log
 		logger = zap.NewNop()
 	}
 
-	// Open SQLite database
-	// Add pragmas for better concurrency:
+	// Open SQLite database with pragmas for better concurrency, rendered
+	// into the DSN so every pooled connection gets them (busy_timeout is
+	// per-connection; a post-open db.Exec would configure only one of the
+	// 10 pooled connections):
 	// - busy_timeout: Wait up to 5s if database is locked
 	// - journal_mode=WAL: Write-Ahead Logging for concurrent reads/writes
-	// - cache_size: Increase cache for better performance
+	//   (file-based databases only; ":memory:" reports journal_mode=memory)
 	dbURL := dbPath
 	if dbPath == ":memory:" {
 		// For in-memory databases with shared cache, use file URI format
 		// This allows multiple connections to share the same in-memory database
 		dbURL = "file::memory:?mode=memory&cache=shared"
 	}
+	dbURL = sqlitedriver.DSN(dbURL, sqlitedriver.Options{
+		BusyTimeoutMS: 5000,
+		WAL:           dbPath != ":memory:",
+	})
 	db, err := sql.Open("sqlite3", dbURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -142,20 +160,6 @@ func NewMessageQueue(dbPath string, tracer observability.Tracer, logger *zap.Log
 	// Set connection pool parameters for better concurrency
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
-
-	// Enable WAL mode for better concurrent access (for file-based databases)
-	if dbPath != ":memory:" {
-		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-			logger.Warn("Failed to enable WAL mode", zap.Error(err))
-			// Continue anyway - not critical
-		}
-	}
-
-	// Set busy timeout for all connections
-	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
-		logger.Warn("Failed to set busy timeout", zap.Error(err))
-		// Continue anyway - not critical
-	}
 
 	// Create tables
 	schema := `
@@ -235,7 +239,7 @@ func (q *MessageQueue) Enqueue(ctx context.Context, msg *QueueMessage) error {
 
 	// Set defaults
 	if msg.ID == "" {
-		msg.ID = fmt.Sprintf("qmsg-%d", time.Now().UnixNano())
+		msg.ID = q.nextID("qmsg")
 	}
 	if msg.EnqueuedAt.IsZero() {
 		msg.EnqueuedAt = time.Now()
@@ -715,7 +719,7 @@ const DefaultQueueTimeout = 30
 // It creates a QueueMessage and enqueues it for the destination agent.
 func (q *MessageQueue) Send(ctx context.Context, fromAgent, toAgent, messageType string, payload *loomv1.MessagePayload, metadata map[string]string) (string, error) {
 	msg := &QueueMessage{
-		ID:          fmt.Sprintf("%s-%d", toAgent, time.Now().UnixNano()),
+		ID:          q.nextID(toAgent),
 		ToAgent:     toAgent,
 		FromAgent:   fromAgent,
 		MessageType: messageType,
@@ -760,7 +764,7 @@ func (q *MessageQueue) SendAndReceive(ctx context.Context, fromAgent, toAgent, m
 	start := time.Now()
 
 	// Generate unique correlation ID
-	correlationID := fmt.Sprintf("corr-%s-%d", fromAgent, time.Now().UnixNano())
+	correlationID := q.nextID("corr-" + fromAgent)
 	if span != nil {
 		span.SetAttribute("correlation_id", correlationID)
 	}
@@ -783,7 +787,7 @@ func (q *MessageQueue) SendAndReceive(ctx context.Context, fromAgent, toAgent, m
 
 	// Send request message with correlation ID
 	msg := &QueueMessage{
-		ID:            fmt.Sprintf("%s-req-%d", toAgent, time.Now().UnixNano()),
+		ID:            q.nextID(toAgent + "-req"),
 		ToAgent:       toAgent,
 		FromAgent:     fromAgent,
 		MessageType:   messageType,

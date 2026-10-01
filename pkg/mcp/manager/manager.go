@@ -16,15 +16,24 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
+	loomconfig "github.com/teradata-labs/loom/pkg/config"
 	"github.com/teradata-labs/loom/pkg/mcp/client"
 	"github.com/teradata-labs/loom/pkg/mcp/protocol"
 	"github.com/teradata-labs/loom/pkg/mcp/transport"
 	"go.uber.org/zap"
 )
+
+// ErrServerNotFound reports that a server name is unknown to the manager —
+// either never configured or not currently connected, depending on the call.
+// Callers use errors.Is to distinguish a missing server from transport or
+// protocol failures (e.g. to evict stale tool-index entries, issue #334).
+var ErrServerNotFound = errors.New("server not found")
 
 // Manager orchestrates multiple MCP server connections.
 type Manager struct {
@@ -33,7 +42,23 @@ type Manager struct {
 	clients map[string]*client.Client
 	mu      sync.RWMutex
 	started bool
+
+	// Tool-list watching (subscriptions/listen) lifecycle: one watcher per
+	// stateless server, individually stoppable so StopServer/RemoveServer
+	// end a server's watcher without waiting for manager shutdown.
+	watchers map[string]*watcherHandle
 }
+
+// watcherHandle controls one server's tool-list watcher: closing stop asks
+// the watcher to exit; done closes when it has.
+type watcherHandle struct {
+	stop chan struct{}
+	done chan struct{}
+}
+
+// Logger returns the manager's structured logger (never nil), so
+// registration paths can hand adapters a real logger instead of a no-op.
+func (m *Manager) Logger() *zap.Logger { return m.logger }
 
 // NewManager creates a new MCP manager.
 func NewManager(config Config, logger *zap.Logger) (*Manager, error) {
@@ -46,9 +71,10 @@ func NewManager(config Config, logger *zap.Logger) (*Manager, error) {
 	}
 
 	return &Manager{
-		config:  config,
-		logger:  logger,
-		clients: make(map[string]*client.Client),
+		config:   config,
+		logger:   logger,
+		clients:  make(map[string]*client.Client),
+		watchers: make(map[string]*watcherHandle),
 	}, nil
 }
 
@@ -100,6 +126,12 @@ func (m *Manager) Start(ctx context.Context) error {
 
 // startServer initializes a single MCP server connection.
 func (m *Manager) startServer(ctx context.Context, name string, config ServerConfig) error {
+	for _, variable := range unresolvedEnvVariables(config.URL, config.Headers) {
+		m.logger.Warn("MCP configuration references an unset environment variable",
+			zap.String("server", name),
+			zap.String("variable", variable))
+	}
+
 	// Add timeout for the entire server startup
 	// This prevents hanging on unreachable servers
 	var cancel context.CancelFunc
@@ -132,7 +164,7 @@ func (m *Manager) startServer(ctx context.Context, name string, config ServerCon
 			Logger:  m.logger.With(zap.String("server", name)),
 		})
 	case "streamable-http":
-		// Streamable HTTP transport (MCP 2025-03-26 spec)
+		// Streamable HTTP transport (MCP 2025-03-26 spec).
 		trans, err = transport.NewStreamableHTTPTransport(transport.StreamableHTTPConfig{
 			Endpoint:         config.URL,
 			Headers:          config.Headers,
@@ -141,9 +173,11 @@ func (m *Manager) startServer(ctx context.Context, name string, config ServerCon
 			Logger:           m.logger.With(zap.String("server", name)),
 		})
 	case "http", "sse":
-		// Legacy HTTP/SSE transport (deprecated, backwards compatibility)
+		// Legacy HTTP/SSE transport (deprecated, backwards compatibility).
+		//nolint:staticcheck // frozen legacy path retained through the 2026-07-28 deprecation window
 		trans, err = transport.NewHTTPTransport(transport.HTTPConfig{
 			Endpoint: config.URL,
+			Headers:  config.Headers,
 			Logger:   m.logger.With(zap.String("server", name)),
 		})
 	default:
@@ -156,26 +190,62 @@ func (m *Manager) startServer(ctx context.Context, name string, config ServerCon
 
 	// Create client
 	mcpClient := client.NewClient(client.Config{
-		Transport: trans,
-		Logger:    m.logger.With(zap.String("server", name)),
+		Transport:       trans,
+		Logger:          m.logger.With(zap.String("server", name)),
+		ProtocolVersion: config.ProtocolVersion,
+		MRTR:            m.config.MRTR,
 	})
 
-	// Initialize with the timeout context
+	// Connect with the timeout context: negotiates the protocol revision
+	// (server/discover probe with initialize fallback), honoring any
+	// protocol_version pin from the server config.
 
 	clientInfo := protocol.Implementation{
 		Name:    m.config.ClientInfo.Name,
 		Version: m.config.ClientInfo.Version,
 	}
 
-	if err := mcpClient.Initialize(startCtx, clientInfo); err != nil {
+	if err := mcpClient.Connect(startCtx, clientInfo); err != nil {
 		_ = trans.Close()
-		return fmt.Errorf("failed to initialize: %w", err)
+		return fmt.Errorf("failed to connect: %w", err)
 	}
+
+	m.logger.Info("MCP server connected",
+		zap.String("server", name),
+		zap.String("negotiated_revision", mcpClient.NegotiatedVersion()),
+		zap.Bool("stateless", mcpClient.IsStateless()))
 
 	// Store client
 	m.clients[name] = mcpClient
 
+	// Stateless servers deliver tool-list changes via subscriptions/listen;
+	// keep the tool cache fresh for the server registration's lifetime.
+	if mcpClient.IsStateless() {
+		h := &watcherHandle{stop: make(chan struct{}), done: make(chan struct{})}
+		m.watchers[name] = h
+		// #nosec G118 -- the watcher's lifetime is the server registration's,
+		// not this start request's: startCtx carries a connect timeout that
+		// must not kill the long-lived watch loop. Shutdown is governed by the
+		// per-server stop channel (Stop/StopServer/RemoveServer close it).
+		go m.watchToolLists(name, mcpClient, h.stop, h.done)
+	}
+
 	return nil
+}
+
+// stopWatcherLocked stops the named server's watcher and waits for it to
+// exit; the caller holds m.mu. Waiting before the client is closed prevents
+// the watcher from issuing calls against a closed client, and removing the
+// registration prevents a duplicate watcher when the same name is re-added.
+// Watchers never take m.mu, so waiting under the lock cannot deadlock.
+func (m *Manager) stopWatcherLocked(name string) {
+	h, ok := m.watchers[name]
+	if !ok {
+		return
+	}
+	delete(m.watchers, name)
+	close(h.stop)
+	<-h.done
 }
 
 // Stop closes all server connections.
@@ -188,6 +258,11 @@ func (m *Manager) Stop() error {
 	}
 
 	m.logger.Info("Stopping MCP manager", zap.Int("server_count", len(m.clients)))
+
+	// Stop tool-list watchers before closing their clients.
+	for name := range m.watchers {
+		m.stopWatcherLocked(name)
+	}
 
 	var errors []error
 	for name, client := range m.clients {
@@ -248,8 +323,12 @@ func (m *Manager) StopServer(name string) error {
 
 	client, exists := m.clients[name]
 	if !exists {
-		return fmt.Errorf("server not found: %s", name)
+		return fmt.Errorf("%w: %s", ErrServerNotFound, name)
 	}
+
+	// The watcher must be gone before its client closes; otherwise it keeps
+	// retrying subscriptions against a closed client until manager shutdown.
+	m.stopWatcherLocked(name)
 
 	if err := client.Close(); err != nil {
 		m.logger.Error("Failed to close server",
@@ -270,7 +349,8 @@ func (m *Manager) RemoveServer(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Stop the client if it's running
+	// Stop the watcher, then the client if it's running
+	m.stopWatcherLocked(name)
 	if client, exists := m.clients[name]; exists {
 		if err := client.Close(); err != nil {
 			m.logger.Error("Failed to close server during removal",
@@ -295,7 +375,7 @@ func (m *Manager) GetClient(serverName string) (*client.Client, error) {
 
 	client, exists := m.clients[serverName]
 	if !exists {
-		return nil, fmt.Errorf("server not found: %s", serverName)
+		return nil, fmt.Errorf("%w: %s", ErrServerNotFound, serverName)
 	}
 
 	return client, nil
@@ -313,14 +393,47 @@ func (m *Manager) ServerNames() []string {
 	return names
 }
 
-// IsHealthy checks if a server is healthy by pinging it.
+func unresolvedEnvVariables(endpoint string, headers map[string]string) []string {
+	missing := make(map[string]struct{})
+	check := func(value string) {
+		for _, variable := range loomconfig.UnresolvedEnvPlaceholders(value) {
+			missing[variable] = struct{}{}
+		}
+	}
+	check(endpoint)
+	for _, value := range headers {
+		check(value)
+	}
+	variables := make([]string, 0, len(missing))
+	for variable := range missing {
+		variables = append(variables, variable)
+	}
+	slices.Sort(variables)
+	return variables
+}
+
+// IsHealthy checks if a server is healthy. Legacy-revision connections use
+// protocol ping; the method does not exist under the stateless 2026-07-28
+// revision, so those connections are probed with a lightweight tools/list
+// (which doubles as a tool-cache refresh).
 func (m *Manager) IsHealthy(ctx context.Context, serverName string) bool {
 	client, err := m.GetClient(serverName)
 	if err != nil {
 		return false
 	}
 
+	if client.IsStateless() {
+		if _, err := client.ListTools(ctx); err != nil {
+			m.logger.Warn("Server health check failed",
+				zap.String("server", serverName),
+				zap.Error(err))
+			return false
+		}
+		return true
+	}
+
 	// Ping the server
+	//nolint:staticcheck // frozen legacy path retained through the 2026-07-28 deprecation window
 	if err := client.Ping(ctx); err != nil {
 		m.logger.Warn("Server health check failed",
 			zap.String("server", serverName),
@@ -348,11 +461,16 @@ func (m *Manager) HealthCheck(ctx context.Context) map[string]bool {
 	return results
 }
 
-// GetServerConfig returns the configuration for a server.
+// GetServerConfig returns the configuration for a server. The read must hold
+// m.mu: AddServer/RemoveServer mutate m.config.Servers under the write lock,
+// so an unlocked read here is a data race.
 func (m *Manager) GetServerConfig(serverName string) (ServerConfig, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	config, exists := m.config.Servers[serverName]
 	if !exists {
-		return ServerConfig{}, fmt.Errorf("server not found: %s", serverName)
+		return ServerConfig{}, fmt.Errorf("%w: %s", ErrServerNotFound, serverName)
 	}
 	return config, nil
 }

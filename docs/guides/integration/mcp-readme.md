@@ -135,7 +135,7 @@ mcp:
 #### 2. streamable-http (Remote Servers - Modern)
 ✅ **Recommended for remote servers**
 
-Modern MCP transport (2025-03-26 spec) with session management and stream resumption.
+Streamable HTTP with per-server protocol revision negotiation. The client speaks the MCP **2026-07-28** stateless core (per-request `_meta`, multi round-trip requests, `subscriptions/listen`, required request headers) and automatically falls back to the legacy initialize handshake for 2024/2025-era servers — including strict session servers that reject pre-initialize requests. Legacy session IDs (`Mcp-Session-Id`) are adopted and echoed automatically when a legacy server mints one.
 
 ```yaml
 mcp:
@@ -144,21 +144,28 @@ mcp:
       transport: streamable-http
       url: https://api.example.com/mcp
       enabled: true
-      enable_sessions: true    # Session IDs for state management
-      enable_resumption: true  # Fault tolerance with event replay
+      protocol_version: auto   # auto (default) | legacy | exact revision, e.g. "2026-07-28"
 ```
+
+**`protocol_version` values:**
+- `auto` (or empty) — probe `server/discover` and negotiate the best mutual revision; fall back to the initialize handshake for legacy servers
+- `legacy` — skip the probe, always run the initialize handshake
+- an exact revision (e.g. `"2026-07-28"`, `"2025-03-26"`) — require the server to speak exactly that revision; fails loudly instead of silently downgrading
+
+Verify what a server actually negotiates with `just mcp-probe -url <endpoint>` (see the [MCP Probe guide](../mcp-probe.md)).
 
 **Use streamable-http when:**
 - Connecting to remote MCP servers
-- Need session management (Mcp-Session-Id headers)
-- Want fault tolerance with stream resumption
+- Talking to 2026-07-28 stateless servers, legacy session servers, or mixed fleets
 - Deploying in production environments
 
 **Features:**
 - Single unified endpoint
-- Session management via `Mcp-Session-Id` headers
-- Stream resumption with `Last-Event-ID`
-- Better error handling (HTTP 404 for expired sessions)
+- Per-server revision negotiation with typed, loud failures on pin mismatches
+- Legacy session management via `Mcp-Session-Id` headers (2024/2025-era servers)
+- Broken-stream recovery: a lost SSE response stream is re-issued once with an idempotency key
+
+> **Note:** `enable_sessions` and `enable_resumption` are deprecated no-ops. Legacy `Mcp-Session-Id` values are adopted automatically whenever a server returns one; SSE stream resumption (`Last-Event-ID`) was removed by the MCP 2026-07-28 revision. Both fields still parse so existing configurations keep loading; recovery is re-issue plus refetch instead of event replay.
 
 #### 3. http/sse (Remote Servers - Legacy)
 ⚠️ **Deprecated - Use streamable-http instead**
@@ -184,8 +191,6 @@ url: http://server.example.com/mcp
 transport: streamable-http
 url: http://server.example.com/mcp
 enabled: true
-enable_sessions: true
-enable_resumption: true
 ```
 
 ### Enabling/Disabling Servers

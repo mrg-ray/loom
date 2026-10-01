@@ -91,7 +91,7 @@ func TestBedrockThinking_ResponseParse(t *testing.T) {
 		t.Fatalf("unmarshal SDK message: %v", err)
 	}
 	c := bedrockThinkingClient("global.anthropic.claude-sonnet-5-v1:0", "auto")
-	r := c.convertResponseFromSDK(&msg)
+	r := c.convertResponseFromSDK(&msg, nil)
 	if r.Thinking != "the plan" {
 		t.Errorf("Thinking = %q", r.Thinking)
 	}

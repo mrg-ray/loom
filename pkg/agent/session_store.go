@@ -17,6 +17,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/artifacts"
 	"github.com/teradata-labs/loom/pkg/config"
 	"github.com/teradata-labs/loom/pkg/observability"
+	"github.com/teradata-labs/loom/pkg/task"
 	"github.com/teradata-labs/loom/pkg/types"
 )
 
@@ -38,6 +40,66 @@ var validSQLIdentifier = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 // Used for cleanup tasks like releasing shared memory references.
 // The hook receives the session ID being deleted.
 type SessionCleanupHook func(ctx context.Context, sessionID string)
+
+// storeUserID resolves the owner identity for session rows: the
+// authenticated caller when present, otherwise the single-tenant default —
+// so local no-auth deployments keep their pre-existing behavior while
+// auth-enabled deployments get per-user isolation (migration 000009).
+func storeUserID(ctx context.Context) string {
+	if u := types.UserIDFromContext(ctx); u != "" {
+		return u
+	}
+	return types.DefaultUserID
+}
+
+// SessionExists reports whether any session row has this id, regardless of
+// owner (see SessionStorage: an authorization primitive for resume gates,
+// not a data read — no session data is returned).
+func (s *SessionStore) SessionExists(ctx context.Context, sessionID string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var one int
+	err := s.db.QueryRowContext(ctx, "SELECT 1 FROM sessions WHERE id = ?", sessionID).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to check session existence: %w", err)
+	}
+	return true, nil
+}
+
+// ownsSession reports whether the context identity owns sessionID. Child
+// reads and writes are guarded through the owned parent: predicating on
+// session_id alone would let any caller who learns an ID read or write
+// another user's conversation. An unowned session is indistinguishable from
+// a missing one by design.
+func (s *SessionStore) ownsSession(ctx context.Context, sessionID string) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		"SELECT 1 FROM sessions WHERE id = ? AND user_id = ?", sessionID, storeUserID(ctx)).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// requireOwnedSession is ownsSession for write paths: the not-owned case is
+// an error naming the session as not found (never revealing foreign
+// existence).
+func (s *SessionStore) requireOwnedSession(ctx context.Context, sessionID string) error {
+	owned, err := s.ownsSession(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("session ownership check: %w", err)
+	}
+	if !owned {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	return nil
+}
 
 // SessionStore provides persistent storage for sessions, messages, and tool executions.
 // All database operations are traced to hawk for observability.
@@ -63,7 +125,12 @@ func NewSessionStoreWithConfig(config DBConfig, tracer observability.Tracer) (*S
 		return nil, err
 	}
 
-	// Enable WAL mode for better concurrency
+	// Enable WAL mode for better concurrency. journal_mode is a persistent
+	// database-level setting (stored in the file header), so a one-time Exec
+	// is sufficient — unlike busy_timeout/foreign_keys/key, which are
+	// per-connection and set via the DSN in OpenDB. Kept as an Exec here
+	// because OpenDB is also used for databases that must not be converted
+	// to WAL.
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
 	}
@@ -101,9 +168,11 @@ func (s *SessionStore) initSchema() error {
 		parent_session_id TEXT,
 		context_json TEXT,
 		created_at INTEGER NOT NULL,
+		incarnation INTEGER,
 		updated_at INTEGER NOT NULL,
 		total_cost_usd REAL DEFAULT 0,
 		total_tokens INTEGER DEFAULT 0,
+		user_id TEXT NOT NULL DEFAULT 'default-user',
 		FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE SET NULL
 	);
 
@@ -116,6 +185,7 @@ func (s *SessionStore) initSchema() error {
 		tool_use_id TEXT,
 		tool_result_json TEXT,
 		session_context TEXT DEFAULT 'direct',
+		task_id TEXT,
 		timestamp INTEGER NOT NULL,
 		token_count INTEGER DEFAULT 0,
 		cost_usd REAL DEFAULT 0,
@@ -133,6 +203,7 @@ func (s *SessionStore) initSchema() error {
 		result_json TEXT,
 		error TEXT,
 		execution_time_ms INTEGER,
+		admission_decision TEXT,
 		timestamp INTEGER NOT NULL,
 		FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 	);
@@ -278,15 +349,38 @@ func (s *SessionStore) initSchema() error {
 		"evicted": "ALTER TABLE messages ADD COLUMN evicted INTEGER NOT NULL DEFAULT 0",
 		"folded":  "ALTER TABLE messages ADD COLUMN folded INTEGER NOT NULL DEFAULT 0",
 		"turn":    "ALTER TABLE messages ADD COLUMN turn INTEGER NOT NULL DEFAULT 0",
+		// Admission audit decision (TER-710): stamped on every persisted tool
+		// execution; without this guard an upgraded DB fails every
+		// tool_executions INSERT (the error is swallowed) and persistence
+		// silently stops.
+		"admission_decision": "ALTER TABLE tool_executions ADD COLUMN admission_decision TEXT",
+		// Session ownership (MCP 2026-07-28 migration, Immediate brief Part A):
+		// pre-existing rows belong to the single-tenant default owner, matching
+		// the postgres 000006 convention. The sessions schema is owned by this
+		// initSchema (not the pkg/storage/sqlite migrator, whose 000001 only
+		// bootstraps): a numbered migration here would double-ALTER.
+		"user_id": "ALTER TABLE sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default-user'",
+		// incarnation is the session's creation nonce (nanosecond, stamped
+		// once, never updated): created_at survives the round trip at SECOND
+		// resolution only, so the implicit-task epoch needs its own column to
+		// distinguish a same-second delete-and-recreate. NULL on legacy rows,
+		// which read back 0 and fall back to a CreatedAt-derived epoch.
+		"incarnation": "ALTER TABLE sessions ADD COLUMN incarnation INTEGER",
+		// task_id attributes a message to the task claimed when it was written,
+		// so a task's timeline can be reconstructed from the rows that already
+		// record the work. NULL for ordinary chat.
+		"task_id": "ALTER TABLE messages ADD COLUMN task_id TEXT",
 	}
 
 	for columnName, migration := range agentMemoryMigrations {
 		// Check if column exists
 		var table string
-		if columnName == "session_context" || columnName == "message_agent_id" ||
-			columnName == "evicted" || columnName == "folded" || columnName == "turn" {
+		switch columnName {
+		case "session_context", "message_agent_id", "evicted", "folded", "turn", "task_id":
 			table = "messages"
-		} else {
+		case "admission_decision":
+			table = "tool_executions"
+		default:
 			table = "sessions"
 		}
 
@@ -315,6 +409,12 @@ func (s *SessionStore) initSchema() error {
 					indexSQL = "CREATE INDEX IF NOT EXISTS idx_messages_context ON messages(session_context)"
 				case "message_agent_id":
 					indexSQL = "CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id)"
+				case "user_id":
+					indexSQL = "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)"
+				case "task_id":
+					// Partial: task_id is NULL for most rows, so the NULL
+					// majority costs nothing to index.
+					indexSQL = "CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id, timestamp) WHERE task_id IS NOT NULL"
 				}
 				if indexSQL != "" {
 					if _, err := s.db.ExecContext(ctx, indexSQL); err != nil {
@@ -396,6 +496,21 @@ func (s *SessionStore) initSchema() error {
 	if span != nil {
 		span.SetAttribute("tables_created", "3")
 	}
+
+	// idx_messages_task is created HERE, after the column pass, and not in the
+	// static DDL block: on a fresh database task_id is in the CREATE TABLE, but
+	// on a legacy upgrade the column arrives via the ALTER above — and the
+	// static block runs before it, so a static CREATE INDEX failed the whole
+	// initSchema on every pre-task_id database ("no such column"). Running it
+	// unconditionally after the pass covers both paths; before this line the
+	// index existed only on upgraded databases and the fresh-install timeline
+	// read was a full table scan (11x slower at 200k rows). Partial: task_id is
+	// NULL for most rows, so the NULL majority costs nothing to index.
+	if _, err := s.db.ExecContext(ctx,
+		"CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id, timestamp) WHERE task_id IS NOT NULL"); err != nil {
+		return fmt.Errorf("failed to create idx_messages_task: %w", err)
+	}
+
 	return nil
 }
 
@@ -414,9 +529,12 @@ func (s *SessionStore) SaveSession(ctx context.Context, session *Session) error 
 		return fmt.Errorf("failed to marshal context: %w", err)
 	}
 
+	// The upsert is ownership-guarded: a conflicting row belonging to a
+	// different user is left untouched (the DO UPDATE WHERE clause fails), so
+	// a caller cannot overwrite another user's session by reusing its ID.
 	query := `
-		INSERT INTO sessions (id, name, agent_id, parent_session_id, context_json, created_at, updated_at, total_cost_usd, total_tokens)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sessions (id, name, agent_id, parent_session_id, context_json, created_at, updated_at, total_cost_usd, total_tokens, user_id, incarnation)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			agent_id = excluded.agent_id,
@@ -425,6 +543,7 @@ func (s *SessionStore) SaveSession(ctx context.Context, session *Session) error 
 			updated_at = excluded.updated_at,
 			total_cost_usd = excluded.total_cost_usd,
 			total_tokens = excluded.total_tokens
+		WHERE sessions.user_id = excluded.user_id
 	`
 
 	// Handle NULL for empty optional fields (SQLite compatibility)
@@ -439,6 +558,17 @@ func (s *SessionStore) SaveSession(ctx context.Context, session *Session) error 
 		parentSessionID = session.ParentSessionID
 	}
 
+	// The authenticated context is authoritative for ownership: a caller
+	// cannot claim another owner by presetting session.UserID. The struct
+	// field is only the fallback for identity-less internal flows.
+	owner := session.UserID
+	if u := types.UserIDFromContext(ctx); u != "" {
+		owner = u
+	}
+	if owner == "" {
+		owner = types.DefaultUserID
+	}
+
 	_, err = s.db.ExecContext(ctx, query,
 		session.ID,
 		sessionName,
@@ -449,6 +579,8 @@ func (s *SessionStore) SaveSession(ctx context.Context, session *Session) error 
 		session.UpdatedAt.Unix(),
 		session.TotalCostUSD,
 		session.TotalTokens,
+		owner,
+		session.Incarnation,
 	)
 	s.mu.Unlock()
 
@@ -477,12 +609,13 @@ func (s *SessionStore) LoadSession(ctx context.Context, sessionID string) (*Sess
 	defer s.mu.RUnlock()
 
 	query := `
-		SELECT id, name, agent_id, parent_session_id, context_json, created_at, updated_at, total_cost_usd, total_tokens
+		SELECT id, name, agent_id, parent_session_id, context_json, created_at, updated_at, total_cost_usd, total_tokens,
+		       COALESCE(incarnation, 0)
 		FROM sessions
-		WHERE id = ?
+		WHERE id = ? AND user_id = ?
 	`
 
-	row := s.db.QueryRowContext(ctx, query, sessionID)
+	row := s.db.QueryRowContext(ctx, query, sessionID, storeUserID(ctx))
 
 	var session Session
 	var contextJSON string
@@ -499,6 +632,7 @@ func (s *SessionStore) LoadSession(ctx context.Context, sessionID string) (*Sess
 		&updatedAt,
 		&session.TotalCostUSD,
 		&session.TotalTokens,
+		&session.Incarnation,
 	)
 
 	// Populate optional fields from nullable database values
@@ -511,8 +645,8 @@ func (s *SessionStore) LoadSession(ctx context.Context, sessionID string) (*Sess
 	if parentSessionID.Valid {
 		session.ParentSessionID = parentSessionID.String
 	}
-	// SQLite backend is single-tenant; set default UserID
-	session.UserID = "default-user"
+	// The row matched the caller's identity predicate; record that owner.
+	session.UserID = storeUserID(ctx)
 
 	if err == sql.ErrNoRows {
 		span.SetAttribute("found", "false")
@@ -555,6 +689,10 @@ func (s *SessionStore) SaveMessage(ctx context.Context, sessionID string, msg *M
 	defer s.tracer.EndSpan(span)
 	span.SetAttribute("session_id", sessionID)
 	span.SetAttribute("role", msg.Role)
+
+	if err := s.requireOwnedSession(ctx, sessionID); err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -615,9 +753,22 @@ func (s *SessionStore) SaveMessage(ctx context.Context, sessionID string, msg *M
 		folded = 1
 	}
 
+	// Attribute the message to the task claimed for this work, if any. An
+	// explicit msg.TaskID wins; otherwise fall back to the ambient attribution
+	// on the context. Both empty is the normal case and stores NULL — a message
+	// written outside any task is not an error.
+	taskIDValue := msg.TaskID
+	if taskIDValue == "" {
+		taskIDValue = task.TaskIDFromContext(ctx)
+	}
+	var taskID *string
+	if taskIDValue != "" {
+		taskID = &taskIDValue
+	}
+
 	query := `
-		INSERT INTO messages (session_id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, timestamp, token_count, cost_usd, evicted, folded, turn)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+		INSERT INTO messages (session_id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, task_id, timestamp, token_count, cost_usd, evicted, folded, turn)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			(SELECT COALESCE(MAX(turn), 0) + ? FROM messages WHERE session_id = ?))
 	`
 
@@ -630,6 +781,7 @@ func (s *SessionStore) SaveMessage(ctx context.Context, sessionID string, msg *M
 		toolResultJSON,
 		string(sessionContext),
 		agentID,
+		taskID,
 		msg.Timestamp.Unix(),
 		msg.TokenCount,
 		msg.CostUSD,
@@ -672,6 +824,12 @@ func (s *SessionStore) LoadMessages(ctx context.Context, sessionID string) ([]Me
 	defer s.tracer.EndSpan(span)
 	span.SetAttribute("session_id", sessionID)
 
+	if owned, err := s.ownsSession(ctx, sessionID); err != nil {
+		return nil, err
+	} else if !owned {
+		return nil, nil // unowned reads as missing by design
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -694,14 +852,17 @@ func (s *SessionStore) loadMessagesLocked(ctx context.Context, sessionID string)
 	// are never loaded into memory at all; the summary stands in for them.
 	// Replay order is the seq (messages.id), which also removes the old
 	// equal-timestamp nondeterminism of timestamp ordering.
+	// The owner predicate is defense in depth: callers guard first, but this
+	// helper must not become a cross-user read if a future caller forgets.
 	query := `
-		SELECT id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, timestamp, token_count, cost_usd, evicted, folded, turn
+		SELECT id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, task_id, timestamp, token_count, cost_usd, evicted, folded, turn
 		FROM messages
 		WHERE session_id = ? AND folded = 0
+		AND EXISTS (SELECT 1 FROM sessions WHERE id = messages.session_id AND user_id = ?)
 		ORDER BY id ASC
 	`
 
-	rows, err := s.db.QueryContext(ctx, query, sessionID)
+	rows, err := s.db.QueryContext(ctx, query, sessionID, storeUserID(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query messages: %w", err)
 	}
@@ -712,7 +873,7 @@ func (s *SessionStore) loadMessagesLocked(ctx context.Context, sessionID string)
 		var msg Message
 		var msgID int64
 		var toolCallsJSON, toolUseID, toolResultJSON *string
-		var sessionContext, agentID sql.NullString
+		var sessionContext, agentID, taskID sql.NullString
 		var timestamp int64
 		var evicted, folded int
 
@@ -725,6 +886,7 @@ func (s *SessionStore) loadMessagesLocked(ctx context.Context, sessionID string)
 			&toolResultJSON,
 			&sessionContext,
 			&agentID,
+			&taskID,
 			&timestamp,
 			&msg.TokenCount,
 			&msg.CostUSD,
@@ -746,8 +908,14 @@ func (s *SessionStore) loadMessagesLocked(ctx context.Context, sessionID string)
 		if agentID.Valid {
 			msg.AgentID = agentID.String
 		}
-		// SQLite backend is single-tenant; set default UserID
-		msg.UserID = "default-user"
+		// task_id is NULL for any message written outside a claimed task, which
+		// is the common case.
+		if taskID.Valid {
+			msg.TaskID = taskID.String
+		}
+		// Messages carry no user_id column in SQLite; the owner predicate
+		// above guarantees these rows belong to the context identity.
+		msg.UserID = storeUserID(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
 		}
@@ -792,6 +960,12 @@ func (s *SessionStore) ListMessagesBySeqRange(ctx context.Context, sessionID str
 	ctx, span := s.tracer.StartSpan(ctx, "session_store.list_messages_by_seq_range")
 	defer s.tracer.EndSpan(span)
 	span.SetAttribute("session_id", sessionID)
+
+	if owned, err := s.ownsSession(ctx, sessionID); err != nil {
+		return nil, err
+	} else if !owned {
+		return nil, nil // unowned reads as missing by design
+	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -888,11 +1062,11 @@ func (s *SessionStore) LoadAgentSessions(ctx context.Context, agentID string) ([
 	query := `
 		SELECT id
 		FROM sessions
-		WHERE agent_id = ?
+		WHERE agent_id = ? AND user_id = ?
 		ORDER BY updated_at DESC
 	`
 
-	rows, err := s.db.QueryContext(ctx, query, agentID)
+	rows, err := s.db.QueryContext(ctx, query, agentID, storeUserID(ctx))
 	if err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("failed to query agent sessions: %w", err)
@@ -939,21 +1113,27 @@ func (s *SessionStore) LoadMessagesForAgent(ctx context.Context, agentID string)
 		       m.tool_result_json, m.session_context, m.agent_id, m.timestamp, m.token_count, m.cost_usd,
 		       m.evicted, m.turn, m.session_id
 		FROM messages m
-		WHERE m.folded = 0 AND ((
+		WHERE m.folded = 0
+		-- Every returned message must live in a session the caller owns: the
+		-- branch subqueries scope the agent's own sessions, but a hostile
+		-- parent_session_id link could otherwise pull a foreign parent's rows.
+		AND m.session_id IN (SELECT id FROM sessions WHERE user_id = ?)
+		AND ((
 			-- Messages from sessions owned by this agent (all contexts)
-			m.session_id IN (SELECT id FROM sessions WHERE agent_id = ?)
+			m.session_id IN (SELECT id FROM sessions WHERE agent_id = ? AND user_id = ?)
 		) OR (
 			-- Messages from parent sessions (coordinator and shared only)
 			m.session_id IN (
 				SELECT parent_session_id FROM sessions
-				WHERE agent_id = ? AND parent_session_id IS NOT NULL
+				WHERE agent_id = ? AND parent_session_id IS NOT NULL AND user_id = ?
 			)
 			AND m.session_context IN ('coordinator', 'shared')
 		))
 		ORDER BY m.timestamp ASC
 	`
 
-	rows, err := s.db.QueryContext(ctx, query, agentID, agentID)
+	uid := storeUserID(ctx)
+	rows, err := s.db.QueryContext(ctx, query, uid, agentID, uid, agentID, uid)
 	if err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("failed to query agent messages: %w", err)
@@ -1048,12 +1228,26 @@ func (s *SessionStore) LoadMessagesFromParentSession(ctx context.Context, sessio
 	defer s.tracer.EndSpan(span)
 	span.SetAttribute("session_id", sessionID)
 
+	if owned, err := s.ownsSession(ctx, sessionID); err != nil {
+		return nil, err
+	} else if !owned {
+		return nil, nil // unowned reads as missing by design
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// First, get the parent_session_id
+	// First, get the parent_session_id. The parent must belong to the same
+	// owner: parent_session_id is caller-supplied at save time, so a hostile
+	// child linked to a foreign parent must read as parentless, not leak the
+	// parent's conversation (mirrors the postgres store).
 	var parentSessionID sql.NullString
-	err := s.db.QueryRowContext(ctx, "SELECT parent_session_id FROM sessions WHERE id = ?", sessionID).
+	err := s.db.QueryRowContext(ctx, `
+		SELECT c.parent_session_id FROM sessions c
+		WHERE c.id = ? AND c.user_id = ?
+		AND (c.parent_session_id IS NULL OR EXISTS (
+			SELECT 1 FROM sessions p WHERE p.id = c.parent_session_id AND p.user_id = c.user_id
+		))`, sessionID, storeUserID(ctx)).
 		Scan(&parentSessionID)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -1072,17 +1266,19 @@ func (s *SessionStore) LoadMessagesFromParentSession(ctx context.Context, sessio
 	span.SetAttribute("parent_session_id", parentSessionID.String)
 	span.SetAttribute("has_parent", "true")
 
-	// Load messages from parent session that are relevant to sub-agents
+	// Load messages from parent session that are relevant to sub-agents. The
+	// owner predicate repeats here as defense in depth on the read itself.
 	query := `
 		SELECT id, role, content, tool_calls_json, tool_use_id, tool_result_json,
 		       session_context, agent_id, timestamp, token_count, cost_usd, evicted, turn
 		FROM messages
 		WHERE session_id = ? AND folded = 0
 		AND session_context IN ('coordinator', 'shared')
+		AND EXISTS (SELECT 1 FROM sessions WHERE id = messages.session_id AND user_id = ?)
 		ORDER BY timestamp ASC
 	`
 
-	rows, err := s.db.QueryContext(ctx, query, parentSessionID.String)
+	rows, err := s.db.QueryContext(ctx, query, parentSessionID.String, storeUserID(ctx))
 	if err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("failed to query parent messages: %w", err)
@@ -1174,6 +1370,10 @@ func (s *SessionStore) SaveToolExecution(ctx context.Context, sessionID string, 
 	span.SetAttribute("session_id", sessionID)
 	span.SetAttribute("tool_name", exec.ToolName)
 
+	if err := s.requireOwnedSession(ctx, sessionID); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1213,9 +1413,16 @@ func (s *SessionStore) SaveToolExecution(ctx context.Context, sessionID string, 
 		execTimeMs = &exec.Result.ExecutionTimeMs
 	}
 
+	// Audit decision — NULL unless an audit binding matched this call (SC-004:
+	// only non-empty rows count as audit records).
+	var admissionDecision *string
+	if exec.AdmissionDecision != "" {
+		admissionDecision = &exec.AdmissionDecision
+	}
+
 	query := `
-		INSERT INTO tool_executions (session_id, tool_name, input_json, result_json, error, execution_time_ms, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO tool_executions (session_id, tool_name, input_json, result_json, error, execution_time_ms, admission_decision, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	_, err = s.db.ExecContext(ctx, query,
@@ -1225,6 +1432,7 @@ func (s *SessionStore) SaveToolExecution(ctx context.Context, sessionID string, 
 		resultJSON,
 		errMsg,
 		execTimeMs,
+		admissionDecision,
 		time.Now().Unix(),
 	)
 
@@ -1249,12 +1457,21 @@ func (s *SessionStore) DeleteSession(ctx context.Context, sessionID string) erro
 	span.SetAttribute("session_id", sessionID)
 
 	s.mu.Lock()
-	// CASCADE delete will remove messages, tool executions, and artifacts
-	_, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE id = ?", sessionID)
+	// CASCADE delete will remove messages, tool executions, and artifacts.
+	// The owner predicate makes cross-user deletion a silent no-op.
+	res, err := s.db.ExecContext(ctx, "DELETE FROM sessions WHERE id = ? AND user_id = ?", sessionID, storeUserID(ctx))
 	if err != nil {
 		s.mu.Unlock()
 		span.RecordError(err)
 		return fmt.Errorf("failed to delete session: %w", err)
+	}
+	// Filesystem cleanup and hooks fire only when an owned row was actually
+	// deleted — otherwise a caller who merely knows a foreign session ID
+	// would erase its artifact directory as a side effect of a no-op.
+	if n, raErr := res.RowsAffected(); raErr == nil && n == 0 {
+		s.mu.Unlock()
+		span.SetAttribute("deleted", "false")
+		return nil
 	}
 
 	// Copy hooks to avoid holding lock during callback execution
@@ -1292,7 +1509,7 @@ func (s *SessionStore) ListSessions(ctx context.Context) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.QueryContext(ctx, "SELECT id FROM sessions ORDER BY updated_at DESC")
+	rows, err := s.db.QueryContext(ctx, "SELECT id FROM sessions WHERE user_id = ? ORDER BY updated_at DESC", storeUserID(ctx))
 	if err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("failed to query sessions: %w", err)
@@ -1321,6 +1538,10 @@ func (s *SessionStore) ListSessions(ctx context.Context) ([]string, error) {
 // MarkEvicted sets evicted=1 on the given rows in one transaction (relief
 // operation; HLD §5.2). Flags are write-once — no code path clears them.
 func (s *SessionStore) MarkEvicted(ctx context.Context, sessionID string, seqs []int64) error {
+
+	if err := s.requireOwnedSession(ctx, sessionID); err != nil {
+		return err
+	}
 	if len(seqs) == 0 {
 		return nil
 	}
@@ -1359,6 +1580,10 @@ func (s *SessionStore) FoldMessages(ctx context.Context, sessionID string, seqs 
 	defer s.tracer.EndSpan(span)
 	span.SetAttribute("session_id", sessionID)
 	span.SetAttribute("version", fmt.Sprintf("%d", n))
+
+	if err := s.requireOwnedSession(ctx, sessionID); err != nil {
+		return err
+	}
 
 	content, err := json.Marshal(map[string]interface{}{"n": n, "text": text})
 	if err != nil {
@@ -1422,6 +1647,10 @@ func (s *SessionStore) SaveMemorySnapshot(ctx context.Context, sessionID, snapsh
 	span.SetAttribute("snapshot_type", snapshotType)
 	span.SetAttribute("token_count", fmt.Sprintf("%d", tokenCount))
 
+	if err := s.requireOwnedSession(ctx, sessionID); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1465,6 +1694,12 @@ func (s *SessionStore) LoadMemorySnapshots(ctx context.Context, sessionID string
 	defer s.tracer.EndSpan(span)
 	span.SetAttribute("session_id", sessionID)
 	span.SetAttribute("snapshot_type", snapshotType)
+
+	if owned, err := s.ownsSession(ctx, sessionID); err != nil {
+		return nil, err
+	} else if !owned {
+		return nil, nil // unowned reads as missing by design
+	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1544,36 +1779,45 @@ func (s *SessionStore) GetStats(ctx context.Context) (*Stats, error) {
 
 	stats := &Stats{}
 
+	// Every aggregate is scoped to the caller's own sessions: stats are a
+	// per-tenant view, and global counts/costs would leak another user's
+	// activity volume (the postgres twin scopes the same way).
+	uid := storeUserID(ctx)
+
 	// Count sessions
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sessions").Scan(&stats.SessionCount)
+	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sessions WHERE user_id = ?", uid).Scan(&stats.SessionCount)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
 	// Count messages
-	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM messages").Scan(&stats.MessageCount)
+	err = s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE user_id = ?)", uid).
+		Scan(&stats.MessageCount)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
 	// Count tool executions
-	err = s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM tool_executions").Scan(&stats.ToolExecutionCount)
+	err = s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM tool_executions WHERE session_id IN (SELECT id FROM sessions WHERE user_id = ?)", uid).
+		Scan(&stats.ToolExecutionCount)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
 	// Sum costs
-	err = s.db.QueryRowContext(ctx, "SELECT COALESCE(SUM(total_cost_usd), 0) FROM sessions").Scan(&stats.TotalCostUSD)
+	err = s.db.QueryRowContext(ctx, "SELECT COALESCE(SUM(total_cost_usd), 0) FROM sessions WHERE user_id = ?", uid).Scan(&stats.TotalCostUSD)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
 	// Sum tokens
-	err = s.db.QueryRowContext(ctx, "SELECT COALESCE(SUM(total_tokens), 0) FROM sessions").Scan(&stats.TotalTokens)
+	err = s.db.QueryRowContext(ctx, "SELECT COALESCE(SUM(total_tokens), 0) FROM sessions WHERE user_id = ?", uid).Scan(&stats.TotalTokens)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -1666,18 +1910,22 @@ func (s *SessionStore) SearchMessages(ctx context.Context, sessionID, query stri
 	var rows *sql.Rows
 	var err error
 
+	// Both branches scope results to sessions the caller owns: the FTS5 index
+	// spans every user's messages, so an unscoped MATCH is a cross-user read.
+	uid := storeUserID(ctx)
 	if sessionID == "" {
-		// Search across ALL sessions when sessionID is empty
+		// Search across ALL sessions owned by the caller when sessionID is empty
 		sqlQuery = `
 			SELECT m.role, m.content, m.tool_calls_json,
 			       m.tool_use_id, m.tool_result_json, m.timestamp, m.token_count, m.cost_usd
 			FROM messages_fts5
 			JOIN messages m ON messages_fts5.message_id = m.id
-			WHERE messages_fts5.content MATCH ?
+			JOIN sessions sess ON m.session_id = sess.id
+			WHERE sess.user_id = ? AND messages_fts5.content MATCH ?
 			ORDER BY bm25(messages_fts5)
 			LIMIT ?
 		`
-		rows, err = s.db.QueryContext(ctx, sqlQuery, fts5Query, limit)
+		rows, err = s.db.QueryContext(ctx, sqlQuery, uid, fts5Query, limit)
 	} else {
 		// Search within specific session
 		sqlQuery = `
@@ -1685,11 +1933,12 @@ func (s *SessionStore) SearchMessages(ctx context.Context, sessionID, query stri
 			       m.tool_use_id, m.tool_result_json, m.timestamp, m.token_count, m.cost_usd
 			FROM messages_fts5
 			JOIN messages m ON messages_fts5.message_id = m.id
-			WHERE messages_fts5.session_id = ? AND messages_fts5.content MATCH ?
+			JOIN sessions sess ON m.session_id = sess.id
+			WHERE messages_fts5.session_id = ? AND sess.user_id = ? AND messages_fts5.content MATCH ?
 			ORDER BY bm25(messages_fts5)
 			LIMIT ?
 		`
-		rows, err = s.db.QueryContext(ctx, sqlQuery, sessionID, fts5Query, limit)
+		rows, err = s.db.QueryContext(ctx, sqlQuery, sessionID, uid, fts5Query, limit)
 	}
 	if err != nil {
 		span.RecordError(err)
@@ -1782,20 +2031,20 @@ func (s *SessionStore) SearchMessagesByAgent(ctx context.Context, agentID, query
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// FTS5 MATCH query with BM25 ranking, filtered by agent_id
-	// Joins messages_fts5 with messages and sessions to filter by agent
+	// FTS5 MATCH query with BM25 ranking, filtered by agent_id and scoped to
+	// the caller's own sessions (the index spans every user's messages).
 	sqlQuery := `
 		SELECT m.role, m.content, m.tool_calls_json,
 		       m.tool_use_id, m.tool_result_json, m.timestamp, m.token_count, m.cost_usd
 		FROM messages_fts5
 		JOIN messages m ON messages_fts5.message_id = m.id
 		JOIN sessions s ON m.session_id = s.id
-		WHERE s.agent_id = ? AND messages_fts5.content MATCH ?
+		WHERE s.agent_id = ? AND s.user_id = ? AND messages_fts5.content MATCH ?
 		ORDER BY bm25(messages_fts5)
 		LIMIT ?
 	`
 
-	rows, err := s.db.QueryContext(ctx, sqlQuery, agentID, fts5Query, limit)
+	rows, err := s.db.QueryContext(ctx, sqlQuery, agentID, storeUserID(ctx), fts5Query, limit)
 	if err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("agent-scoped FTS5 search failed: %w", err)
