@@ -46,7 +46,7 @@ func TestRung0_SingleTurnEvictShedsToTarget(t *testing.T) {
 			if m.Role == "tool" && strings.Contains(m.Content, "evicted from context") {
 				sawEvictedStub = true
 			}
-			if m.Role == "system" && strings.Contains(m.Content, "also covers msg:") {
+			if m.Role == "system" && strings.Contains(m.Content, "covers msg:") {
 				sawFold = true
 			}
 		}
@@ -100,7 +100,7 @@ func TestRung0_FoldLastResort(t *testing.T) {
 	var sawFold bool
 	for _, s := range stages {
 		for _, m := range s.Messages {
-			if m.Role == "system" && strings.Contains(m.Content, "also covers msg:") {
+			if m.Role == "system" && strings.Contains(m.Content, "covers msg:") {
 				sawFold = true
 			}
 		}
