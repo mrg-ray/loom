@@ -106,8 +106,34 @@ func TestInloopFold_NeedsFoldTracksMark(t *testing.T) {
 	sm := NewSegmentedMemory("ROM", 4000, 400) // tiny window: mark ≈ a few K tokens
 	sm.SetThreshold(1024)
 	assert.False(t, sm.NeedsFold())
-	for turn := int64(1); turn <= 6; turn++ {
+	for turn := int64(1); turn <= 9; turn++ {
 		sm.AddMessage(context.Background(), Message{Role: "assistant", Content: strings.Repeat("x ", 800), Turn: turn})
 	}
 	assert.True(t, sm.NeedsFold())
+}
+
+// TestInloopFold_InFlightResultsNeverTrigger — the estimate excludes tool
+// results the model has not yet consumed (rows after the last assistant row).
+// A fold fired on their mass cannot commit — the collapse protects the
+// pending pair — so unconsumed mass must not arm the fold. Once the model's
+// next response consumes the batch, the same mass counts and the fold arms.
+func TestInloopFold_InFlightResultsNeverTrigger(t *testing.T) {
+	sm := NewSegmentedMemory("ROM", 4000, 400) // tiny window: mark ≈ a few K tokens
+	sm.SetThreshold(100000)                    // no offload stubs — raw results in the estimate
+	ctx := context.Background()
+
+	sm.AddMessage(ctx, Message{Role: "user", Content: "find the bug", Turn: 1})
+	sm.AddMessage(ctx, Message{Role: "assistant", Turn: 1,
+		ToolCalls: []ToolCall{{ID: "c1", Name: "file_read", Input: map[string]interface{}{}}}})
+	// A huge unconsumed batch: far past the mark on its own.
+	sm.AddMessage(ctx, Message{Role: "tool", ToolUseID: "c1", Content: strings.Repeat("y ", 8000), Turn: 1})
+
+	assert.False(t, sm.NeedsFold(),
+		"unconsumed results are unshedable — they must not arm the fold")
+
+	// The model consumes the batch: the same mass is now past, and sheddable.
+	sm.AddMessage(ctx, Message{Role: "assistant", Content: "the bug is in the parser", Turn: 2})
+
+	assert.True(t, sm.NeedsFold(),
+		"once consumed, the batch counts and the fold arms")
 }

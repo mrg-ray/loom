@@ -87,7 +87,8 @@ func (sm *SegmentedMemory) compileLocked() []Message {
 	// from HERE down — ROM and the tool schemas stay cached across folds.
 	if sm.summary.text != "" {
 		out = append(out, Message{Role: "user",
-			Content: "<system-reminder>\nSession summary — the work so far:\n\n" + sm.summary.text + "\n</system-reminder>"})
+			Content: "<system-reminder>\nSession summary — the work so far:\n\n" + sm.summary.text +
+				"\n\nExact values quoted in this summary (expected outputs, literals, paths, interfaces) are unverified — the summary may restate them imprecisely. Before relying on one, read it from its source.\n</system-reminder>"})
 	}
 
 	// Step 5: T — the session's current turn number.
@@ -470,7 +471,7 @@ const msgFramingTokens = 4
 // deliberately smaller than the real bytes-per-token of this system's content
 // (~3.3), so the byte bound OVER-counts tokens: the cheap tier may tokenize a
 // little early, but it never reports "under" when we are actually near the limit.
-const cheapBytesPerToken = 2.7
+const cheapBytesPerToken = 2.0
 
 // estimateLocked returns the token count of the compiled context (KERNEL + ROM +
 // summary + L1 view). Two tiers, so the tokenizer runs only near the limit:
@@ -483,9 +484,30 @@ const cheapBytesPerToken = 2.7
 func (sm *SegmentedMemory) estimateLocked() int {
 	compiled := sm.compileLocked()
 
+	// The in-flight batch: tool results after the last assistant row. The
+	// model has not consumed them and no fold may excise them, so no trigger
+	// may count them — an estimate inflated by unshedable mass fires folds
+	// that cannot commit (the collapse finds nothing removable), and the
+	// pressure failsafe then churns the prefix on every call. The batch is
+	// consumed by the model's next response, ages into excisable past, and
+	// counts from then on. The provider refusal backstop still covers real
+	// overflow.
+	lastAssistant := -1
+	for i := range compiled {
+		if compiled[i].Role == "assistant" {
+			lastAssistant = i
+		}
+	}
+	inFlight := func(i int) bool {
+		return compiled[i].Role == "tool" && i > lastAssistant
+	}
+
 	// Cheap tier — byte bound, no tokenization.
 	bytes := sm.kernelBytes
 	for i := range compiled {
+		if inFlight(i) {
+			continue
+		}
 		bytes += len(compiled[i].Content)
 		if len(compiled[i].ToolCalls) > 0 {
 			if b, err := json.Marshal(compiled[i].ToolCalls); err == nil {
@@ -508,6 +530,9 @@ func (sm *SegmentedMemory) estimateLocked() int {
 	}
 	tokens := tokenFigure(sm.kernelBytes)
 	for i := range compiled {
+		if inFlight(i) {
+			continue
+		}
 		tokens += sm.msgTokensLocked(tc, &compiled[i])
 	}
 	return tokens
@@ -599,18 +624,22 @@ func (sm *SegmentedMemory) marksLocked() (start, release int) {
 	return start, release
 }
 
-// startMarkLocked is the HWM: begin relief when the estimate reaches it. penalty
-// (percentage points) lowers it for the recovery pass. Must hold lock.
+// startMarkLocked is the HWM: begin relief when the estimate reaches it. The
+// configured MaxTokens IS G — the growth budget (fold every ~G of sheddable
+// conversation), an absolute the same for every model, NOT a fraction of a
+// provider window. The provider's real ceiling is enforced only by the
+// refusal backstop. penalty (percentage points) lowers the mark for the
+// recovery pass. Must hold lock.
 func (sm *SegmentedMemory) startMarkLocked(penalty int) int {
-	start, _ := sm.marksLocked()
-	return applyPenalty(start, penalty) * sm.usableLocked() / 100
+	return applyPenalty(100, penalty) * sm.tokenBudget.MaxTokens / 100
 }
 
-// releaseMarkLocked is the LWM: shed down to it. penalty lowers it in step with
-// startMarkLocked so the recovery pass sheds deeper. Must hold lock.
+// releaseMarkLocked is the LWM: shed down to it — the profile's release
+// percentage applied to G. penalty lowers it in step with startMarkLocked so
+// the recovery pass sheds deeper. Must hold lock.
 func (sm *SegmentedMemory) releaseMarkLocked(penalty int) int {
 	_, release := sm.marksLocked()
-	return applyPenalty(release, penalty) * sm.usableLocked() / 100
+	return applyPenalty(release, penalty) * sm.tokenBudget.MaxTokens / 100
 }
 
 // --- releasePressure (HLD §5.2) ----------------------------------------------
@@ -1196,7 +1225,7 @@ func foldedSkillLoads(region []Message) []string {
 // defaultProtectedRecentTurns is K (HLD §5.1): the top rung of the halving
 // escalation ladder — the newest user turns relief tries hardest to keep. The
 // ladder folds/evicts at K, K/2, K/4 … 1 (§5.2).
-const defaultProtectedRecentTurns = 16
+const defaultProtectedRecentTurns = 4
 
 // SetProtectedRecentTurns configures K (config ProtectedRecentTurns, §9).
 func (sm *SegmentedMemory) SetProtectedRecentTurns(k int) {

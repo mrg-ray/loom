@@ -55,6 +55,11 @@ Write for one reader: yourself, continuing this work with nothing but this
 summary and your most recent turns. Everything you write should serve the
 remaining work; everything that serves nothing ahead is dropped.
 
+A session summary is already in context. It is the complete record of
+everything before your recent turns, and what you write now REPLACES it.
+Carry forward everything in it that still serves the work; whatever you omit
+is gone for good. Fold the recent turns into it — do not summarise them alone.
+
 Write the current state in the present tense — never the story of how it got
 here. Keep, in this order: the operator's instructions and rulings, verbatim
 where the wording carries force; decisions with their rationale; approaches

@@ -411,27 +411,18 @@ func TestEffectiveOutputReservation(t *testing.T) {
 // property: with the reservation applied, the relief start mark sits below the
 // provider's ceiling (window − max_tokens), so proactive relief fires before a
 // refusal instead of after it.
-func TestEffectiveOutputReservation_MarksStayBelowRefusalLine(t *testing.T) {
-	const window, wireMaxTokens = 200000, 64000
-
-	reserve := EffectiveOutputReservation("anthropic", "claude-sonnet-4-6", wireMaxTokens, 0, window)
-	sm := NewSegmentedMemory("ROM", window, reserve)
-
-	sm.mu.Lock()
-	start := sm.startMarkLocked(0)
-	sm.mu.Unlock()
-
-	refusalLine := window - wireMaxTokens
-	assert.LessOrEqual(t, start, refusalLine,
-		"the start mark must sit at or below window − max_tokens, or relief can never fire")
-
-	// The pre-fix 10% reserve put the mark above the line — guard the regression.
-	stale := NewSegmentedMemory("ROM", window, window/10)
-	stale.mu.Lock()
-	staleStart := stale.startMarkLocked(0)
-	stale.mu.Unlock()
-	assert.Greater(t, staleStart, refusalLine,
-		"precondition: the 10% reserve is exactly the geometry this fix corrects")
+func TestMarks_IgnoreOutputReservation(t *testing.T) {
+	// G semantics: the start mark is the configured budget itself. The output
+	// reservation is a wire concern (the request's max_tokens); it must not
+	// bend the fold policy. The provider's refusal backstop owns the ceiling.
+	const g = 50000
+	for _, reserve := range []int{0, 20000, 64000, 128000} {
+		sm := NewSegmentedMemory("ROM", g, reserve)
+		sm.mu.Lock()
+		assert.Equal(t, g, sm.startMarkLocked(0),
+			"reserve=%d must not move the start mark", reserve)
+		sm.mu.Unlock()
+	}
 }
 
 // TestNewAgent_DoesNotClobberComputedReservation reproduces the server's build
@@ -460,6 +451,6 @@ func TestNewAgent_DoesNotClobberComputedReservation(t *testing.T) {
 		"the computed reservation survives agent construction")
 	assert.Equal(t, window-effectiveReserve, segMem.usableLocked(),
 		"usable is window minus the real output reservation")
-	assert.Less(t, segMem.startMarkLocked(0), window-effectiveReserve,
-		"the start mark stays below the provider's refusal line")
+	assert.Equal(t, window, segMem.startMarkLocked(0),
+		"the start mark is the configured budget (G semantics)")
 }
