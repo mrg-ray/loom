@@ -204,6 +204,28 @@ type scriptedLLM struct {
 	idx     int
 	over    bool // set when the script was exhausted
 	refuseN int  // next N Chat calls return the typed context-too-long error
+	// In-loop fold: a call whose trailing user message is the fold instruction
+	// is answered the way a model answers it — with a summary — and consumes no
+	// scripted turn. folds counts those answers; foldGarbage makes them
+	// unusable instead, which is how the pressure failsafe is exercised.
+	folds       int
+	foldGarbage bool
+}
+
+// foldInstructionMarker is the opening line of agent.foldInstruction.
+const foldInstructionMarker = "Context maintenance: summarise the work so far"
+
+// isFoldCall reports whether this provider call carries the fold instruction.
+func isFoldCall(messages []types.Message) bool {
+	n := len(messages)
+	return n > 0 && messages[n-1].Role == "user" && strings.Contains(messages[n-1].Content, foldInstructionMarker)
+}
+
+// foldCount returns how many fold instructions the fake model has answered.
+func (m *scriptedLLM) foldCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.folds
 }
 
 // refuse makes the next n Chat calls return llm.ErrContextTooLong — the typed
@@ -224,6 +246,13 @@ func (m *scriptedLLM) Chat(_ context.Context, messages []types.Message, _ []shut
 	if m.refuseN > 0 {
 		m.refuseN--
 		return nil, fmt.Errorf("API error (status 400): context window exceeded: %w", llm.ErrContextTooLong)
+	}
+	if isFoldCall(messages) {
+		m.folds++
+		if m.foldGarbage {
+			return &types.LLMResponse{Content: "I would rather keep going; here is some prose that is not the requested JSON."}, nil
+		}
+		return &types.LLMResponse{Content: fmt.Sprintf(`{"summary": "[fold %d] the work so far, carried forward"}`, m.folds)}, nil
 	}
 	if m.idx >= len(m.turns) {
 		m.over = true
