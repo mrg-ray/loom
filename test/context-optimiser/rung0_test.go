@@ -17,14 +17,15 @@ import (
 	"testing"
 )
 
-// TestRung0_SingleTurnEvictShedsToTarget — one turn, consumed mid-size results
-// push past the HWM mid-drive → relief must shed via evict(t) alone: evicted
-// stubs appear, no fold happens, the run completes, and the cache marker
-// budget holds in every dispatched context.
-func TestRung0_SingleTurnEvictShedsToTarget(t *testing.T) {
+// TestRung0_SingleTurnOffloadShedsToTarget — one turn, consumed mid-size
+// results push past the HWM mid-drive → relief must shed via the lossless
+// current-turn offload alone: door-only pressure stubs appear, no fold happens,
+// the run completes, and the cache marker budget holds in every dispatched
+// context.
+func TestRung0_SingleTurnOffloadShedsToTarget(t *testing.T) {
 	requireGate(t)
-	r := newRig(t, routeOutDir(t, "rung0-evict"), nil, 12000, 2000, 16384)
-	sid := "rung0-evict"
+	r := newRig(t, routeOutDir(t, "rung0-offload"), nil, 12000, 2000, 16384)
+	sid := "rung0-offload"
 
 	turns := make([]scriptedTurn, 0, 7)
 	for i := 0; i < 6; i++ {
@@ -40,22 +41,22 @@ func TestRung0_SingleTurnEvictShedsToTarget(t *testing.T) {
 		t.Fatalf("want ≥5 provider calls, got %d", len(stages))
 	}
 
-	var sawEvictedStub, sawFold bool
+	var sawPressureStub, sawFold bool
 	for _, s := range stages {
 		for _, m := range s.Messages {
-			if m.Role == "tool" && strings.Contains(m.Content, "evicted from context") {
-				sawEvictedStub = true
+			if m.Role == "tool" && strings.Contains(m.Content, "held in memory this turn") {
+				sawPressureStub = true
 			}
 			if m.Role == "system" && strings.Contains(m.Content, "covers msg:") {
 				sawFold = true
 			}
 		}
 	}
-	if !sawEvictedStub {
-		t.Error("no evicted stub ever dispatched — rung 0 evict did not fire")
+	if !sawPressureStub {
+		t.Error("no pressure stub ever dispatched — the current-turn offload rung did not fire")
 	}
 	if sawFold {
-		t.Error("a fold ran — evict(t) should have reached target first (reversibility order)")
+		t.Error("a fold ran — the current-turn offload should have reached target first (reversibility order)")
 	}
 
 	// Marker budget in every dispatched context, including post-relief ones.

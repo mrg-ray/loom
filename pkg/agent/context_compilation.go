@@ -56,6 +56,19 @@ const offloadStubFormat = "[%s result, ~%d tokens, held in memory this turn — 
 // doors minus sql=, which tabularPayload would refuse.
 const offloadStubOpaqueFormat = "[%s result, ~%d tokens, held in memory this turn — query_tool_result(message_id=%d, offset=0, limit=100) to read it.%s\n %s]"
 
+// pressureStubFormat is the stub for a current-turn result offloaded by the
+// pressure rung rather than the size rule. The size rule stubs one oversize
+// result and carries previewMeta so the model knows what it holds; the
+// pressure rung stubs a whole batch of ordinary results at once, where forty
+// previews cost more than the window can give back (the rung would stub
+// everything and still miss target). So this stub is the door alone — the
+// payload is in memory, and one query_tool_result reads any of them.
+const pressureStubFormat = "[%s result, ~%d tokens, held in memory this turn — query_tool_result(message_id=%d, offset=0, limit=100) to read it.]"
+
+// pressureStubTabularFormat is pressureStubFormat plus the sql door, which
+// tabularPayload accepts for this row.
+const pressureStubTabularFormat = "[%s result, ~%d tokens, held in memory this turn — query_tool_result(message_id=%d, offset=0, limit=100) to read it; sql=\"SELECT ... FROM results\" for tabular data.]"
+
 // evictedStubFormat is the normative evicted stub of HLD §5.5 — evicted=true or
 // legacy oversize; the only door is re-run.
 const evictedStubFormat = "[%s result, ~%d tokens, evicted from context — re-run the call above if this data is needed again.%s\n %s]"
@@ -105,6 +118,7 @@ func (sm *SegmentedMemory) compileLocked() []Message {
 	emit := func(m *Message) {
 		out = append(out, sm.renderLocked(m, t, callName))
 		if m.Turn == t && ((m.Role == "tool" && !m.Evicted && len(m.Content) > sm.threshold) ||
+			(m.Role == "tool" && sm.pressureOffloadedLocked(m, t)) ||
 			(m.Role == "assistant" && hasQueryToolResultCall(m))) {
 			frozen = true
 		}
@@ -188,13 +202,15 @@ func hasQueryToolResultCall(m *Message) bool {
 	return false
 }
 
-// renderLocked applies §5.2 step 6's five render cases — first matching case
-// wins. Conversation is never stubbed; offload is a pure render condition of
-// the current turn; evicted and legacy-oversize rows render the evicted stub.
+// renderLocked applies §5.2 step 6's render cases — first matching case wins.
+// Conversation is never stubbed; offload is a pure render condition of the
+// current turn; evicted and legacy-oversize rows render the evicted stub.
 // The offload case carves out the exempt set (SetOffloadExemptTools): an
 // exempt tool's current-turn result renders whole — exemption never reaches
 // the evicted cases, so relief and prior turns behave identically for every
-// tool.
+// tool. The one exception is relief's last-resort pressure offload
+// (offloadCurrentTurnLocked), which stubs a current-turn result whatever its
+// size or exemption, because the alternative is a turn that cannot be sent.
 func (sm *SegmentedMemory) renderLocked(m *Message, t int64, callName map[string]string) Message {
 	if m.Role == "assistant" && len(m.ThinkingBlocks) > 0 && m.Turn < t {
 		// Settled turns render without thinking blocks: the provider ignores
@@ -234,6 +250,14 @@ func (sm *SegmentedMemory) renderLocked(m *Message, t int64, callName map[string
 	case m.Evicted:
 		r := *m
 		r.Content = sm.evictedStub(m, callName)
+		return r
+	case sm.pressureOffloadedLocked(m, t):
+		// Relief's last-resort rung: a current-turn result offloaded under
+		// pressure regardless of size or exemption — the turn would otherwise
+		// end on a provider refusal. The payload stays queryable this turn
+		// through a door-only stub (pressureStubFormat).
+		r := *m
+		r.Content = sm.pressureStub(m, callName)
 		return r
 	case len(m.Content) > sm.threshold && m.Turn == t:
 		if sm.offloadExempt[callName[m.ToolUseID]] {
@@ -288,6 +312,21 @@ func (sm *SegmentedMemory) offloadStub(m *Message, callName map[string]string) s
 		id,
 		harvestTails(m.Content),
 		meta)
+}
+
+// pressureStub renders the door-only stub for a result the pressure rung
+// offloaded (pressureStubFormat). Storeless rows fall back to the evicted stub
+// for the same reason offloadStub does.
+func (sm *SegmentedMemory) pressureStub(m *Message, callName map[string]string) string {
+	id, _ := strconv.ParseInt(m.ID, 10, 64)
+	if id <= 0 {
+		return sm.evictedStub(m, callName)
+	}
+	format := pressureStubFormat
+	if _, tabular := previewMeta(m.Content); tabular {
+		format = pressureStubTabularFormat
+	}
+	return fmt.Sprintf(format, stubToolName(m, callName), tokenFigure(len(m.Content)), id)
 }
 
 // evictedStub renders the §5.5 evicted stub.
@@ -471,7 +510,15 @@ const cheapBytesPerToken = 2.7
 //
 // Must hold lock.
 func (sm *SegmentedMemory) estimateLocked() int {
-	compiled := sm.compileLocked()
+	return sm.estimateCompiledLocked(sm.compileLocked())
+}
+
+// estimateCompiledLocked is estimateLocked over an already-compiled message
+// list (the whole context, or a subset such as the current-turn floor). Both
+// tiers are scaled by the provider calibration factor, so the cheap tier's
+// early exit compares like with like. Must hold lock.
+func (sm *SegmentedMemory) estimateCompiledLocked(compiled []Message) int {
+	f := sm.calibrationLocked()
 
 	// Cheap tier — byte bound, no tokenization.
 	bytes := sm.kernelBytes
@@ -486,12 +533,18 @@ func (sm *SegmentedMemory) estimateLocked() int {
 			bytes += len(tb.Thinking) + len(tb.Signature)
 		}
 	}
-	cheap := int(float64(bytes) / cheapBytesPerToken)
+	cheap := int(float64(bytes) / cheapBytesPerToken * f)
 	if limit := sm.startMarkLocked(0); limit <= 0 || cheap < limit {
 		return cheap
 	}
 
 	// Accurate tier — near the limit, tokenize (cached per rendered message).
+	return int(float64(sm.accurateTokensLocked(compiled)) * f)
+}
+
+// accurateTokensLocked is the uncalibrated tiktoken count of KERNEL plus the
+// compiled messages. Must hold lock.
+func (sm *SegmentedMemory) accurateTokensLocked(compiled []Message) int {
 	tc := sm.tokenCounter
 	if tc == nil {
 		tc = GetTokenCounter()
@@ -501,6 +554,65 @@ func (sm *SegmentedMemory) estimateLocked() int {
 		tokens += sm.msgTokensLocked(tc, &compiled[i])
 	}
 	return tokens
+}
+
+// Provider calibration. The estimate tokenizes with tiktoken, which counts
+// Claude prompts ~25% low (production: 1.17M estimated, 1.46M billed), so
+// relief fired late and its recovery pass under-shed. After each successful
+// call the provider's own prompt count is compared with loom's count of the
+// same compiled context, and the running ratio scales every estimate.
+const (
+	// calibrationMin: never scale below tiktoken — a provider that counts
+	// fewer tokens must not make relief fire later than it did uncalibrated.
+	calibrationMin = 1.0
+	// calibrationMax bounds a skewed sample (e.g. image blocks the estimate
+	// does not count) to relief firing earlier, never to a runaway factor.
+	calibrationMax = 2.0
+	// calibrationAlpha is the EWMA weight of each new sample.
+	calibrationAlpha = 0.5
+	// calibrationMinSampleTokens skips small prompts, where fixed provider
+	// overhead (tool-use system text, framing) dominates the ratio.
+	calibrationMinSampleTokens = 2000
+)
+
+// calibrationLocked returns the current estimate scale factor. Must hold lock.
+func (sm *SegmentedMemory) calibrationLocked() float64 {
+	if sm.estimateCalibration < calibrationMin {
+		return calibrationMin
+	}
+	return sm.estimateCalibration
+}
+
+// EstimateCalibration returns the factor the estimate is currently scaled by.
+func (sm *SegmentedMemory) EstimateCalibration() float64 {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.calibrationLocked()
+}
+
+// ObservePromptTokens feeds one provider-reported prompt size (input + cache
+// read + cache write — the whole prompt, see types.Usage) into the calibration.
+// Call it right after a successful send, before anything is appended, so the
+// compiled context is the one that was sent.
+func (sm *SegmentedMemory) ObservePromptTokens(actual int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if actual <= 0 {
+		return
+	}
+	counted := sm.accurateTokensLocked(sm.compileLocked())
+	if counted < calibrationMinSampleTokens {
+		return
+	}
+	ratio := min(max(float64(actual)/float64(counted), calibrationMin), calibrationMax)
+	f := sm.calibrationLocked()
+	sm.estimateCalibration = min(max(f+calibrationAlpha*(ratio-f), calibrationMin), calibrationMax)
+	zap.L().Debug("relief: estimate calibration",
+		zap.String("session_id", sm.sessionID),
+		zap.Int("provider_prompt_tokens", actual),
+		zap.Int("counted_tokens", counted),
+		zap.Float64("sample_ratio", ratio),
+		zap.Float64("factor", sm.estimateCalibration))
 }
 
 // msgTokensLocked returns one compiled message's token count, memoising the
@@ -608,10 +720,13 @@ func (sm *SegmentedMemory) releaseMarkLocked(penalty int) int {
 // ReleasePressure is the relief pass, called at compile before every send. It
 // SELF-GATES on loom's own accounting: if the estimate is under the start mark
 // (HWM, §5.1) there is no pressure and it is a no-op. Otherwise it sheds to the
-// release mark (LWM) via the escalating evict-then-fold ladder below —
-// recompiling and re-estimating after each op, returning the instant the
-// estimate reaches the mark. Returns whether it shed and the post-pass
-// {estimate, target}.
+// release mark (LWM) via the escalating ladder below — prior-turn evict, then
+// prior-turn fold, then current-turn offload; when the current turn alone is
+// over target, the current-turn offload moves ahead of every fold and a fold
+// that still cannot reach target is skipped — recompiling and re-estimating
+// after each op, returning the instant the estimate reaches the mark. The
+// estimate is scaled by the provider calibration (ObservePromptTokens).
+// Returns whether it shed and the post-pass {estimate, target}.
 //
 // penalty (percentage points) lowers both marks. It is 0 for the normal compile
 // pass; on the one recovery pass after a provider refusal it is
@@ -629,9 +744,19 @@ func (sm *SegmentedMemory) ReleasePressure(ctx context.Context, penalty int) (sh
 		return false, sm.estimateLocked(), sm.releaseMarkLocked(penalty)
 	}
 
-	if sm.estimateLocked() < sm.startMarkLocked(penalty) {
+	startEstimate := sm.estimateLocked()
+	if startEstimate < sm.startMarkLocked(penalty) {
 		return false, 0, 0 // under the start mark — no pressure to release
 	}
+	// The per-op lines log only post-op estimates; without the starting point
+	// two consecutive passes read as one op inflating the estimate.
+	zap.L().Info("releasePressure: start",
+		zap.String("session_id", sm.sessionID),
+		zap.Int64("turn", sm.currentTurnLocked()),
+		zap.Int("estimate_tokens", startEstimate),
+		zap.Int("start_tokens", sm.startMarkLocked(penalty)),
+		zap.Int("target_tokens", sm.releaseMarkLocked(penalty)),
+		zap.Int("penalty", penalty))
 
 	sm.reliefInFlight = true
 	defer func() { sm.reliefInFlight = false }()
@@ -663,36 +788,85 @@ func (sm *SegmentedMemory) ReleasePressure(ctx context.Context, penalty int) (sh
 			rungs = append(rungs, b)
 		}
 	}
-	ops := make([]reliefOp, 0, 2*len(rungs)+3)
+	evictOps := make([]reliefOp, 0, len(rungs))
+	foldOps := make([]reliefOp, 0, len(rungs))
 	for _, b := range rungs {
-		ops = append(ops, reliefOp{"evict", b, sm.evictLocked})
+		evictOps = append(evictOps, reliefOp{"evict", b, sm.evictLocked})
+		foldOps = append(foldOps, reliefOp{"fold", b, sm.foldLocked})
 	}
-	// Rung 0 — the current turn's consumed region, cheapest first: sweep the
-	// never-persisted query pairs, then evict consumed results. Reversibility
-	// order (all eviction before any fold) extends across regions: an evicted
-	// row is one re-run away; a folded region is gone.
-	ops = append(ops, reliefOp{"sweep_qtr", t, sm.sweepRetrievalPairsLocked})
-	ops = append(ops, reliefOp{"evict", t, sm.evictLocked})
-	for _, b := range rungs {
-		ops = append(ops, reliefOp{"fold", b, sm.foldLocked})
-	}
-	ops = append(ops, reliefOp{"fold", t, sm.foldLocked})
-	for _, op := range ops {
-		if !op.run(ctx, op.boundary) {
-			// An operation that changed nothing (its rows were already flagged
-			// by an earlier pressure event) passes to the next.
-			continue
+	// The current turn. Every rung above stops at T−1, so a turn whose OWN tool
+	// results exceed the window (hundreds of parallel calls, each under the
+	// threshold and so rendered whole) used to leave the pass with nothing to
+	// shed, and the turn ended on the provider's refusal. These rungs offload
+	// them to stubs — oldest first, on the same halving ladder, keeping the
+	// newest n/2, n/4 … 0 whole. Lossless within the turn: each stub carries
+	// its query_tool_result door.
+	var offloadOps []reliefOp
+	n := len(sm.currentTurnOffloadCandidatesLocked(t))
+	for keep := n / 2; n > 0; keep /= 2 {
+		offloadOps = append(offloadOps, reliefOp{"offload_current_turn", t, func(context.Context, int64) bool {
+			return sm.offloadCurrentTurnLocked(t, keep)
+		}})
+		if keep == 0 {
+			break
 		}
-		estimate = sm.estimateLocked()
-		zap.L().Info("releasePressure: operation complete",
-			zap.String("session_id", sm.sessionID),
-			zap.String("operation", op.name),
-			zap.Int64("boundary_turn", op.boundary),
-			zap.Int("estimate_tokens", estimate),
-			zap.Int("target_tokens", target))
-		if estimate <= target {
+	}
+
+	// runOps runs ops in order and reports whether the estimate reached target.
+	runOps := func(ops []reliefOp) bool {
+		for _, op := range ops {
+			if !op.run(ctx, op.boundary) {
+				// An operation that changed nothing (its rows were already
+				// flagged by an earlier pressure event) passes to the next.
+				continue
+			}
+			estimate = sm.estimateLocked()
+			zap.L().Info("releasePressure: operation complete",
+				zap.String("session_id", sm.sessionID),
+				zap.String("operation", op.name),
+				zap.Int64("boundary_turn", op.boundary),
+				zap.Int("estimate_tokens", estimate),
+				zap.Int("target_tokens", target))
+			if estimate <= target {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Phase order: prior-turn eviction (re-runnable) first. Then, when the
+	// current turn ALONE is over target, no prior-turn fold can reach it — so
+	// the lossless current-turn offload goes before any lossy fold, and a fold
+	// runs only if it can now reach target or the estimate is still at or over
+	// the start mark (every token counts near the provider's hard limit).
+	// Otherwise folds go first and the current turn stays the last resort.
+	if runOps(evictOps) {
+		return true, estimate, target
+	}
+	if sm.currentTurnFloorLocked(t) > target {
+		if runOps(offloadOps) {
 			return true, estimate, target
 		}
+		if floor := sm.currentTurnFloorLocked(t); floor > target && sm.estimateLocked() < sm.startMarkLocked(penalty) {
+			zap.L().Info("releasePressure: fold skipped — the current turn alone exceeds target",
+				zap.String("session_id", sm.sessionID),
+				zap.Int64("turn", t),
+				zap.Int("current_turn_floor_tokens", floor),
+				zap.Int("target_tokens", target))
+			return estimate >= 0, sm.estimateLocked(), target
+		}
+	}
+	if runOps(foldOps) || runOps(offloadOps) {
+		return true, estimate, target
+	}
+	// Rung 0 fold — the current turn itself. The offload rungs above cover a
+	// turn whose mass is tool results; a turn whose mass is the model's own
+	// reasoning text has nothing to stub, and no prior-turn fold can reach it.
+	// foldLocked at b = t caps the region before the last assistant message, so
+	// the pending pair and the turn's user rows survive it whole. Lossy, and
+	// therefore last.
+	if runOps([]reliefOp{{"fold", t, sm.foldLocked}}) {
+		return true, estimate, target
 	}
 
 	if estimate < 0 {
@@ -704,76 +878,172 @@ func (sm *SegmentedMemory) ReleasePressure(ctx context.Context, penalty int) (sh
 	return true, estimate, target
 }
 
-// sweepRetrievalPairsLocked removes the current turn's CONSUMED
-// query_tool_result call/result pairs from L1 — the §4.3 predicate applied
-// mid-turn, verbatim from the persist seam (Memory.PersistMessage): strip the
-// qtr entries from an assistant row's calls, drop the matching result rows,
-// drop an assistant row left with no text, no calls and no content blocks —
-// both sides always. These rows are never persisted, so removal is in-memory
-// only: there is nothing to write and nothing a crash can half-do; L1
-// converges toward its own persisted history. Pairs at or after the last
-// assistant message are pending (query issued, answer not yet consumed) and
-// are never touched. Returns whether anything changed. Must hold lock.
-func (sm *SegmentedMemory) sweepRetrievalPairsLocked(_ context.Context, _ int64) bool {
-	lastAssistant := -1
+// currentTurnFloorLocked estimates the context with every prior turn gone —
+// ROM, the summary and turn T as currently rendered. No prior-turn operation
+// can bring the estimate below it, so when it is over target a fold would be a
+// lossy compressor call that cannot succeed. Must hold lock.
+func (sm *SegmentedMemory) currentTurnFloorLocked(t int64) int {
+	compiled := sm.compileLocked()
+	kept := make([]Message, 0, len(compiled))
+	for i := range compiled {
+		if compiled[i].Role == "system" || compiled[i].Turn == t {
+			kept = append(kept, compiled[i])
+		}
+	}
+	return sm.estimateCompiledLocked(kept)
+}
+
+// CurrentTurnOverflow describes a current turn relief cannot bring under its
+// start mark: every result it may offload is already a stub, and the turn alone
+// (ROM, the summary and turn T as rendered, every prior turn gone) is still at
+// or over the start mark.
+type CurrentTurnOverflow struct {
+	// FloorTokens is the calibrated estimate of the turn alone.
+	FloorTokens int
+	// StartTokens is the relief start mark (no penalty).
+	StartTokens int
+	// StubbedResults counts the turn's tool results rendered as stubs.
+	StubbedResults int
+	// ToolResults counts the turn's tool results.
+	ToolResults int
+}
+
+// CurrentTurnOverflow reports whether the current turn has outgrown the window
+// in a way no relief operation can fix — the irreducible cost of its stubs and
+// read-backs alone keeps the context at or over the start mark. Sending anyway
+// buys an uncached near-limit loop whose every pass sheds nothing; the caller
+// ends the turn instead. Called after ReleasePressure: it does not shed, it
+// only reads. False when any candidate still renders whole (the ladder has
+// room) or the turn has no stubbed tool result (the pressure is not the
+// turn's results — a ROM that alone fills the window is a config problem).
+func (sm *SegmentedMemory) CurrentTurnOverflow() (CurrentTurnOverflow, bool) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	t := sm.currentTurnLocked()
+	// Cheap gate, no compile: it runs before every send, and an overflow needs
+	// at least one turn-T row the pressure rung or the size rule stubs.
+	maybeStubbed := sm.pressureOffloadTurn == t && len(sm.pressureOffload) > 0
 	for i := range sm.contextMessages {
-		if sm.contextMessages[i].Role == "assistant" {
-			lastAssistant = i
+		if maybeStubbed {
+			break
+		}
+		m := &sm.contextMessages[i]
+		maybeStubbed = m.Role == "tool" && m.Turn == t && (m.Evicted || len(m.Content) > sm.threshold)
+	}
+	if !maybeStubbed {
+		return CurrentTurnOverflow{}, false
+	}
+	for _, i := range sm.currentTurnOffloadCandidatesLocked(t) {
+		if !sm.pressureOffloadedLocked(&sm.contextMessages[i], t) {
+			return CurrentTurnOverflow{}, false
 		}
 	}
-	if lastAssistant <= 0 {
-		return false
+	stored := make(map[string]string)
+	for i := range sm.contextMessages {
+		if m := &sm.contextMessages[i]; m.Role == "tool" && m.Turn == t && m.ToolUseID != "" {
+			stored[m.ToolUseID] = m.Content
+		}
 	}
-
-	dropRow := make(map[int]bool)
-	qtrIDs := make(map[string]bool)
-	changed := false
-	for i := 0; i < lastAssistant; i++ {
-		m := &sm.contextMessages[i]
-		if m.Role != "assistant" {
+	var o CurrentTurnOverflow
+	for _, m := range sm.compileLocked() {
+		if m.Role != "tool" || m.Turn != t {
 			continue
 		}
-		kept := m.ToolCalls[:0:0]
-		for _, c := range m.ToolCalls {
-			if c.Name == "query_tool_result" {
-				if c.ID != "" {
-					qtrIDs[c.ID] = true
-				}
-				changed = true
-				continue
-			}
-			kept = append(kept, c)
+		o.ToolResults++
+		if content, ok := stored[m.ToolUseID]; ok && content != m.Content {
+			o.StubbedResults++
 		}
-		if len(kept) == len(m.ToolCalls) {
+	}
+	if o.StubbedResults == 0 {
+		return CurrentTurnOverflow{}, false
+	}
+	o.StartTokens = sm.startMarkLocked(0)
+	o.FloorTokens = sm.currentTurnFloorLocked(t)
+	if o.StartTokens <= 0 || o.FloorTokens < o.StartTokens {
+		return CurrentTurnOverflow{}, false
+	}
+	return o, true
+}
+
+// pressureOffloadedLocked reports whether m is a current-turn tool result that
+// relief's last-resort rung has offloaded. Must hold lock.
+func (sm *SegmentedMemory) pressureOffloadedLocked(m *Message, t int64) bool {
+	return m.Role == "tool" && m.Turn == t && m.ToolUseID != "" &&
+		sm.pressureOffloadTurn == t && sm.pressureOffload[m.ToolUseID]
+}
+
+// currentTurnOffloadCandidatesLocked returns, in seq order, the indices of the
+// turn-T tool rows the last-resort rung may offload: not evicted, keyed by a
+// ToolUseID, not produced by query_tool_result, not already rendered as an
+// offload stub by the size rule, and at least 2× their offload stub (the same
+// floor evictLocked applies — below it, stubbing saves nothing). Rows the rung
+// already offloaded stay in the list, so its length is stable across the
+// ladder. Must hold lock.
+//
+// A query_tool_result row is the model reading an offloaded payload back
+// through the stub's door. Stubbing it would render a stub whose door points
+// at the read itself — the model can never see the data, loops to MaxTurns and
+// answers from previews. The read is already bounded at one page (threshold),
+// so it is never a candidate.
+func (sm *SegmentedMemory) currentTurnOffloadCandidatesLocked(t int64) []int {
+	callName := make(map[string]string)
+	for i := range sm.contextMessages {
+		for _, c := range sm.contextMessages[i].ToolCalls {
+			if c.ID != "" {
+				callName[c.ID] = c.Name
+			}
+		}
+	}
+	var out []int
+	for i := range sm.contextMessages {
+		m := &sm.contextMessages[i]
+		if m.Role != "tool" || m.Turn != t || m.Evicted || m.ToolUseID == "" {
 			continue
 		}
-		m.ToolCalls = kept
-		if m.Content == "" && len(m.ToolCalls) == 0 && len(m.ContentBlocks) == 0 {
-			dropRow[i] = true
+		if callName[m.ToolUseID] == "query_tool_result" {
+			continue // the model's read-back of an offloaded payload
 		}
+		if len(m.Content) > sm.threshold && !sm.offloadExempt[callName[m.ToolUseID]] {
+			continue // the size rule already stubs it
+		}
+		if len(m.Content) < 2*len(sm.pressureStub(m, callName)) {
+			continue
+		}
+		out = append(out, i)
 	}
-	if !changed {
+	return out
+}
+
+// offloadCurrentTurnLocked offloads every last-resort candidate except the
+// newest keep, oldest first. Returns whether any row newly moved to a stub.
+// Must hold lock.
+func (sm *SegmentedMemory) offloadCurrentTurnLocked(t int64, keep int) bool {
+	cands := sm.currentTurnOffloadCandidatesLocked(t)
+	if keep >= len(cands) {
 		return false
 	}
-	for i := 0; i < lastAssistant; i++ {
-		m := &sm.contextMessages[i]
-		if m.Role == "tool" && m.ToolUseID != "" && qtrIDs[m.ToolUseID] {
-			dropRow[i] = true
+	if sm.pressureOffloadTurn != t || sm.pressureOffload == nil {
+		sm.pressureOffload = make(map[string]bool)
+		sm.pressureOffloadTurn = t
+	}
+	added := 0
+	for _, i := range cands[:len(cands)-keep] {
+		id := sm.contextMessages[i].ToolUseID
+		if !sm.pressureOffload[id] {
+			sm.pressureOffload[id] = true
+			added++
 		}
 	}
-
-	if len(dropRow) > 0 {
-		out := sm.contextMessages[:0:0]
-		for i := range sm.contextMessages {
-			if !dropRow[i] {
-				out = append(out, sm.contextMessages[i])
-			}
-		}
-		sm.contextMessages = out
+	if added == 0 {
+		return false
 	}
-	sm.l1Dirty = true
-	sm.updateTokenCount()
-	sm.tokenCountDirty = false
+	zap.L().Warn("releasePressure: offload current turn",
+		zap.String("session_id", sm.sessionID),
+		zap.Int64("turn", t),
+		zap.Int("rows_offloaded", added),
+		zap.Int("offloaded_total", len(sm.pressureOffload)),
+		zap.Int("kept_newest", keep))
 	return true
 }
 

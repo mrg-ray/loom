@@ -2257,6 +2257,18 @@ func addUsage(dst *Usage, u Usage) {
 	dst.CostUSD += u.CostUSD
 }
 
+// observePromptUsage feeds a successful call's provider-reported prompt size
+// into the session's relief calibration. The whole prompt is input + cache
+// read + cache write (types.Usage). Call before appending the response, so the
+// compiled context still matches what was sent.
+func (a *Agent) observePromptUsage(session *Session, u Usage) {
+	segMem, ok := session.SegmentedMem.(*SegmentedMemory)
+	if !ok || segMem == nil {
+		return
+	}
+	segMem.ObservePromptTokens(u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens)
+}
+
 // appendMessage is the arrival seam (HLD §1): it stamps the message's turn,
 // persists its durable row once (write rules §4; the store's RETURNING-derived
 // seq and turn override the stamp), and appends the message to the session in
@@ -2622,6 +2634,37 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				tools = recovery.activeTools(tools)
 				segMem.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
 			}
+			// Relief has nothing left to shed and the turn's own stubs still
+			// hold the context over the start mark: every further send is a
+			// near-limit loop toward MaxTurns and a preview-backed synthesis.
+			// End the turn with an error the user can act on instead.
+			if o, over := segMem.CurrentTurnOverflow(); over {
+				cause := fmt.Errorf("turn produced too many tool results to fit the context window: "+
+					"%d of %d results are already offloaded to stubs and the turn alone is still %d tokens "+
+					"against a relief start mark of %d; split the work into smaller batches across turns",
+					o.StubbedResults, o.ToolResults, o.FloorTokens, o.StartTokens)
+				zap.L().Error("current turn overflow: turn ends",
+					zap.String("session_id", session.ID),
+					zap.Int("turn", turnCount),
+					zap.Int("floor_tokens", o.FloorTokens),
+					zap.Int("start_tokens", o.StartTokens),
+					zap.Int("stubbed_results", o.StubbedResults),
+					zap.Int("tool_results", o.ToolResults))
+				span.AddEvent("turn.current_turn_overflow", map[string]interface{}{
+					"turn":            turnCount,
+					"floor_tokens":    o.FloorTokens,
+					"start_tokens":    o.StartTokens,
+					"stubbed_results": o.StubbedResults,
+					"tool_results":    o.ToolResults,
+				})
+				return nil, recovery.buildRecoverableError("current_turn_overflow", cause, "",
+					map[string]any{
+						"floor_tokens":    o.FloorTokens,
+						"start_tokens":    o.StartTokens,
+						"stubbed_results": o.StubbedResults,
+						"tool_results":    o.ToolResults,
+					})
+			}
 		}
 
 		// withReminder appends the transient tail — the turn's soft reminder —
@@ -2650,7 +2693,22 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// context-too-long still comes back (loom's estimate under-counted), shed
 		// and resend once; a second refusal ends the turn with the recoverable
 		// context_exhausted error.
-		llmResp, err := a.chatWithRetry(ctx, withReminder(messages), tools)
+		//
+		// Generation-free replay (WeaveRequest.replay_assistant_message): when a
+		// scripted assistant turn is threaded through the context, substitute it
+		// for the provider call. Relief/compression (above), context compilation,
+		// and graph extraction on the incoming user turn have all already run, so
+		// the memory pipeline is exercised exactly as a live turn — only
+		// generation is skipped. The scripted text carries no tool calls, so the
+		// loop finalizes this turn at the no-tool-calls branch below. An empty
+		// override is ignored (falls through to a normal provider call).
+		var llmResp *LLMResponse
+		var err error
+		if scripted, ok := scriptedResponseFromContext(ctx); ok && strings.TrimSpace(scripted) != "" {
+			llmResp = &LLMResponse{Content: scripted, StopReason: "end_turn"}
+		} else {
+			llmResp, err = a.chatWithRetry(ctx, withReminder(messages), tools)
+		}
 		if err != nil && errors.Is(err, llm.ErrContextTooLong) {
 			if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
 				_, estimate, target := segMem.ReleasePressure(ctx, pressureRecoveryPenalty)
@@ -2687,6 +2745,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			return nil, fmt.Errorf("LLM call failed: %w", err)
 		}
 		addUsage(&turnUsage, llmResp.Usage)
+		a.observePromptUsage(session, llmResp.Usage)
 
 		// Record LLM response on conversation_loop span
 		llmEvent := map[string]interface{}{
@@ -3352,8 +3411,33 @@ func (a *Agent) synthesizeFinalResponse(ctx Context, session *Session, turnCount
 		Timestamp: time.Now(),
 	}, false)
 
-	// Make final LLM call WITHOUT tools to force synthesis
+	// Make final LLM call WITHOUT tools to force synthesis. It reaches here
+	// exactly when the loop ran out of budget — the turn is at its largest —
+	// so it gets the same relief as a loop send: advertise no tool bytes (this
+	// call carries none), shed before the send, and on a provider refusal shed
+	// deeper and resend once.
+	segMem, _ := session.SegmentedMem.(*SegmentedMemory)
+	if segMem != nil {
+		segMem.SetAdvertisedToolsBytes(0)
+		if shed, estimate, target := segMem.ReleasePressure(ctx, 0); shed {
+			zap.L().Info("relief: shed before synthesis",
+				zap.String("session_id", session.ID),
+				zap.Int("estimate_tokens", estimate),
+				zap.Int("target_tokens", target))
+		}
+	}
 	finalResp, err := a.chatWithRetry(ctx, session.GetMessages(), nil)
+	if err != nil && errors.Is(err, llm.ErrContextTooLong) && segMem != nil {
+		_, estimate, target := segMem.ReleasePressure(ctx, pressureRecoveryPenalty)
+		zap.L().Info("context too long at synthesis: relief pass complete, resending once",
+			zap.String("session_id", session.ID),
+			zap.Int("estimate_tokens", estimate),
+			zap.Int("target_tokens", target))
+		finalResp, err = a.chatWithRetry(ctx, session.GetMessages(), nil)
+	}
+	if err == nil {
+		a.observePromptUsage(session, finalResp.Usage)
+	}
 	if err != nil {
 		// Only fall back to guidance message if synthesis fails
 		maxTurnsMessage := a.getGuidanceMessage(ctx, "max_turns_reached", nil)
