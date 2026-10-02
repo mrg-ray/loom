@@ -127,3 +127,64 @@ func TestEditFilesSensitivePath(t *testing.T) {
 		t.Fatal("sensitive path must fail")
 	}
 }
+
+// An edit survives interruption: the replacement is written to a sibling temp
+// file and renamed, so the source is never a half-written file. The guarantee
+// yields only where it cannot hold — a writable file inside a directory that
+// is not writable still edits in place, as it did before.
+func TestEditFilesWriteIsAtomicAndLeavesNoTemp(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "y.txt")
+	if err := os.WriteFile(f, []byte("a b c\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewEditFilesTool("")
+	if err := tool.applyOne(f, "b", "B"); err != nil {
+		t.Fatalf("edit failed: %v", err)
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 {
+		for _, e := range ents {
+			t.Logf("left behind: %s", e.Name())
+		}
+		t.Fatalf("temp file leaked: %d entries", len(ents))
+	}
+	st, err := os.Stat(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o640 {
+		t.Fatalf("permissions not preserved: %v", st.Mode().Perm())
+	}
+}
+
+func TestEditFilesWritableFileInLockedDir(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "locked")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(sub, "x.txt")
+	if err := os.WriteFile(f, []byte("hello world\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sub, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(sub, 0o755) }()
+
+	tool := NewEditFilesTool("")
+	if err := tool.applyOne(f, "world", "there"); err != nil {
+		t.Fatalf("edit failed where it used to succeed: %v", err)
+	}
+	b, err := os.ReadFile(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "hello there\n" {
+		t.Fatalf("content = %q", string(b))
+	}
+}

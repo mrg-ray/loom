@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"go.uber.org/zap"
 )
@@ -434,7 +435,13 @@ func previewMeta(content string) (string, bool) {
 	if len(content) > 600 {
 		// collapseTo keeps the head of its input, so slice exactly the tail;
 		// collapsing only shrinks, so the whole slice always fits the cap.
-		line += " … tail: " + collapseTo(content[len(content)-200:], 200)
+		// The cut snaps forward to a rune start: slicing mid-rune would put a
+		// replacement character in a stub that is otherwise byte-exact.
+		cut := len(content) - 200
+		for cut < len(content) && !utf8.RuneStart(content[cut]) {
+			cut++
+		}
+		line += " … tail: " + collapseTo(content[cut:], 200)
 	}
 	return line, false
 }

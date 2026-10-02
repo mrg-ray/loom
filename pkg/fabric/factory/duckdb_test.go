@@ -7,6 +7,7 @@ package factory
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -154,5 +155,53 @@ con.close()
 	schema, err := b.GetSchema(ctx, "zeta.main.orders")
 	if err != nil || len(schema.Fields) != 1 {
 		t.Fatalf("qualified schema failed: %v %+v", err, schema)
+	}
+}
+
+// A SQL probe reaches the configured databases and nothing else: external
+// access is sealed once the files are attached, so DuckDB's file readers
+// cannot turn a query into an arbitrary filesystem read. Both connection
+// shapes are covered — one path (read_only connect) and several (ATTACH).
+func TestDuckDBBackendSealsFilesystem(t *testing.T) {
+	if !havePythonDuckDB() {
+		t.Skip("python3-duckdb not available")
+	}
+	dir := t.TempDir()
+	one := filepath.Join(dir, "alpha.duckdb")
+	two := filepath.Join(dir, "zeta.duckdb")
+	seedDuckDB(t, one)
+	seedDuckDB(t, two)
+
+	secret := filepath.Join(dir, "secret.csv")
+	if err := os.WriteFile(secret, []byte("col\nleaked\n"), 0o600); err != nil {
+		t.Fatalf("seed csv: %v", err)
+	}
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name  string
+		paths string
+		live  string
+	}{
+		{"single path", one, "SELECT count(*) AS n FROM hosts"},
+		{"multi path", one + "," + two, "SELECT count(*) AS n FROM alpha.main.hosts"},
+	} {
+		b, err := NewDuckDBBackend("seal", tc.paths)
+		if err != nil {
+			t.Fatalf("%s: backend failed: %v", tc.name, err)
+		}
+		// The configured databases stay queryable.
+		if res, err := b.ExecuteQuery(ctx, tc.live); err != nil || res.Rows[0]["n"] != "2" {
+			t.Fatalf("%s: configured database unreadable: %v %+v", tc.name, err, res)
+		}
+		// Everything else on disk is refused.
+		for _, q := range []string{
+			"SELECT * FROM read_csv('" + secret + "')",
+			"SELECT * FROM read_csv_auto('" + secret + "')",
+		} {
+			if _, err := b.ExecuteQuery(ctx, q); err == nil {
+				t.Errorf("%s: file read was allowed: %s", tc.name, q)
+			}
+		}
 	}
 }

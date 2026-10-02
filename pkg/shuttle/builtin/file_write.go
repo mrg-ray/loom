@@ -48,7 +48,7 @@ func (t *FileWriteTool) Name() string {
 
 // Description returns the tool description.
 func (t *FileWriteTool) Description() string {
-	return `Write complete files: create or fully replace (replacing an existing file? read it first). files carries every file that is ready — batch all determined deliverables into one call. For line changes inside an existing file use edit_files; never rewrite a large file to change a few lines. Creates parent directories automatically; won't overwrite system files.`
+	return `Write complete files. files carries every file that is ready — batch all determined deliverables into one call. A new file needs no mode; replacing an existing one needs mode:"overwrite" and reading it first. For line changes inside an existing file use edit_files; never rewrite a large file to change a few lines. Creates parent directories automatically; won't overwrite system files.`
 }
 
 func (t *FileWriteTool) InputSchema() *shuttle.JSONSchema {
@@ -64,7 +64,7 @@ func (t *FileWriteTool) InputSchema() *shuttle.JSONSchema {
 					Properties: map[string]*shuttle.JSONSchema{
 						"path":    shuttle.NewStringSchema("File path to write."),
 						"content": shuttle.NewStringSchema("Complete file content. Max 50KB per file."),
-						"mode": shuttle.NewStringSchema("'overwrite' (default), 'create' (fail if exists), or 'append'").
+						"mode": shuttle.NewStringSchema("'create' (default; fails if the file exists), 'overwrite', or 'append'").
 							WithEnum("create", "overwrite", "append"),
 					},
 					Required: []string{"path", "content"},
@@ -73,7 +73,7 @@ func (t *FileWriteTool) InputSchema() *shuttle.JSONSchema {
 			"path": shuttle.NewStringSchema("File path to write (single-file form; prefer files)."),
 			"content": shuttle.NewStringSchema("Content to write to the file (single-file form). Max 50KB per call - use append mode for larger content.").
 				WithLength(nil, &maxContentLen),
-			"mode": shuttle.NewStringSchema("Write mode: 'overwrite' (default), 'create' (fail if exists), or 'append'").
+			"mode": shuttle.NewStringSchema("Write mode: 'create' (default; fail if exists), 'overwrite', or 'append'").
 				WithEnum("create", "overwrite", "append").
 				WithDefault("create"),
 		},
@@ -272,7 +272,10 @@ func (t *FileWriteTool) Execute(ctx context.Context, params map[string]interface
 // overwrite), parent-directory creation. Returns a one-line report.
 func (t *FileWriteTool) writeOne(path, content, mode string) (string, error) {
 	if mode == "" {
-		mode = "overwrite"
+		// Same default as the single-file form and the schema: create. An
+		// omitted mode must never clobber — a batch that means to replace an
+		// existing file says so with mode:"overwrite".
+		mode = "create"
 	}
 	if len(content) > MaxSafeContentSize {
 		return "", fmt.Errorf("content exceeds 50KB limit (%d bytes)", len(content))

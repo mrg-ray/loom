@@ -36,11 +36,12 @@ prompts:
 
   - id: file_write
     content: |
-      Write complete files: create or fully replace (replacing an existing file?
-      read it first). files carries every file that is ready — batch all
-      determined deliverables into one call. For line changes inside an existing
-      file use edit_files; never rewrite a large file to change a few lines.
-      Creates parent directories automatically; won't overwrite system files.
+      Write complete files. files carries every file that is ready — batch all
+      determined deliverables into one call. A new file needs no mode; replacing
+      an existing one needs mode:"overwrite" and reading it first. For line
+      changes inside an existing file use edit_files; never rewrite a large file
+      to change a few lines. Creates parent directories automatically; won't
+      overwrite system files.
     tags:
       - tool
       - file

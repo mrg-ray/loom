@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/teradata-labs/loom/pkg/artifacts"
 	"github.com/teradata-labs/loom/pkg/config"
@@ -839,14 +840,41 @@ const (
 )
 
 // compactShellOutput strips terminal escape sequences and, past the cap,
-// keeps the head and tail of the stream with an explicit elision marker.
+// keeps the head and tail of the stream with an explicit elision marker. The
+// cuts land on rune boundaries: a byte-offset slice through a multi-byte rune
+// puts invalid UTF-8 into the result, which every downstream encoder then has
+// to repair.
 func compactShellOutput(s string) string {
 	s = ansiEscape.ReplaceAllString(s, "")
 	if len(s) <= shellOutputCap {
 		return s
 	}
-	elided := len(s) - shellOutputHead - shellOutputTail
-	return s[:shellOutputHead] +
+	head := runeBoundaryBefore(s, shellOutputHead)
+	tail := runeBoundaryAfter(s, len(s)-shellOutputTail)
+	elided := tail - head
+	return s[:head] +
 		fmt.Sprintf("\n[... %d bytes elided — rerun with a filter (grep/tail) to see the middle ...]\n", elided) +
-		s[len(s)-shellOutputTail:]
+		s[tail:]
+}
+
+// runeBoundaryBefore returns the largest index <= i that starts a rune.
+func runeBoundaryBefore(s string, i int) int {
+	if i >= len(s) {
+		return len(s)
+	}
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return i
+}
+
+// runeBoundaryAfter returns the smallest index >= i that starts a rune.
+func runeBoundaryAfter(s string, i int) int {
+	if i < 0 {
+		return 0
+	}
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return i
 }

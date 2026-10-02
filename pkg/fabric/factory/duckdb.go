@@ -64,6 +64,8 @@ func (b *DuckDBBackend) Name() string {
 // returns columns plus stringified rows. Read-only connections only: the
 // backend serves probes; mutations belong to the pipeline tooling (dbt).
 // Multiple files attach into an in-memory session — no default database.
+// External access is disabled once the databases are attached, so a query
+// can read the configured databases and nothing else on the filesystem.
 func (b *DuckDBBackend) pythonQuery(ctx context.Context, query string, maxRows int) ([]string, [][]*string, error) {
 	script := `
 import sys, json, os, duckdb
@@ -76,6 +78,11 @@ else:
     for p in paths:
         stem = os.path.splitext(os.path.basename(p))[0]
         con.execute('ATTACH %s AS "%s" (READ_ONLY)' % ("'" + p.replace("'", "''") + "'", stem))
+# Seal the filesystem before the caller's query runs. read_only guards the
+# database; without this, read_csv('/etc/passwd') and friends would turn a SQL
+# probe into an arbitrary file read, bypassing the file tools' own guards.
+# Order matters: ATTACH itself needs external access, so the seal comes last.
+con.execute("SET enable_external_access=false")
 cur = con.execute(q)
 cols = [d[0] for d in cur.description] if cur.description else []
 rows = cur.fetchmany(limit)

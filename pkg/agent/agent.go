@@ -118,10 +118,16 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		a.config.PatternConfig = DefaultPatternConfig()
 	}
 
-	// Automatic graph memory (background extraction + recall injection) is
-	// permanently disabled: it put LLM bookkeeping calls on the message
-	// critical path. Graph memory exists only through the explicit
-	// graph_memory tool.
+	// Automatic graph memory EXTRACTION stays off: enableGraphMemoryExtraction
+	// is never set, so the cadence hook in commitToolRow cannot fire and
+	// extractGraphMemoryAsync returns at its guard. Writing to the graph is
+	// the explicit graph_memory tool's job.
+	//
+	// Recall INJECTION is still live — injectGraphMemoryContext runs on every
+	// turn whose agent has graph memory enabled, and it carries an LLM
+	// side-call (extractSearchQuery) plus a per-turn system block. That block
+	// is hoisted ahead of the conversation by the provider clients, so it
+	// re-prices the cached prefix each turn.
 
 	// Initialize pattern orchestrator
 	patternLibrary := patterns.NewLibrary(nil, a.config.PatternsDir)

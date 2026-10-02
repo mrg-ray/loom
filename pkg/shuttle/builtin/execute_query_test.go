@@ -67,6 +67,37 @@ func TestExecuteQueryReadOnlyGate(t *testing.T) {
 	}
 }
 
+// A read-only leading keyword does not make the statement read-only: EXPLAIN
+// ANALYZE executes its subject and SELECT ... INTO creates a table, so the gate
+// scans the whole statement. The allow list guards against over-rejection —
+// identifiers that merely contain a keyword, and EXPLAIN's option syntax.
+func TestExecuteQueryGateScansWholeStatement(t *testing.T) {
+	rejected := []string{
+		"EXPLAIN ANALYZE DELETE FROM t",
+		"EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+		"EXPLAIN ANALYZE UPDATE t SET x = 1",
+		"SELECT * INTO backup FROM users",
+		"WITH a AS (SELECT 1) SELECT * INTO t FROM a",
+		"SELECT * FROM t WHERE id = 1 GRANT ALL ON t TO public",
+	}
+	for _, q := range rejected {
+		if err := checkReadOnly(q); err == nil {
+			t.Errorf("mutation passed the gate: %q", q)
+		}
+	}
+	allowed := []string{
+		"EXPLAIN (FORMAT JSON) SELECT 1",
+		"EXPLAIN ANALYZE SELECT count(*) FROM t",
+		"SELECT create_date, drop_count FROM t",
+		"SELECT * FROM t WHERE id IN (SELECT id FROM u)",
+	}
+	for _, q := range allowed {
+		if err := checkReadOnly(q); err != nil {
+			t.Errorf("read-only probe wrongly rejected: %q → %v", q, err)
+		}
+	}
+}
+
 // The tool renders aligned rows with NULLs and delegates to the backend.
 func TestExecuteQueryRendersRows(t *testing.T) {
 	be := &fakeSQLBackend{

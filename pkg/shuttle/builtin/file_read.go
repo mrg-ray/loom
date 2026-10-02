@@ -53,6 +53,14 @@ type FileReadTool struct {
 // MaxMultiReadFiles caps glob expansion — a wider match must be narrowed.
 const MaxMultiReadFiles = 50
 
+// maxMultiReadBytes bounds the assembled output of one batch read. The
+// per-file cap is MaxFileReadSize, so fifty matches could otherwise build a
+// half-gigabyte result in memory before anything downstream can stub it. The
+// budget is tested between files, so the file that crosses it is still read
+// whole — the ceiling is this value plus one file, not this value. Files past
+// it are named but not read, so the model learns what it did not get.
+const maxMultiReadBytes = 1 << 20
+
 // buildArtifactDirs are dbt's regenerated machinery folders — compiled and
 // run SQL, installed packages, logs. Wildcard sweeps skip them the way they
 // skip hidden directories; a literal path into one still reads.
@@ -407,7 +415,12 @@ func (t *FileReadTool) executeMulti(rawPaths []interface{}, params map[string]in
 	var b strings.Builder
 	okCount := 0
 	matchCount := 0
+	var skipped []string
 	for _, f := range files {
+		if b.Len() >= maxMultiReadBytes {
+			skipped = append(skipped, f)
+			continue
+		}
 		clean := f
 		if !filepath.IsAbs(clean) {
 			clean = filepath.Join(t.baseDir, clean)
@@ -463,6 +476,10 @@ func (t *FileReadTool) executeMulti(rawPaths []interface{}, params map[string]in
 	}
 
 	out := b.String()
+	if len(skipped) > 0 {
+		out += fmt.Sprintf("[output budget %d bytes reached — %d file(s) not read: %s. Narrow the glob or lower max_lines.]\n",
+			maxMultiReadBytes, len(skipped), strings.Join(skipped, ", "))
+	}
 	for _, zm := range zeroMatch {
 		out += fmt.Sprintf("(no matches: %s)\n", zm)
 	}

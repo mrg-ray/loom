@@ -226,18 +226,32 @@ func checkReadOnly(sqlText string) error {
 		return fmt.Errorf("empty query")
 	}
 	switch fields[0] {
-	case "SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "PRAGMA":
+	case "SHOW", "DESCRIBE", "PRAGMA":
 		return nil
-	case "WITH":
-		for _, kw := range []string{"INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP", "ALTER", "TRUNCATE", "COPY", "ATTACH"} {
+	case "SELECT", "WITH", "EXPLAIN":
+		// The leading keyword alone does not make a statement read-only.
+		// EXPLAIN ANALYZE executes its subject, so EXPLAIN ANALYZE DELETE
+		// mutates; SELECT ... INTO creates a table on engines that support
+		// it; a WITH can wrap any of them. Scan the structural text — string
+		// literals are already stripped, so a data value never trips this.
+		for _, kw := range mutatingSQLKeywords {
 			if containsSQLKeyword(upper, kw) {
-				return fmt.Errorf("WITH query contains %s — only SELECT is allowed", kw)
+				return fmt.Errorf("%s statement contains %s — only read-only statements are allowed", fields[0], kw)
 			}
 		}
 		return nil
 	default:
 		return fmt.Errorf("%s is not allowed — only SELECT / WITH / SHOW / DESCRIBE / EXPLAIN", fields[0])
 	}
+}
+
+// mutatingSQLKeywords are the keywords whose presence anywhere in a
+// read-only-shaped statement means it can still write. INTO covers
+// SELECT ... INTO <table> (and SELECT ... INTO OUTFILE); the rest cover a
+// mutation wrapped in a CTE or executed by EXPLAIN ANALYZE.
+var mutatingSQLKeywords = []string{
+	"INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP",
+	"ALTER", "TRUNCATE", "COPY", "ATTACH", "INTO", "GRANT", "REVOKE",
 }
 
 // containsSQLKeyword reports whether kw appears as a standalone word.

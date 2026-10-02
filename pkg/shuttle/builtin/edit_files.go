@@ -146,7 +146,37 @@ func (t *EditFilesTool) applyOne(path, find, replace string) error {
 		return fmt.Errorf("find text matches %d times — include surrounding lines to disambiguate", n)
 	}
 	content = strings.Replace(content, find, replace, 1)
-	if err := os.WriteFile(cleanPath, []byte(content), info.Mode().Perm()); err != nil {
+	// Write through a sibling temp file and rename: os.WriteFile truncates
+	// first, so a failure mid-write would leave the source half-written. The
+	// temp lives in the same directory so the rename stays on one filesystem
+	// and is atomic.
+	dir := filepath.Dir(cleanPath)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(cleanPath)+".edit-*")
+	if err != nil {
+		// A writable file inside a directory that is not writable could be
+		// edited in place before this change and must still be editable: the
+		// temp file is an upgrade, not a new requirement. Falling back costs
+		// the atomicity guarantee for exactly that case.
+		if werr := os.WriteFile(cleanPath, []byte(content), info.Mode().Perm()); werr != nil {
+			return fmt.Errorf("write failed: %v", werr)
+		}
+		return nil
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }() // no-op once the rename succeeds
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write failed: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("write failed: %v", err)
+	}
+	// CreateTemp makes the file 0600; restore the original's permissions
+	// before it takes the original's place.
+	if err := os.Chmod(tmpName, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write failed: %v", err)
+	}
+	if err := os.Rename(tmpName, cleanPath); err != nil {
 		return fmt.Errorf("write failed: %v", err)
 	}
 	return nil
