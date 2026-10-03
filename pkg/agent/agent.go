@@ -118,16 +118,20 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		a.config.PatternConfig = DefaultPatternConfig()
 	}
 
-	// Automatic graph memory EXTRACTION stays off: enableGraphMemoryExtraction
-	// is never set, so the cadence hook in commitToolRow cannot fire and
-	// extractGraphMemoryAsync returns at its guard. Writing to the graph is
-	// the explicit graph_memory tool's job.
-	//
-	// Recall INJECTION is still live — injectGraphMemoryContext runs on every
-	// turn whose agent has graph memory enabled, and it carries an LLM
-	// side-call (extractSearchQuery) plus a per-turn system block. That block
-	// is hoisted ahead of the conversation by the provider clients, so it
-	// re-prices the cached prefix each turn.
+	// Initialize automatic graph memory extraction if graph memory is enabled.
+	if a.graphMemoryStore != nil && a.graphMemoryConfig != nil &&
+		a.graphMemoryConfig.Enabled && a.graphMemoryConfig.EnableExtraction {
+		a.enableGraphMemoryExtraction = true
+		a.graphExtractionCadence = int(a.graphMemoryConfig.ExtractionCadence)
+		if a.graphExtractionCadence <= 0 {
+			a.graphExtractionCadence = 5
+		}
+		a.graphToolExecutionsSinceExtraction = 0
+
+		// Conversation-turn-based extraction (fires on LLM responses, not just tool use).
+		a.graphConversationExtractionCadence = int(a.graphMemoryConfig.ConversationExtractionCadence)
+		a.graphTurnsSinceExtraction = 0
+	}
 
 	// Initialize pattern orchestrator
 	patternLibrary := patterns.NewLibrary(nil, a.config.PatternsDir)
@@ -2025,6 +2029,17 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	// turn that asked for them — and, for a MANUAL skill, this is the only
 	// route in. A message that names no known command is left alone.
 	a.loadSkillFromSlashCommand(ctx, session, userMessage)
+
+	// Fire graph memory extraction on the incoming user message immediately,
+	// in parallel with the LLM processing it. The user message is where the
+	// information lives — extract entities/facts before the response comes back.
+	if a.enableGraphMemoryExtraction {
+		a.graphExtractionWG.Add(1)
+		go func() {
+			defer a.graphExtractionWG.Done()
+			a.extractGraphMemoryAsync(ctx, sessionID)
+		}()
+	}
 
 	// Store progressCallback in context so nested operations (tools, backends) can access it.
 	// This enables sub-agent progress reporting (e.g., weaver's sub-agents).

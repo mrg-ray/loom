@@ -91,7 +91,13 @@ func (sm *SegmentedMemory) compileLocked() []Message {
 	// Step 3: the summary's newest version, one system message. Its own cache
 	// breakpoint — stable until the next fold rewrites it.
 	if sm.summary.text != "" {
-		out = append(out, Message{Role: "system", Content: sm.summary.text, CacheBreakpoint: true})
+		// No cache marker. Markers are WRITE points and the budget is four:
+		// the tool list, ROM, lastStable, and the till-NOW marker that makes a
+		// turn's offload stubs and query_tool_result re-reads cacheable. The
+		// summary is the weakest claimant — a fold rewrites the summary itself,
+		// so the fallback it would provide lands on ROM's entry anyway, and on
+		// an evict-only pass it saves re-sending the summary alone.
+		out = append(out, Message{Role: "system", Content: sm.summary.text})
 	}
 
 	// Step 5: T — the session's current turn number.
