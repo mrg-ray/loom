@@ -86,7 +86,7 @@ func (t *ShellExecuteTool) Name() string {
 // This fallback is used only when prompts are not configured.
 func (t *ShellExecuteTool) Description() string {
 	return `Executes shell commands on the local system — general-purpose. Supports bash/sh on Unix and PowerShell/cmd on Windows.
-Prefer file_read for reading and searching files, file_write/edit_files for changing them, and sql_query for data probes; use shell for everything else: dbt, builds, scripts, OS operations.
+Prefer file_read for reading and searching files, and file_write/edit_files for changing them; use shell for everything else: dbt, builds, scripts, OS operations.
 Security: validates working directories, filters sensitive env vars, enforces timeouts.`
 }
 
