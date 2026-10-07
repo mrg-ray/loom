@@ -820,7 +820,7 @@ func TestOutputConfigEffort(t *testing.T) {
 	}
 	for _, tc := range cases {
 		c := &Client{model: tc.model, thinkingLevel: tc.level}
-		oc := c.outputConfigParam()
+		oc := c.outputConfigParam(context.Background())
 		got := ""
 		if oc != nil {
 			got, _ = oc["effort"].(string)

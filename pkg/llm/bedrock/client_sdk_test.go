@@ -180,7 +180,7 @@ func TestSDKClientOutputConfigEffort(t *testing.T) {
 	}
 	for _, tc := range cases {
 		c := &SDKClient{modelID: tc.model, thinkingLevel: tc.level}
-		got := string(c.outputConfig().Effort)
+		got := string(c.outputConfig(context.Background()).Effort)
 		if got != tc.want {
 			t.Errorf("%s/%s: effort=%q want %q", tc.model, tc.level, got, tc.want)
 		}

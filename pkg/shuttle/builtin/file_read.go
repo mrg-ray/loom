@@ -149,12 +149,20 @@ func (t *FileReadTool) Execute(ctx context.Context, params map[string]interface{
 		startLine = int(s)
 	}
 
-	// Safety: Clean the path and make it absolute
-	cleanPath := filepath.Clean(path)
-
-	// If relative, make it relative to baseDir
-	if !filepath.IsAbs(cleanPath) {
-		cleanPath = filepath.Join(t.baseDir, cleanPath)
+	// Safety: resolve into the workspace. isSensitiveReadPath alone is a deny
+	// list; it does not stop "../../.." or a symlinked directory from reaching
+	// outside the roots these tools are allowed to read.
+	cleanPath, scopeErr := resolveInScope(t.baseDir, path)
+	if scopeErr != nil {
+		return &shuttle.Result{
+			Success: false,
+			Error: &shuttle.Error{
+				Code:       "UNSAFE_PATH",
+				Message:    fmt.Sprintf("%s: %v", path, scopeErr),
+				Suggestion: "Read files inside the workspace, the loom data dir, or /tmp",
+			},
+			ExecutionTimeMs: time.Since(start).Milliseconds(),
+		}, nil
 	}
 
 	// Safety: Prevent reading sensitive locations
@@ -430,6 +438,13 @@ func (t *FileReadTool) executeMulti(rawPaths []interface{}, params map[string]in
 
 		fail := func(msg string) {
 			b.WriteString(fmt.Sprintf("=== %s ===\nERROR: %s\n", display, msg))
+		}
+		// A glob can expand through a symlinked directory and land outside
+		// the workspace, so every expanded file is tested, not just the
+		// pattern the caller wrote.
+		if !pathWithinScope(t.baseDir, clean) {
+			fail("outside the workspace, not readable")
+			continue
 		}
 		if isSensitiveReadPath(clean) {
 			fail("sensitive location, not readable")

@@ -201,9 +201,9 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 		Model:        c.model,
 		Messages:     apiMessages,
 		MaxTokens:    c.maxTokens,
-		Temperature:  c.temperatureParam(),
-		Thinking:     c.thinkingParam(),
-		OutputConfig: c.outputConfigParam(),
+		Temperature:  c.temperatureParam(ctx),
+		Thinking:     c.thinkingParam(ctx),
+		OutputConfig: c.outputConfigParam(ctx),
 	}
 
 	// Add system prompt blocks if present (Anthropic Messages API requires separate system field)
@@ -230,20 +230,21 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 // display default, omitted, returns signature-only blocks with no text —
 // observed live); older models still take enabled+budget_tokens, where the
 // level tiers finally differ.
-func (c *Client) thinkingParam() map[string]interface{} {
+func (c *Client) thinkingParam(ctx context.Context) map[string]interface{} {
 	if c.thinkingLevel == "" || c.thinkingLevel == "none" {
 		return nil
 	}
-	m := strings.ToLower(c.model)
-	adaptive := false
-	for _, marker := range []string{"sonnet-5", "opus-5", "fable-5", "-4-6", "-4-7", "-4-8"} {
-		if strings.Contains(m, marker) {
-			adaptive = true
-			break
-		}
-	}
-	if adaptive {
+	if llm.IsAdaptiveThinkingModel(c.model) {
 		return map[string]interface{}{"type": "adaptive", "display": "summarized"}
+	}
+	// Suppression applies HERE and only here. The requirement that a final
+	// assistant message begin with its thinking block belongs to this
+	// enabled+budget form; adaptive models accept a rebuilt tool_use row
+	// without one (measured across every Claude model Bedrock offers — only
+	// sonnet-4 and opus-4-1 reject it). Suppressing on the adaptive path
+	// would cost a resumed turn its thinking for nothing.
+	if llm.ThinkingSuppressed(ctx) {
+		return nil
 	}
 	budget := 16384
 	switch c.thinkingLevel {
@@ -269,8 +270,8 @@ func (c *Client) thinkingParam() map[string]interface{} {
 // temperatureParam returns the request temperature, or 1 when thinking is on.
 // Anthropic rejects any other temperature alongside thinking, so a configured
 // 0.2 would fail every request at any level above off.
-func (c *Client) temperatureParam() float64 {
-	if c.thinkingParam() != nil || c.outputConfigParam() != nil {
+func (c *Client) temperatureParam(ctx context.Context) float64 {
+	if c.thinkingParam(ctx) != nil || c.outputConfigParam(ctx) != nil {
 		return 1.0
 	}
 	return c.temperature
@@ -281,32 +282,11 @@ func (c *Client) temperatureParam() float64 {
 // (low|medium|high|xhigh|max — the API default is high; "auto" and empty
 // leave the field omitted). Older models have no effort knob and take the
 // budget tiers in thinkingParam instead.
-func (c *Client) outputConfigParam() map[string]interface{} {
-	if effort := effortForLevel(c.model, c.thinkingLevel); effort != "" {
+func (c *Client) outputConfigParam(ctx context.Context) map[string]interface{} {
+	if effort := llm.EffortForLevel(c.model, c.thinkingLevel); effort != "" {
 		return map[string]interface{}{"effort": effort}
 	}
 	return nil
-}
-
-// effortForLevel maps a thinking level to an effort tier for models that
-// accept output_config.effort; "" means omit the field.
-func effortForLevel(model, level string) string {
-	m := strings.ToLower(model)
-	adaptive := false
-	for _, marker := range []string{"sonnet-5", "opus-5", "fable-5", "-4-6", "-4-7", "-4-8"} {
-		if strings.Contains(m, marker) {
-			adaptive = true
-			break
-		}
-	}
-	if !adaptive {
-		return ""
-	}
-	switch strings.ToLower(level) {
-	case "low", "medium", "high", "xhigh", "max":
-		return strings.ToLower(level)
-	}
-	return ""
 }
 
 // convertMessages converts agent messages to Anthropic format.
@@ -682,9 +662,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		Model:        c.model,
 		Messages:     apiMessages,
 		MaxTokens:    c.maxTokens,
-		Temperature:  c.temperatureParam(),
-		Thinking:     c.thinkingParam(),
-		OutputConfig: c.outputConfigParam(),
+		Temperature:  c.temperatureParam(ctx),
+		Thinking:     c.thinkingParam(ctx),
+		OutputConfig: c.outputConfigParam(ctx),
 		Stream:       true, // Enable streaming
 	}
 

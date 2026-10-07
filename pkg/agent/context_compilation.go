@@ -21,11 +21,13 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -416,6 +418,59 @@ func collapseTo(content string, max int) string {
 // across compiles, so it can never disturb the provider prompt cache.
 // The bool reports whether the payload is tabular (the sql= door applies).
 func previewMeta(content string) (string, bool) {
+	if line, tabular, ok := previewMetaCached(content); ok {
+		return line, tabular
+	}
+	line, tabular := previewMetaUncached(content)
+	previewMetaStore(content, line, tabular)
+	return line, tabular
+}
+
+// previewMetaCache memoizes previewMeta. Compile and every estimate pass call
+// it for each stubbed row, and each call can run three json.Unmarshals over a
+// payload large enough to have been stubbed — all under the memory lock, for a
+// function whose output depends on nothing but its input. The key carries the
+// content length and a hash, so a changed payload cannot read a stale line.
+var (
+	previewMetaMu    sync.Mutex
+	previewMetaCache = map[string]previewMetaEntry{}
+)
+
+type previewMetaEntry struct {
+	line    string
+	tabular bool
+}
+
+// previewMetaCacheCap bounds the map. Entries are keyed by payload, and a long
+// session stubs many different ones; past the cap the cache is dropped whole
+// rather than evicted one by one, which costs one recompute per live stub and
+// keeps the bookkeeping to nothing.
+const previewMetaCacheCap = 512
+
+func previewMetaKey(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return fmt.Sprintf("%d:%x", len(content), sum[:8])
+}
+
+func previewMetaCached(content string) (string, bool, bool) {
+	k := previewMetaKey(content)
+	previewMetaMu.Lock()
+	defer previewMetaMu.Unlock()
+	e, ok := previewMetaCache[k]
+	return e.line, e.tabular, ok
+}
+
+func previewMetaStore(content, line string, tabular bool) {
+	k := previewMetaKey(content)
+	previewMetaMu.Lock()
+	defer previewMetaMu.Unlock()
+	if len(previewMetaCache) >= previewMetaCacheCap {
+		previewMetaCache = map[string]previewMetaEntry{}
+	}
+	previewMetaCache[k] = previewMetaEntry{line: line, tabular: tabular}
+}
+
+func previewMetaUncached(content string) (string, bool) {
 	if columns, rows, err := tabularPayload(content); err == nil {
 		count := fmt.Sprintf("%d", len(rows))
 		var envelope struct {
@@ -424,14 +479,14 @@ func previewMeta(content string) (string, bool) {
 		if json.Unmarshal([]byte(content), &envelope) == nil && envelope.TotalRowCount > len(rows) {
 			count = fmt.Sprintf("%d of %d", len(rows), envelope.TotalRowCount)
 		}
-		sample := ""
-		if len(rows) > 0 {
-			if b, err := json.Marshal(rows[0]); err == nil {
-				sample = " · sample: " + collapseTo(string(b), 200)
-			}
-		}
-		return fmt.Sprintf("columns: [%s] · rows: %s%s",
-			collapseTo(strings.Join(columns, ", "), 300), count, sample), true
+		// No sample row. The line's whole purpose is to say what the payload
+		// IS so the model can decide whether to open the door; a real first
+		// row up to 200 bytes is data, and data invites answering from the
+		// fragment — the truncated-but-looks-whole state this design exists
+		// to remove. It also inflated every stub, and the evicted stub's
+		// length sets the floor below which eviction saves nothing.
+		return fmt.Sprintf("columns: [%s] · rows: %s",
+			collapseTo(strings.Join(columns, ", "), 300), count), true
 	}
 	var v interface{}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(content)), &v); err == nil {
@@ -1339,12 +1394,16 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 	// dropped. Deactivation is by name, so without this a fold of an old load
 	// pair kills a reload from the very turn that asked for it.
 	stillLoaded := make(map[string]bool)
-	for _, name := range foldedSkillLoads(sm.contextMessages[count:]) {
+	// Pass 0, not the current turn: this scan asks which skills are loaded in
+	// live context, and a reload made THIS turn is the most live activation
+	// there is — skipping it would leave an earlier fold's note standing over
+	// a skill that is active again.
+	for _, name := range foldedSkillLoads(sm.contextMessages[count:], 0) {
 		stillLoaded[name] = true
 		delete(sm.foldedSkills, name)
 	}
 	var newlyFolded []string
-	for _, name := range foldedSkillLoads(region) {
+	for _, name := range foldedSkillLoads(region, sm.currentTurnLocked()) {
 		if !stillLoaded[name] {
 			newlyFolded = append(newlyFolded, name)
 		}
@@ -1416,9 +1475,6 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 	return true
 }
 
-// foldedSkillLoads returns the names of skills whose manage_skills load pair —
-// the load call paired with a "Skill loaded: " confirmation — lies inside the
-// region.
 // coversThrough reports whether text opens with a "covers msg:A-B" line whose
 // upper bound reaches hiSeq — i.e. the span line genuinely claims this fold's
 // coverage, not a stale echo of a previous version's line.
@@ -1443,9 +1499,23 @@ func coversThrough(text string, hiSeq int64) bool {
 	return err == nil && hi >= hiSeq
 }
 
-func foldedSkillLoads(region []Message) []string {
+// foldedSkillLoads returns the names of skills whose manage_skills load pair —
+// the load call paired with a "Skill loaded: " confirmation — lies inside the
+// region AND belongs to a settled turn.
+//
+// A load pair from the CURRENT turn is skipped. Rung 0 folds the current turn,
+// so without this a turn that loaded a skill and then hit the window would
+// have that skill deactivated mid-turn: its tools leave the kernel while the
+// protected skill-body row — the instructions telling the model to use them —
+// stays in context. The model is then told how to drive tools it no longer
+// has. The load pair's text still folds away; the activation it created
+// outlives it, and the ordinary settled-turn fold deactivates it later.
+func foldedSkillLoads(region []Message, currentTurn int64) []string {
 	loadCalls := make(map[string]string) // tool_use_id → skill name
 	for i := range region {
+		if region[i].Turn == currentTurn {
+			continue
+		}
 		for _, c := range region[i].ToolCalls {
 			if c.Name != "manage_skills" || c.ID == "" {
 				continue
@@ -1462,7 +1532,7 @@ func foldedSkillLoads(region []Message) []string {
 	seen := make(map[string]bool)
 	for i := range region {
 		m := &region[i]
-		if m.Role != "tool" || m.ToolUseID == "" {
+		if m.Role != "tool" || m.ToolUseID == "" || m.Turn == currentTurn {
 			continue
 		}
 		name := loadCalls[m.ToolUseID]

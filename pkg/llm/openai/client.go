@@ -382,8 +382,8 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 	req := &ChatCompletionRequest{
 		Model:       c.model,
 		Messages:    apiMessages,
-		Temperature: c.temperatureParam(),
-		Thinking:    c.thinkingParam(),
+		Temperature: c.temperatureParam(ctx),
+		Thinking:    c.thinkingParam(ctx),
 	}
 	if c.usesMaxCompletionTokens() {
 		req.MaxCompletionTokens = c.maxTokens
@@ -617,7 +617,9 @@ func completeThinkingBlocks(blocks []llmtypes.ThinkingBlock, text string) {
 // gate as cache_control, kept one predicate on purpose. Every non-off level
 // maps to adaptive: budget_tokens is rejected by Claude 4.6+/5, and adaptive
 // carries no effort knob on this wire.
-func (c *Client) thinkingParam() map[string]interface{} {
+func (c *Client) thinkingParam(ctx context.Context) map[string]interface{} {
+	// No suppression branch: this path only ever requests adaptive thinking,
+	// which accepts a rebuilt tool_use row with no thinking block.
 	if c.thinkingLevel == "" || c.thinkingLevel == "none" || !c.emitsCacheControl() {
 		return nil
 	}
@@ -629,8 +631,8 @@ func (c *Client) thinkingParam() map[string]interface{} {
 // temperature other than 1 alongside thinking — a configured 0.2 would fail
 // every request at any level above off. No budget clamp is needed here: this
 // path only ever requests adaptive thinking, which carries no budget_tokens.
-func (c *Client) temperatureParam() float64 {
-	if c.thinkingParam() != nil {
+func (c *Client) temperatureParam(ctx context.Context) float64 {
+	if c.thinkingParam(ctx) != nil {
 		return 1.0
 	}
 	return c.temperature
@@ -1076,8 +1078,8 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	req := &ChatCompletionRequest{
 		Model:         c.model,
 		Messages:      apiMessages,
-		Temperature:   c.temperatureParam(),
-		Thinking:      c.thinkingParam(),
+		Temperature:   c.temperatureParam(ctx),
+		Thinking:      c.thinkingParam(ctx),
 		Stream:        true,                               // Enable streaming
 		StreamOptions: &StreamOptions{IncludeUsage: true}, // final usage chunk (tokens + cache)
 	}

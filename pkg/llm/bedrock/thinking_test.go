@@ -8,9 +8,12 @@
 package bedrock
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/teradata-labs/loom/pkg/llm"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
@@ -37,7 +40,7 @@ func TestBedrockThinking_ConfigMapping(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := bedrockThinkingClient(tc.model, tc.level)
-			b, err := json.Marshal(c.thinkingConfig())
+			b, err := json.Marshal(c.thinkingConfig(context.Background()))
 			if err != nil {
 				t.Fatalf("marshal: %v", err)
 			}
@@ -48,7 +51,7 @@ func TestBedrockThinking_ConfigMapping(t *testing.T) {
 	}
 	// Off: the zero union must marshal to nothing meaningful.
 	c := bedrockThinkingClient("global.anthropic.claude-sonnet-5-v1:0", "")
-	if b, _ := json.Marshal(c.thinkingConfig()); strings.Contains(string(b), "adaptive") ||
+	if b, _ := json.Marshal(c.thinkingConfig(context.Background())); strings.Contains(string(b), "adaptive") ||
 		strings.Contains(string(b), "budget") {
 		t.Errorf("off level produced a thinking config: %s", b)
 	}
@@ -116,13 +119,13 @@ func TestBedrockThinking_BudgetAndTemperatureStayValid(t *testing.T) {
 	older := "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 
 	c := &SDKClient{modelID: older, thinkingLevel: "low", maxTokens: 4096, temperature: 1.0}
-	cfg := c.thinkingConfig()
+	cfg := c.thinkingConfig(context.Background())
 	if cfg.OfEnabled != nil && cfg.OfEnabled.BudgetTokens >= 4096 {
 		t.Errorf("budget %d is not below max_tokens 4096", cfg.OfEnabled.BudgetTokens)
 	}
 
 	c = &SDKClient{modelID: older, thinkingLevel: "low", maxTokens: 1500, temperature: 1.0}
-	if cfg := c.thinkingConfig(); cfg.OfEnabled != nil || cfg.OfAdaptive != nil {
+	if cfg := c.thinkingConfig(context.Background()); cfg.OfEnabled != nil || cfg.OfAdaptive != nil {
 		b, _ := json.Marshal(cfg)
 		t.Errorf("no valid budget fits under max_tokens 1500, thinking should be omitted: %s", b)
 	}
@@ -133,8 +136,33 @@ func TestBedrockThinking_BudgetAndTemperatureStayValid(t *testing.T) {
 		want  bool
 	}{{"", false}, {"none", false}, {"low", true}, {"high", true}} {
 		c = &SDKClient{modelID: older, thinkingLevel: tc.level, maxTokens: 64000, temperature: 0.2}
-		if omitted := !c.temperatureParam().Valid(); omitted != tc.want {
+		if omitted := !c.temperatureParam(context.Background()).Valid(); omitted != tc.want {
 			t.Errorf("level %q: temperature omitted=%v, want %v", tc.level, omitted, tc.want)
 		}
+	}
+}
+
+// Suppression belongs to the enabled+budget form only. Measured across every
+// Claude model Bedrock offers, only sonnet-4 and opus-4-1 reject a rebuilt
+// tool_use row with no thinking block; adaptive models accept it. Suppressing
+// on the adaptive path would cost a resumed turn its thinking for nothing.
+func TestBedrockThinking_SuppressionOnlyOnTheEnabledForm(t *testing.T) {
+	ctx := llm.ContextSuppressThinking(context.Background())
+
+	older := &SDKClient{modelID: "us.anthropic.claude-sonnet-4-20250514-v1:0",
+		thinkingLevel: "high", maxTokens: 64000, temperature: 1.0}
+	if cfg := older.thinkingConfig(ctx); cfg.OfEnabled != nil || cfg.OfAdaptive != nil {
+		b, _ := json.Marshal(cfg)
+		t.Errorf("the enabled form must yield to suppression: %s", b)
+	}
+
+	adaptive := &SDKClient{modelID: "global.anthropic.claude-opus-5-5",
+		thinkingLevel: "high", maxTokens: 64000, temperature: 1.0}
+	if cfg := adaptive.thinkingConfig(ctx); cfg.OfAdaptive == nil {
+		b, _ := json.Marshal(cfg)
+		t.Errorf("the adaptive form has no such constraint and must keep thinking: %s", b)
+	}
+	if eff := adaptive.outputConfig(ctx); eff.Effort == "" {
+		t.Error("output_config.effort must survive suppression on an adaptive model")
 	}
 }

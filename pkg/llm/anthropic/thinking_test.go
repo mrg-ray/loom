@@ -183,7 +183,7 @@ func TestNativeThinking_BudgetAndTemperatureStayValid(t *testing.T) {
 	older := "claude-3-5-sonnet-20241022"
 
 	c := NewClient(Config{APIKey: "k", Model: older, MaxTokens: 4096, ThinkingLevel: "low"})
-	p := c.thinkingParam()
+	p := c.thinkingParam(context.Background())
 	if p == nil {
 		t.Fatal("thinking should still be sent when a smaller budget fits")
 	}
@@ -192,7 +192,7 @@ func TestNativeThinking_BudgetAndTemperatureStayValid(t *testing.T) {
 	}
 
 	c = NewClient(Config{APIKey: "k", Model: older, MaxTokens: 1500, ThinkingLevel: "low"})
-	if c.thinkingParam() != nil {
+	if c.thinkingParam(context.Background()) != nil {
 		t.Error("no valid budget fits under max_tokens 1500; thinking should be omitted")
 	}
 
@@ -207,7 +207,7 @@ func TestNativeThinking_BudgetAndTemperatureStayValid(t *testing.T) {
 		{"claude-sonnet-5", "high", 1.0},
 	} {
 		c = NewClient(Config{APIKey: "k", Model: tc.model, MaxTokens: 64000, ThinkingLevel: tc.level, Temperature: 0.2})
-		if got := c.temperatureParam(); got != tc.want {
+		if got := c.temperatureParam(context.Background()); got != tc.want {
 			t.Errorf("model %s level %q: temperature %v, want %v", tc.model, tc.level, got, tc.want)
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/teradata-labs/loom/pkg/shuttle"
@@ -113,11 +114,23 @@ func (t *EditFilesTool) Execute(ctx context.Context, params map[string]interface
 	}, nil
 }
 
+// editLocks serialises edits per file. An edit is read-modify-write, so two
+// edits to one file could both read the original and the second write would
+// drop the first's change. The lock is held for the whole cycle; it is keyed by
+// the resolved path, so two names for one file (a symlink and its target)
+// still serialise.
+var editLocks sync.Map // resolved path -> *sync.Mutex
+
+func lockForPath(path string) *sync.Mutex {
+	actual, _ := editLocks.LoadOrStore(path, &sync.Mutex{})
+	return actual.(*sync.Mutex)
+}
+
 // applyOne performs a single exactly-once literal replacement.
 func (t *EditFilesTool) applyOne(path, find, replace string) error {
-	cleanPath := filepath.Clean(path)
-	if !filepath.IsAbs(cleanPath) {
-		cleanPath = filepath.Join(t.baseDir, cleanPath)
+	cleanPath, err := resolveInScope(t.baseDir, path)
+	if err != nil {
+		return err
 	}
 	if isSensitivePath(cleanPath) {
 		return fmt.Errorf("sensitive location, not editable")
@@ -130,6 +143,10 @@ func (t *EditFilesTool) applyOne(path, find, replace string) error {
 	if resolved, rerr := filepath.EvalSymlinks(cleanPath); rerr == nil {
 		cleanPath = resolved
 	}
+	mu := lockForPath(cleanPath)
+	mu.Lock()
+	defer mu.Unlock()
+
 	info, err := os.Stat(cleanPath)
 	if err != nil {
 		return fmt.Errorf("not found")

@@ -289,9 +289,9 @@ func (t *FileWriteTool) writeOne(path, content, mode string) (string, error) {
 	if len(content) > MaxSafeContentSize {
 		return "", fmt.Errorf("content exceeds 50KB limit (%d bytes)", len(content))
 	}
-	cleanPath := filepath.Clean(path)
-	if !filepath.IsAbs(cleanPath) {
-		cleanPath = filepath.Join(t.baseDir, cleanPath)
+	cleanPath, scopeErr := resolveInScope(t.baseDir, path)
+	if scopeErr != nil {
+		return "", scopeErr
 	}
 	if isSensitivePath(cleanPath) {
 		return "", fmt.Errorf("sensitive location, not writable")

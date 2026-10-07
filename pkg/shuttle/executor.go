@@ -804,6 +804,16 @@ func (e *Executor) ResolveAndRegister(ctx context.Context, name string, servers 
 	if e.toolRegistry == nil {
 		return nil, fmt.Errorf("tool registry not configured")
 	}
+	// A name already registered is returned as-is, never rebound. Two skills
+	// can declare the same bare name (execute_sql is the obvious one), and
+	// silently replacing the first skill's tool with the second's gives the
+	// model a tool whose behaviour changed under it — and makes the first
+	// skill's unmount remove a tool the second is still using. First claim
+	// wins; the caller gets the live tool and a nil error, because the name
+	// it asked for is mounted.
+	if existing, ok := e.registry.Get(name); ok {
+		return existing, nil
+	}
 	resp, err := e.toolRegistry.Search(ctx, &loomv1.SearchToolsRequest{
 		Query:         name,
 		Mode:          loomv1.SearchMode_SEARCH_MODE_FAST,

@@ -852,7 +852,24 @@ func TestPreviewMeta_TabularEnvelope(t *testing.T) {
 	assert.True(t, tabular, "the drain envelope is tabular — the sql door applies")
 	assert.Contains(t, meta, "columns: [DataBaseName, TableName]")
 	assert.Contains(t, meta, "rows: 2 of 1004", "partial payloads state N of M — the you-have-not-seen-this signal")
-	assert.Contains(t, meta, `sample: ["agentic_demo","t1"]`)
+	assert.NotContains(t, meta, "agentic_demo",
+		"the line says what the payload is, never what it contains — a real row is data, and data invites answering from the fragment")
+}
+
+// previewMeta is a pure function of its input and is called for every stubbed
+// row on every render and every estimate pass, so it is memoized. A changed
+// payload must never read a previous one's line.
+func TestPreviewMeta_MemoizedPerPayload(t *testing.T) {
+	a := `{"columns":["x"],"rows":[["1"]],"row_count":1}`
+	b := `{"columns":["y"],"rows":[["2"]],"row_count":1}`
+
+	first, _ := previewMeta(a)
+	again, _ := previewMeta(a)
+	assert.Equal(t, first, again, "the same payload yields the same line")
+
+	other, _ := previewMeta(b)
+	assert.NotEqual(t, first, other, "a different payload must not read the cached line")
+	assert.Contains(t, other, "columns: [y]")
 }
 
 func TestPreviewMeta_UniformObjects(t *testing.T) {
@@ -990,4 +1007,29 @@ func TestReleasePressure_FoldRetriesThenSucceeds(t *testing.T) {
 	require.True(t, shed)
 	assert.Equal(t, 3, fc.calls, "two failures then the success")
 	assert.Contains(t, sm.summary.text, "summary after retry")
+}
+
+// A load pair from a settled turn deactivates its skill when it folds; one
+// from the CURRENT turn does not. Rung 0 folds the current turn, and taking
+// the tools away there leaves the protected skill-body row in context telling
+// the model to use tools the kernel no longer has.
+func TestFoldedSkillLoads_SkipsTheCurrentTurn(t *testing.T) {
+	pair := func(turn int64, id, skill string) []Message {
+		return []Message{
+			{Role: "assistant", Turn: turn, ToolCalls: []ToolCall{{
+				ID: id, Name: "manage_skills",
+				Input: map[string]interface{}{"action": "load", "name": skill},
+			}}},
+			{Role: "tool", Turn: turn, ToolUseID: id, Content: "Skill loaded: " + skill},
+		}
+	}
+
+	region := append(pair(4, "load-settled", "alpha-skill"), pair(7, "load-current", "beta-skill")...)
+
+	got := foldedSkillLoads(region, 7)
+	assert.Equal(t, []string{"alpha-skill"}, got,
+		"only the settled turn's load pair deactivates; the current turn's activation outlives its folded text")
+
+	// With no turn in flight every pair in the region counts.
+	assert.ElementsMatch(t, []string{"alpha-skill", "beta-skill"}, foldedSkillLoads(region, 0))
 }

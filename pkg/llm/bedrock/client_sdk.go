@@ -231,9 +231,9 @@ func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools
 		Model:        anthropic.Model(c.modelID),
 		Messages:     sdkMessages,
 		MaxTokens:    c.maxTokens,
-		Temperature:  c.temperatureParam(),
-		Thinking:     c.thinkingConfig(),
-		OutputConfig: c.outputConfig(),
+		Temperature:  c.temperatureParam(ctx),
+		Thinking:     c.thinkingConfig(ctx),
+		OutputConfig: c.outputConfig(ctx),
 	}
 
 	// System blocks carry the compile's cache breakpoints, one per block.
@@ -303,8 +303,8 @@ func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools
 
 // thinkingEnabled reports whether this request carries thinking, in which form
 // does not matter: the API rejects temperature != 1 whenever thinking is on.
-func (c *SDKClient) thinkingEnabled() bool {
-	t := c.thinkingConfig()
+func (c *SDKClient) thinkingEnabled(ctx context.Context) bool {
+	t := c.thinkingConfig(ctx)
 	return t.OfAdaptive != nil || t.OfEnabled != nil
 }
 
@@ -313,8 +313,8 @@ func (c *SDKClient) thinkingEnabled() bool {
 // thinking, so a configured 0.2 would fail every request at any level above
 // off. Omitting the field takes the API default, which is the only value
 // thinking accepts.
-func (c *SDKClient) temperatureParam() param.Opt[float64] {
-	if c.thinkingEnabled() {
+func (c *SDKClient) temperatureParam(ctx context.Context) param.Opt[float64] {
+	if c.thinkingEnabled(ctx) {
 		return param.Opt[float64]{}
 	}
 	return anthropic.Float(c.temperature)
@@ -324,17 +324,20 @@ func (c *SDKClient) temperatureParam() param.Opt[float64] {
 // summarized display on 4.6+/5 models (the level tiers collapse there — no
 // effort knob exists), enabled+budget_tokens tiers on older ones. Zero value
 // = field omitted = thinking off.
-func (c *SDKClient) thinkingConfig() anthropic.ThinkingConfigParamUnion {
+func (c *SDKClient) thinkingConfig(ctx context.Context) anthropic.ThinkingConfigParamUnion {
 	if c.thinkingLevel == "" || c.thinkingLevel == "none" {
 		return anthropic.ThinkingConfigParamUnion{}
 	}
-	m := strings.ToLower(c.modelID)
-	for _, marker := range []string{"sonnet-5", "opus-5", "fable-5", "-4-6", "-4-7", "-4-8"} {
-		if strings.Contains(m, marker) {
-			return anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{
-				Display: anthropic.ThinkingConfigAdaptiveDisplaySummarized,
-			}}
-		}
+	if llm.IsAdaptiveThinkingModel(c.modelID) {
+		return anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{
+			Display: anthropic.ThinkingConfigAdaptiveDisplaySummarized,
+		}}
+	}
+	// Suppression applies HERE and only here — see the native client: the
+	// thinking-block requirement belongs to this enabled+budget form, and
+	// adaptive models accept a rebuilt tool_use row without one.
+	if llm.ThinkingSuppressed(ctx) {
+		return anthropic.ThinkingConfigParamUnion{}
 	}
 	budget := int64(16384)
 	switch c.thinkingLevel {
@@ -360,19 +363,8 @@ func (c *SDKClient) thinkingConfig() anthropic.ThinkingConfigParamUnion {
 // outputConfig maps the thinking level to output_config.effort on
 // adaptive-thinking models (low|medium|high|xhigh|max; "auto"/empty omit
 // the field and take the API default, high). Zero value = field omitted.
-func (c *SDKClient) outputConfig() anthropic.OutputConfigParam {
-	m := strings.ToLower(c.modelID)
-	adaptive := false
-	for _, marker := range []string{"sonnet-5", "opus-5", "fable-5", "-4-6", "-4-7", "-4-8"} {
-		if strings.Contains(m, marker) {
-			adaptive = true
-			break
-		}
-	}
-	if !adaptive {
-		return anthropic.OutputConfigParam{}
-	}
-	switch strings.ToLower(c.thinkingLevel) {
+func (c *SDKClient) outputConfig(ctx context.Context) anthropic.OutputConfigParam {
+	switch llm.EffortForLevel(c.modelID, c.thinkingLevel) {
 	case "low":
 		return anthropic.OutputConfigParam{Effort: anthropic.OutputConfigEffortLow}
 	case "medium":
@@ -712,9 +704,9 @@ func (c *SDKClient) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		Model:        anthropic.Model(c.modelID),
 		Messages:     sdkMessages,
 		MaxTokens:    c.maxTokens,
-		Temperature:  c.temperatureParam(),
-		Thinking:     c.thinkingConfig(),
-		OutputConfig: c.outputConfig(),
+		Temperature:  c.temperatureParam(ctx),
+		Thinking:     c.thinkingConfig(ctx),
+		OutputConfig: c.outputConfig(ctx),
 	}
 
 	// System blocks carry the compile's cache breakpoints, one per block.
