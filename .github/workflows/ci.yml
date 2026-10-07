@@ -193,11 +193,17 @@ jobs:
           # pipefail so a non-zero `go test` exit is not masked by `tee`.
           # ./cmd/... is in the gate: the CLI is the standalone respond door,
           # and a test that does not gate is not coverage.
+          #
+          # ./test/... drives the agent from outside its package — the relief
+          # machinery is exercised there and nowhere else — so -coverpkg
+          # attributes what those routes execute back to the packages that own
+          # the lines, which a per-package profile cannot do.
           set -euo pipefail
           go test -tags fts5 -race -v -timeout=10m \
             -coverprofile=coverage.out \
             -covermode=atomic \
-            ./pkg/... ./internal/... ./cmd/... \
+            -coverpkg=./pkg/...,./internal/...,./cmd/... \
+            ./pkg/... ./internal/... ./cmd/... ./test/... \
             | tee test-output.log
 
       - name: Run example tests

@@ -618,7 +618,7 @@ func (c *Client) calculateCost(inputTokens, outputTokens, cacheReadTokens, cache
 			inputPricePerM = 5.0
 			outputPricePerM = 25.0
 		case strings.Contains(c.model, "opus"):
-			// Any newer Opus (5+) not yet in the catalog: $5/$25, never the
+			// Any Opus 5+ absent from the catalog: $5/$25, never the
 			// sonnet default — a missing catalog entry must not silently
 			// under-price Opus at sonnet rates.
 			inputPricePerM = 5.0

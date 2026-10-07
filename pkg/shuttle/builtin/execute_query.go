@@ -20,16 +20,14 @@ import (
 // for local and benchmark work. The tool is backend-agnostic: duckdb,
 // postgres, or any other ExecutionBackend serves it identically.
 //
-// EXPERIMENTAL, and deliberately not reachable from any agent's tool surface:
-// nothing calls NewExecuteQueryTool outside this package and the name is
-// absent from ByName, so a config cannot mount it either. It exists to drive
+// The tool is constructed only by a caller that holds a backend: nothing
+// builds it outside this package and the name is absent from ByName, so it
+// reaches an agent only when a host wires it in deliberately. It serves
 // benchmark harnesses against a local warehouse.
 //
-// Statements are NOT gated. The tool runs what it is given, mutations
-// included, because the benchmarks it serves build and change data. Its risk
-// profile is the shell tool's — lower, since it reaches one database rather
-// than the machine — and it is governed the same way: by not being enabled.
-// A production surface must not register it.
+// Statements run as given, mutations included, because those harnesses build
+// and change data. Its reach is one database; the shell tool's is the machine.
+// Both are governed by which surfaces mount them.
 type ExecuteQueryTool struct {
 	backend fabric.ExecutionBackend
 }
@@ -47,7 +45,7 @@ func (t *ExecuteQueryTool) Backend() string { return "" }
 
 // Description returns the tool description.
 func (t *ExecuteQueryTool) Description() string {
-	return `Run SQL batches against the project's warehouse. You are strongly advised to batch multiple statements together and run them in one call — every independent check (counts, distributions, verifications) in a single call to reduce cost. Experimental, local use only.`
+	return `Run SQL batches against the project's warehouse. You are strongly advised to batch multiple statements together and run them in one call — every independent check (counts, distributions, verifications) in a single call to reduce cost.`
 }
 
 // InputSchema returns the JSON schema for the tool input.

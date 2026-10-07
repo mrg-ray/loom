@@ -96,7 +96,7 @@ func (t *FileReadTool) InputSchema() *shuttle.JSONSchema {
 				Items:       shuttle.NewStringSchema("file path or glob"),
 			},
 			"pattern": shuttle.NewStringSchema("Optional regex. When set, returns only matching lines as path:line: text (search mode) instead of full contents."),
-			"path":    shuttle.NewStringSchema("Single file path to read (legacy form; prefer paths)."),
+			"path":    shuttle.NewStringSchema("Single file path to read; paths reads one or many."),
 			"encoding": shuttle.NewStringSchema("Output encoding: 'text' (default) or 'base64' for binary files (single-path form only)").
 				WithEnum("text", "base64").
 				WithDefault("text"),

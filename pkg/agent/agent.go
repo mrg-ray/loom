@@ -852,9 +852,9 @@ func (a *Agent) enforceRequiredSkillTools(sessionID string) {
 						zap.String("skill", as.Skill.Name),
 						zap.String("tool", name))
 				} else if err := a.resolveSkillTool(name, as.Skill.Tools.MCPServers); err != nil {
-					// Non-builtin (MCP/registry) tool that could not be
-					// resolved: warn and skip, matching the pre-existing
-					// degrade-not-fail contract — the turn continues without it.
+					// A non-builtin (MCP/registry) tool that does not
+					// resolve is logged and skipped; the turn continues
+					// without it.
 					zap.L().Warn("skill required tool not resolvable; skipping",
 						zap.String("skill", as.Skill.Name),
 						zap.String("tool", name),
