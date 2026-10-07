@@ -10,15 +10,26 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/teradata-labs/loom/pkg/fabric"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 )
 
-// ExecuteQueryTool exposes the agent's fabric.ExecutionBackend as a read-only
-// query tool. The tool is backend-agnostic: duckdb, postgres, or any other
-// ExecutionBackend serves it identically. Register it only when the agent has
-// a real backend — absent beats broken.
+// ExecuteQueryTool exposes the agent's fabric.ExecutionBackend as a SQL tool
+// for local and benchmark work. The tool is backend-agnostic: duckdb,
+// postgres, or any other ExecutionBackend serves it identically.
+//
+// EXPERIMENTAL, and deliberately not reachable from any agent's tool surface:
+// nothing calls NewExecuteQueryTool outside this package and the name is
+// absent from ByName, so a config cannot mount it either. It exists to drive
+// benchmark harnesses against a local warehouse.
+//
+// Statements are NOT gated. The tool runs what it is given, mutations
+// included, because the benchmarks it serves build and change data. Its risk
+// profile is the shell tool's — lower, since it reaches one database rather
+// than the machine — and it is governed the same way: by not being enabled.
+// A production surface must not register it.
 type ExecuteQueryTool struct {
 	backend fabric.ExecutionBackend
 }
@@ -36,7 +47,7 @@ func (t *ExecuteQueryTool) Backend() string { return "" }
 
 // Description returns the tool description.
 func (t *ExecuteQueryTool) Description() string {
-	return `Run read-only SQL batches against the project's warehouse. You are strongly advised to batch multiple queries together and run them in one call — every independent check (counts, distributions, verifications) in a single call to reduce cost. Mutations are rejected — schema changes and loads go through dbt.`
+	return `Run SQL batches against the project's warehouse. You are strongly advised to batch multiple statements together and run them in one call — every independent check (counts, distributions, verifications) in a single call to reduce cost. Experimental, local use only.`
 }
 
 // InputSchema returns the JSON schema for the tool input.
@@ -51,7 +62,7 @@ func (t *ExecuteQueryTool) InputSchema() *shuttle.JSONSchema {
 					Type: "object",
 					Properties: map[string]*shuttle.JSONSchema{
 						"label": shuttle.NewStringSchema("Short name for this check; heads its result section."),
-						"sql":   shuttle.NewStringSchema("One read-only statement: SELECT / WITH / SHOW / DESCRIBE / EXPLAIN."),
+						"sql":   shuttle.NewStringSchema("One SQL statement."),
 					},
 					Required: []string{"sql"},
 				},
@@ -93,7 +104,8 @@ func parseStatements(params map[string]interface{}) []queryStatement {
 	return stmts
 }
 
-// Execute gates for read-only-ness and delegates to the backend.
+// Execute parses the batch and delegates each statement to the backend. There
+// is no read-only gate — see the type's doc comment.
 func (t *ExecuteQueryTool) Execute(ctx context.Context, params map[string]interface{}) (*shuttle.Result, error) {
 	start := time.Now()
 
@@ -113,10 +125,20 @@ func (t *ExecuteQueryTool) Execute(ctx context.Context, params map[string]interf
 	if len(stmts) == 0 {
 		return fail("INVALID_PARAMS", "statements is required", "Provide statements: [{label, sql}, ...]")
 	}
+	if len(stmts) > maxQueryStatements {
+		return fail("TOO_MANY_STATEMENTS",
+			fmt.Sprintf("%d statements (max %d)", len(stmts), maxQueryStatements),
+			"Split the batch — the per-statement render budget divides across the call")
+	}
 
 	rowLimit := 50
 	if rl, ok := params["row_limit"].(float64); ok && rl > 0 {
+		// A fractional limit floors to 0 and would render an empty result for
+		// a statement that returned rows. One row is the smallest honest answer.
 		rowLimit = int(rl)
+		if rowLimit < 1 {
+			rowLimit = 1
+		}
 	}
 
 	// Per-statement render budget: the whole batch stays lean no matter how
@@ -183,9 +205,6 @@ func (t *ExecuteQueryTool) runOne(ctx context.Context, sqlText string, rowLimit,
 	if sqlText == "" {
 		return "", &shuttle.Error{Code: "INVALID_PARAMS", Message: "empty sql"}
 	}
-	if err := checkReadOnly(sqlText); err != nil {
-		return "", &shuttle.Error{Code: "READ_ONLY", Message: err.Error(), Suggestion: "read-only: mutations go through dbt or shell"}
-	}
 	res, err := t.backend.ExecuteQuery(ctx, sqlText)
 	if err != nil {
 		return "", &shuttle.Error{Code: "QUERY_FAILED", Message: err.Error()}
@@ -210,71 +229,10 @@ func (t *ExecuteQueryTool) runOne(ctx context.Context, sqlText string, rowLimit,
 	}
 }
 
-// checkReadOnly enforces the probe contract: single statement, first keyword
-// in the read-only set, and a WITH must contain no mutating keyword. Scans
-// run on structural text only — quoted string literals are stripped first,
-// so data values like 'DELETE' or 'a;b' never trip the gate.
-func checkReadOnly(sqlText string) error {
-	structural := stripSQLStringLiterals(strings.TrimSpace(sqlText))
-	trimmed := strings.TrimRight(structural, "; \n\t")
-	if strings.Contains(trimmed, ";") {
-		return fmt.Errorf("multi-statement queries are rejected")
-	}
-	upper := strings.ToUpper(trimmed)
-	fields := strings.Fields(upper)
-	if len(fields) == 0 {
-		return fmt.Errorf("empty query")
-	}
-	switch fields[0] {
-	case "SHOW", "DESCRIBE", "PRAGMA":
-		return nil
-	case "SELECT", "WITH", "EXPLAIN":
-		// The leading keyword alone does not make a statement read-only.
-		// EXPLAIN ANALYZE executes its subject, so EXPLAIN ANALYZE DELETE
-		// mutates; SELECT ... INTO creates a table on engines that support
-		// it; a WITH can wrap any of them. Scan the structural text — string
-		// literals are already stripped, so a data value never trips this.
-		for _, kw := range mutatingSQLKeywords {
-			if containsSQLKeyword(upper, kw) {
-				return fmt.Errorf("%s statement contains %s — only read-only statements are allowed", fields[0], kw)
-			}
-		}
-		return nil
-	default:
-		return fmt.Errorf("%s is not allowed — only SELECT / WITH / SHOW / DESCRIBE / EXPLAIN", fields[0])
-	}
-}
-
-// mutatingSQLKeywords are the keywords whose presence anywhere in a
-// read-only-shaped statement means it can still write. INTO covers
-// SELECT ... INTO <table> (and SELECT ... INTO OUTFILE); the rest cover a
-// mutation wrapped in a CTE or executed by EXPLAIN ANALYZE.
-var mutatingSQLKeywords = []string{
-	"INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP",
-	"ALTER", "TRUNCATE", "COPY", "ATTACH", "INTO", "GRANT", "REVOKE",
-}
-
-// containsSQLKeyword reports whether kw appears as a standalone word.
-func containsSQLKeyword(upperSQL, kw string) bool {
-	idx := 0
-	for {
-		i := strings.Index(upperSQL[idx:], kw)
-		if i < 0 {
-			return false
-		}
-		i += idx
-		before := i == 0 || !isSQLWordChar(upperSQL[i-1])
-		after := i+len(kw) >= len(upperSQL) || !isSQLWordChar(upperSQL[i+len(kw)])
-		if before && after {
-			return true
-		}
-		idx = i + len(kw)
-	}
-}
-
-func isSQLWordChar(c byte) bool {
-	return c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
-}
+// maxQueryStatements bounds one batch. Every statement runs, and the render
+// budget divides across them, so an unbounded batch both takes unbounded time
+// and squeezes every result to the budget floor.
+const maxQueryStatements = 25
 
 // queryCellMaxLen bounds a rendered cell — long text columns get elided, a
 // probe needs the value's shape, not its entirety.
@@ -290,7 +248,13 @@ func renderQueryRows(cols []string, rows []map[string]interface{}, omitted int) 
 		}
 		s := fmt.Sprint(v)
 		if len(s) > queryCellMaxLen {
-			s = s[:queryCellMaxLen-1] + "…"
+			// Cut on a rune boundary: a byte-offset slice through a
+			// multi-byte rune renders a broken character into the result.
+			cut := queryCellMaxLen - 1
+			for cut > 0 && !utf8.RuneStart(s[cut]) {
+				cut--
+			}
+			s = s[:cut] + "…"
 		}
 		return s
 	}
@@ -319,35 +283,6 @@ func renderQueryRows(cols []string, rows []map[string]interface{}, omitted int) 
 	b.WriteString(fmt.Sprintf("(%d rows)", len(rows)))
 	if omitted > 0 {
 		b.WriteString(fmt.Sprintf(" [+%d more not shown — narrow with WHERE or aggregate]", omitted))
-	}
-	return b.String()
-}
-
-// stripSQLStringLiterals blanks out single-quoted literals (” escaping
-// honored) so keyword and separator scans see only query structure.
-func stripSQLStringLiterals(sqlText string) string {
-	var b strings.Builder
-	inString := false
-	for i := 0; i < len(sqlText); i++ {
-		c := sqlText[i]
-		if inString {
-			if c == '\'' {
-				// doubled '' is an escaped quote inside the literal
-				if i+1 < len(sqlText) && sqlText[i+1] == '\'' {
-					i++
-					continue
-				}
-				inString = false
-				b.WriteByte('\'')
-			}
-			continue
-		}
-		if c == '\'' {
-			inString = true
-			b.WriteByte('\'')
-			continue
-		}
-		b.WriteByte(c)
 	}
 	return b.String()
 }

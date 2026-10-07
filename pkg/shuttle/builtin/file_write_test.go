@@ -368,3 +368,44 @@ func TestFileWriteTool_DefaultCreateRefusesExisting(t *testing.T) {
 		t.Fatalf("content = %q, want the original untouched", got)
 	}
 }
+
+// An unrecognized mode is refused rather than guessed. The write path used to
+// be the switch's default, so a model sending "replace" or "Create" clobbered
+// a file it had not read.
+func TestFileWriteRejectsUnknownMode(t *testing.T) {
+	dir := t.TempDir()
+	tool := NewFileWriteTool(dir)
+	f := filepath.Join(dir, "a.txt")
+	for _, mode := range []string{"Create", "write", "replace", "OVERWRITE", "truncate"} {
+		if err := os.WriteFile(f, []byte("ORIGINAL"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tool.writeOne(f, "CLOBBERED", mode); err == nil {
+			t.Errorf("mode %q was accepted", mode)
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "ORIGINAL" {
+			t.Errorf("mode %q clobbered the file", mode)
+		}
+	}
+}
+
+// create means O_EXCL. A dangling symlink reads as "does not exist" to Stat,
+// so a check-then-write would follow it and write wherever it points.
+func TestFileWriteCreateRefusesDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	tool := NewFileWriteTool(dir)
+	link := filepath.Join(dir, "dangle")
+	if err := os.Symlink(filepath.Join(dir, "absent"), link); err != nil {
+		t.Skip("symlinks unsupported")
+	}
+	if _, err := tool.writeOne(link, "X", "create"); err == nil {
+		t.Error("create wrote through a dangling symlink")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "absent")); err == nil {
+		t.Error("the symlink target was created")
+	}
+}

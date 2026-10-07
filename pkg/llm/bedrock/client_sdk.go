@@ -24,6 +24,7 @@ import (
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/bedrock"
+	"github.com/anthropics/anthropic-sdk-go/packages/param"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -230,7 +231,7 @@ func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools
 		Model:        anthropic.Model(c.modelID),
 		Messages:     sdkMessages,
 		MaxTokens:    c.maxTokens,
-		Temperature:  anthropic.Float(c.temperature),
+		Temperature:  c.temperatureParam(),
 		Thinking:     c.thinkingConfig(),
 		OutputConfig: c.outputConfig(),
 	}
@@ -300,13 +301,25 @@ func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools
 	return llmResp, nil
 }
 
-// convertMessagesToSDK converts agent messages to Anthropic SDK format.
-// Returns the system blocks and the API messages.
-//
-// One block per source system message, each carrying its own cache_control
-// when compile marked it (HLD §5.2 step 8). Merging them into a single block
-// would put ROM and the summary behind one breakpoint, so a fold — which
-// rewrites only the summary — would invalidate ROM's cached prefix too.
+// thinkingEnabled reports whether this request carries thinking, in which form
+// does not matter: the API rejects temperature != 1 whenever thinking is on.
+func (c *SDKClient) thinkingEnabled() bool {
+	t := c.thinkingConfig()
+	return t.OfAdaptive != nil || t.OfEnabled != nil
+}
+
+// temperatureParam returns the request temperature, or the zero value when
+// thinking is on. Anthropic rejects any temperature other than 1 alongside
+// thinking, so a configured 0.2 would fail every request at any level above
+// off. Omitting the field takes the API default, which is the only value
+// thinking accepts.
+func (c *SDKClient) temperatureParam() param.Opt[float64] {
+	if c.thinkingEnabled() {
+		return param.Opt[float64]{}
+	}
+	return anthropic.Float(c.temperature)
+}
+
 // thinkingConfig maps the level to the SDK thinking union: adaptive with
 // summarized display on 4.6+/5 models (the level tiers collapse there — no
 // effort knob exists), enabled+budget_tokens tiers on older ones. Zero value
@@ -329,6 +342,17 @@ func (c *SDKClient) thinkingConfig() anthropic.ThinkingConfigParamUnion {
 		budget = 4096
 	case "high":
 		budget = 32768
+	}
+	// The API requires budget_tokens < max_tokens. A model missing from the
+	// catalog falls back to a 4096 max_tokens, which equals the low tier and
+	// makes every request invalid, so the budget yields to the ceiling rather
+	// than the request failing. Below the API's 1024 floor there is no valid
+	// budget at all, so thinking is omitted instead of sent malformed.
+	if c.maxTokens > 0 && budget >= c.maxTokens {
+		budget = c.maxTokens - 1024
+		if budget < 1024 {
+			return anthropic.ThinkingConfigParamUnion{}
+		}
 	}
 	return anthropic.ThinkingConfigParamOfEnabled(budget)
 }
@@ -363,6 +387,13 @@ func (c *SDKClient) outputConfig() anthropic.OutputConfigParam {
 	return anthropic.OutputConfigParam{}
 }
 
+// convertMessagesToSDK converts agent messages to Anthropic SDK format.
+// Returns the system blocks and the API messages.
+//
+// One block per source system message, each carrying its own cache_control
+// when compile marked it (HLD §5.2 step 8). Merging them into a single block
+// would put ROM and the summary behind one breakpoint, so a fold — which
+// rewrites only the summary — would invalidate ROM's cached prefix too.
 func (c *SDKClient) convertMessagesToSDK(messages []llmtypes.Message) ([]anthropic.TextBlockParam, []anthropic.MessageParam) {
 	var systemBlocks []anthropic.TextBlockParam
 	var sdkMessages []anthropic.MessageParam
@@ -681,7 +712,7 @@ func (c *SDKClient) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		Model:        anthropic.Model(c.modelID),
 		Messages:     sdkMessages,
 		MaxTokens:    c.maxTokens,
-		Temperature:  anthropic.Float(c.temperature),
+		Temperature:  c.temperatureParam(),
 		Thinking:     c.thinkingConfig(),
 		OutputConfig: c.outputConfig(),
 	}

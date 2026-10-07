@@ -743,3 +743,24 @@ func TestShellOutputCompaction(t *testing.T) {
 		t.Fatal("small clean output must pass through untouched")
 	}
 }
+
+// Containment is tested on whole path segments: a sibling directory whose name
+// merely starts the same way is outside, not inside.
+func TestPathWithinRejectsSiblingPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		path, dir string
+		want      bool
+	}{
+		{"/work/proj", "/work/proj", true},
+		{"/work/proj/sub/file", "/work/proj", true},
+		{"/work/proj-evil", "/work/proj", false},
+		{"/work/project", "/work/proj", false},
+		{"/work", "/work/proj", false},
+		{"/work/proj", "", false},
+		{"", "/work/proj", false},
+	} {
+		if got := pathWithin(tc.path, tc.dir); got != tc.want {
+			t.Errorf("pathWithin(%q, %q) = %v, want %v", tc.path, tc.dir, got, tc.want)
+		}
+	}
+}

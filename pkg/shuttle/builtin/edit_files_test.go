@@ -188,3 +188,35 @@ func TestEditFilesWritableFileInLockedDir(t *testing.T) {
 		t.Fatalf("content = %q", string(b))
 	}
 }
+
+// Editing a symlink edits the file it points at, and leaves the link a link.
+// The atomic write renames onto the path, which would otherwise replace the
+// link with a regular file and report success having changed nothing.
+func TestEditFilesFollowsSymlinkToTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.txt")
+	link := filepath.Join(dir, "link.txt")
+	if err := os.WriteFile(target, []byte("hello world\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Skip("symlinks unsupported")
+	}
+	if err := NewEditFilesTool("").applyOne(link, "world", "there"); err != nil {
+		t.Fatalf("edit failed: %v", err)
+	}
+	b, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "hello there\n" {
+		t.Errorf("target not edited: %q", string(b))
+	}
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Error("the symlink was replaced by a regular file")
+	}
+}

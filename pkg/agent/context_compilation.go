@@ -757,6 +757,8 @@ func (sm *SegmentedMemory) ReleasePressure(ctx context.Context, penalty int) (sh
 		return false, sm.estimateLocked(), sm.releaseMarkLocked(penalty)
 	}
 
+	sm.compressorFailedThisPass = false
+
 	startEstimate := sm.estimateLocked()
 	if startEstimate < sm.startMarkLocked(penalty) {
 		return false, 0, 0 // under the start mark — no pressure to release
@@ -1258,6 +1260,12 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 			zap.Int64("boundary_turn", b))
 		return false
 	}
+	if sm.compressorFailedThisPass {
+		zap.L().Warn("releasePressure: fold skipped — the compressor already failed in this pass",
+			zap.String("session_id", sm.sessionID),
+			zap.Int64("boundary_turn", b))
+		return false
+	}
 	newText := ""
 	const compressAttempts = 3
 	for attempt := 1; attempt <= compressAttempts; attempt++ {
@@ -1310,6 +1318,9 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 			zap.Error(err))
 	}
 	if newText == "" {
+		// Remember it for the rest of the pass: the next region's fold would
+		// pay the same attempts against the same broken provider.
+		sm.compressorFailedThisPass = true
 		zap.L().Error("releasePressure: fold aborted — compressor failed after retries; no fallback exists (a fold without a summary is amnesia)",
 			zap.String("session_id", sm.sessionID),
 			zap.Int64("boundary_turn", b))

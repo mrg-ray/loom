@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/teradata-labs/loom/pkg/fabric"
 	"github.com/teradata-labs/loom/pkg/fabric/factory"
@@ -32,70 +33,6 @@ func (f *fakeSQLBackend) ExecuteQuery(ctx context.Context, q string) (*fabric.Qu
 		return nil, f.err
 	}
 	return &fabric.QueryResult{Type: "rows", Rows: f.rows, Columns: f.cols, RowCount: len(f.rows)}, nil
-}
-
-// The read-only gate admits probes and rejects every mutation shape.
-func TestExecuteQueryReadOnlyGate(t *testing.T) {
-	allowed := []string{
-		"SELECT 1",
-		"select * from t where x = 1",
-		"WITH a AS (SELECT 1) SELECT * FROM a",
-		"EXPLAIN SELECT 1",
-		"DESCRIBE t",
-		"SHOW TABLES",
-		"SELECT 1;", // trailing semicolon is fine
-	}
-	for _, q := range allowed {
-		if err := checkReadOnly(q); err != nil {
-			t.Errorf("should be allowed: %q → %v", q, err)
-		}
-	}
-	rejected := []string{
-		"INSERT INTO t VALUES (1)",
-		"update t set x=1",
-		"DELETE FROM t",
-		"DROP TABLE t",
-		"CREATE TABLE t (x int)",
-		"WITH a AS (SELECT 1) DELETE FROM t",
-		"WITH a AS (SELECT 1) INSERT INTO t SELECT * FROM a",
-		"SELECT 1; DROP TABLE t",
-	}
-	for _, q := range rejected {
-		if err := checkReadOnly(q); err == nil {
-			t.Errorf("should be rejected: %q", q)
-		}
-	}
-}
-
-// A read-only leading keyword does not make the statement read-only: EXPLAIN
-// ANALYZE executes its subject and SELECT ... INTO creates a table, so the gate
-// scans the whole statement. The allow list guards against over-rejection —
-// identifiers that merely contain a keyword, and EXPLAIN's option syntax.
-func TestExecuteQueryGateScansWholeStatement(t *testing.T) {
-	rejected := []string{
-		"EXPLAIN ANALYZE DELETE FROM t",
-		"EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
-		"EXPLAIN ANALYZE UPDATE t SET x = 1",
-		"SELECT * INTO backup FROM users",
-		"WITH a AS (SELECT 1) SELECT * INTO t FROM a",
-		"SELECT * FROM t WHERE id = 1 GRANT ALL ON t TO public",
-	}
-	for _, q := range rejected {
-		if err := checkReadOnly(q); err == nil {
-			t.Errorf("mutation passed the gate: %q", q)
-		}
-	}
-	allowed := []string{
-		"EXPLAIN (FORMAT JSON) SELECT 1",
-		"EXPLAIN ANALYZE SELECT count(*) FROM t",
-		"SELECT create_date, drop_count FROM t",
-		"SELECT * FROM t WHERE id IN (SELECT id FROM u)",
-	}
-	for _, q := range allowed {
-		if err := checkReadOnly(q); err != nil {
-			t.Errorf("read-only probe wrongly rejected: %q → %v", q, err)
-		}
-	}
 }
 
 // The tool renders aligned rows with NULLs and delegates to the backend.
@@ -153,7 +90,7 @@ func TestExecuteQueryBatchSectionsAndIsolation(t *testing.T) {
 	res, err := tool.Execute(context.Background(), map[string]interface{}{
 		"statements": []interface{}{
 			map[string]interface{}{"label": "row count", "sql": "SELECT count(*) AS n FROM t"},
-			map[string]interface{}{"label": "bad", "sql": "DELETE FROM t"},
+			map[string]interface{}{"label": "bad", "sql": ""},
 			map[string]interface{}{"sql": "SELECT count(*) AS n FROM u"},
 		},
 	})
@@ -170,15 +107,15 @@ func TestExecuteQueryBatchSectionsAndIsolation(t *testing.T) {
 
 // An entirely failed batch carries the first failure's typed error.
 func TestExecuteQueryAllFailedCarriesError(t *testing.T) {
-	be := &fakeSQLBackend{}
+	be := &fakeSQLBackend{err: fmt.Errorf("relation does not exist")}
 	tool := NewExecuteQueryTool(be)
 	res, _ := tool.Execute(context.Background(), map[string]interface{}{
 		"statements": []interface{}{
-			map[string]interface{}{"sql": "DROP TABLE a"},
-			map[string]interface{}{"sql": "DELETE FROM b"},
+			map[string]interface{}{"sql": "SELECT * FROM a"},
+			map[string]interface{}{"sql": "SELECT * FROM b"},
 		},
 	})
-	if res.Success || res.Error == nil || res.Error.Code != "READ_ONLY" {
+	if res.Success || res.Error == nil || res.Error.Code != "QUERY_FAILED" {
 		t.Fatalf("all-failed batch must carry typed error: %+v", res)
 	}
 }
@@ -199,21 +136,6 @@ func TestExecuteQueryCoercesConventionalForms(t *testing.T) {
 	})
 	if !res.Success || strings.Contains(res.Data.(string), "== statement") {
 		t.Fatalf("bare sql param must run unlabeled and unsectioned: %+v", res)
-	}
-}
-
-// A mutation never reaches the backend.
-func TestExecuteQueryMutationNeverDelegated(t *testing.T) {
-	be := &fakeSQLBackend{}
-	tool := NewExecuteQueryTool(be)
-	res, _ := tool.Execute(context.Background(), map[string]interface{}{
-		"sql": "DROP TABLE hosts",
-	})
-	if res.Success || res.Error.Code != "READ_ONLY" {
-		t.Fatalf("mutation must be gated: %+v", res)
-	}
-	if be.lastQuery != "" {
-		t.Fatalf("mutation reached the backend: %q", be.lastQuery)
 	}
 }
 
@@ -270,13 +192,17 @@ con.close()
 		}
 	}
 
-	// Mutation: gated by the tool before the backend, and the backend's
-	// read-only connection is the second wall.
+	// Mutation: the tool does not gate — it hands the statement to the
+	// backend. What refuses it here is the duckdb connection, which this
+	// backend opens read-only. The wall is the database, not the tool.
 	res, _ = tool.Execute(context.Background(), map[string]interface{}{
 		"sql": "DELETE FROM reviews",
 	})
-	if res.Success || res.Error.Code != "READ_ONLY" {
-		t.Fatalf("mutation must be gated: %+v", res)
+	if res.Success {
+		t.Fatalf("a read-only backend must still refuse the mutation: %+v", res)
+	}
+	if !strings.Contains(res.Error.Message, "read-only") {
+		t.Fatalf("refusal should come from the backend, not a tool gate: %+v", res.Error)
 	}
 
 	// A wrong-table error surfaces the engine's message to the agent.
@@ -285,30 +211,6 @@ con.close()
 	})
 	if res.Success || !strings.Contains(res.Error.Message, "nonexistent") {
 		t.Fatalf("engine error not surfaced: %+v", res)
-	}
-}
-
-// Quoted data values never trip the gate; real mutations still do.
-func TestExecuteQueryGateIgnoresStringLiterals(t *testing.T) {
-	allowed := []string{
-		"WITH x AS (SELECT 1) SELECT * FROM t WHERE action = 'DELETE'",
-		"SELECT 'a;b' AS v",
-		"WITH x AS (SELECT 1) SELECT * FROM logs WHERE msg = 'DROP TABLE users'",
-		"SELECT * FROM t WHERE note = 'it''s a DELETE; really'",
-	}
-	for _, q := range allowed {
-		if err := checkReadOnly(q); err != nil {
-			t.Errorf("literal tripped the gate: %q → %v", q, err)
-		}
-	}
-	rejected := []string{
-		"WITH x AS (SELECT 1) DELETE FROM t",
-		"SELECT 1; DROP TABLE t",
-	}
-	for _, q := range rejected {
-		if err := checkReadOnly(q); err == nil {
-			t.Errorf("mutation passed the gate: %q", q)
-		}
 	}
 }
 
@@ -340,5 +242,40 @@ func TestExecuteQueryRenderBudget(t *testing.T) {
 	}
 	if !strings.Contains(out, "more not shown") {
 		t.Fatalf("budget cut not stated in footer:\n%s", out[:200])
+	}
+}
+
+// Batch and render bounds: a fractional row_limit must not floor to zero rows,
+// an unbounded batch is refused rather than squeezed to the budget floor, and a
+// long cell is cut on a rune boundary so the table never carries broken UTF-8.
+func TestExecuteQueryBatchAndRenderBounds(t *testing.T) {
+	be := &fakeSQLBackend{cols: []fabric.Column{{Name: "v"}}, rows: []map[string]interface{}{{"v": "x"}, {"v": "y"}}}
+	tool := NewExecuteQueryTool(be)
+	ctx := context.Background()
+
+	res, err := tool.Execute(ctx, map[string]interface{}{
+		"statements": []interface{}{map[string]interface{}{"sql": "SELECT v FROM t"}},
+		"row_limit":  float64(0.5),
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("fractional row_limit failed the call: %v %+v", err, res)
+	}
+	if !strings.Contains(fmt.Sprint(res.Data), "x") {
+		t.Errorf("fractional row_limit returned no rows: %v", res.Data)
+	}
+
+	many := make([]interface{}, maxQueryStatements+1)
+	for i := range many {
+		many[i] = map[string]interface{}{"sql": "SELECT 1"}
+	}
+	res, err = tool.Execute(ctx, map[string]interface{}{"statements": many})
+	if err != nil || res.Success {
+		t.Fatalf("an oversized batch should be refused: %v %+v", err, res)
+	}
+
+	wide := strings.Repeat("é", queryCellMaxLen)
+	out := renderQueryRows([]string{"v"}, []map[string]interface{}{{"v": wide}}, 0)
+	if !utf8.ValidString(out) {
+		t.Error("a truncated cell produced invalid UTF-8")
 	}
 }

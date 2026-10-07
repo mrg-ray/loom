@@ -52,7 +52,7 @@ func TestNativeThinking_RequestMapping(t *testing.T) {
 			var gotBody string
 			srv := thinkingSrv(t, &gotBody, nativePlainResponse)
 			defer srv.Close()
-			c := NewClient(Config{APIKey: "k", Model: tc.model, Endpoint: srv.URL, MaxTokens: 64, ThinkingLevel: tc.level})
+			c := NewClient(Config{APIKey: "k", Model: tc.model, Endpoint: srv.URL, MaxTokens: 64000, ThinkingLevel: tc.level})
 			if _, err := c.Chat(context.Background(), []llmtypes.Message{{Role: "user", Content: "hi"}}, nil); err != nil {
 				t.Fatalf("Chat: %v", err)
 			}
@@ -76,7 +76,7 @@ func TestNativeThinking_PresentButEmptyReplay(t *testing.T) {
 	var gotBody string
 	srv := thinkingSrv(t, &gotBody, nativePlainResponse)
 	defer srv.Close()
-	c := NewClient(Config{APIKey: "k", Model: "claude-sonnet-5", Endpoint: srv.URL, MaxTokens: 64, ThinkingLevel: "auto"})
+	c := NewClient(Config{APIKey: "k", Model: "claude-sonnet-5", Endpoint: srv.URL, MaxTokens: 64000, ThinkingLevel: "auto"})
 
 	messages := []llmtypes.Message{
 		{Role: "user", Content: "task"},
@@ -118,7 +118,7 @@ func TestNativeThinking_ResponseParse(t *testing.T) {
 	var gotBody string
 	srv := thinkingSrv(t, &gotBody, resp)
 	defer srv.Close()
-	c := NewClient(Config{APIKey: "k", Model: "claude-sonnet-5", Endpoint: srv.URL, MaxTokens: 64, ThinkingLevel: "auto"})
+	c := NewClient(Config{APIKey: "k", Model: "claude-sonnet-5", Endpoint: srv.URL, MaxTokens: 64000, ThinkingLevel: "auto"})
 	r, err := c.Chat(context.Background(), []llmtypes.Message{{Role: "user", Content: "hi"}}, nil)
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
@@ -158,7 +158,7 @@ func TestNativeThinking_StreamAssembly(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(Config{APIKey: "k", Model: "claude-sonnet-5", Endpoint: srv.URL, MaxTokens: 64, ThinkingLevel: "auto"})
+	c := NewClient(Config{APIKey: "k", Model: "claude-sonnet-5", Endpoint: srv.URL, MaxTokens: 64000, ThinkingLevel: "auto"})
 	var streamed strings.Builder
 	r, err := c.ChatStream(context.Background(), []llmtypes.Message{{Role: "user", Content: "hi"}}, nil,
 		func(token string) { streamed.WriteString(token) })
@@ -173,5 +173,42 @@ func TestNativeThinking_StreamAssembly(t *testing.T) {
 	}
 	if streamed.String() != "answer" {
 		t.Errorf("token callback saw %q — thinking must never reach it", streamed.String())
+	}
+}
+
+// budget_tokens must stay under max_tokens, and temperature must be 1 when
+// thinking rides. A model missing from the catalog falls back to a 4096
+// ceiling, which equals the low tier.
+func TestNativeThinking_BudgetAndTemperatureStayValid(t *testing.T) {
+	older := "claude-3-5-sonnet-20241022"
+
+	c := NewClient(Config{APIKey: "k", Model: older, MaxTokens: 4096, ThinkingLevel: "low"})
+	p := c.thinkingParam()
+	if p == nil {
+		t.Fatal("thinking should still be sent when a smaller budget fits")
+	}
+	if b, _ := p["budget_tokens"].(int); b >= 4096 {
+		t.Errorf("budget %d is not below max_tokens 4096", b)
+	}
+
+	c = NewClient(Config{APIKey: "k", Model: older, MaxTokens: 1500, ThinkingLevel: "low"})
+	if c.thinkingParam() != nil {
+		t.Error("no valid budget fits under max_tokens 1500; thinking should be omitted")
+	}
+
+	// Temperature is forced to 1 whenever thinking rides, in either form.
+	for _, tc := range []struct {
+		model, level string
+		want         float64
+	}{
+		{older, "", 0.2},
+		{older, "none", 0.2},
+		{older, "low", 1.0},
+		{"claude-sonnet-5", "high", 1.0},
+	} {
+		c = NewClient(Config{APIKey: "k", Model: tc.model, MaxTokens: 64000, ThinkingLevel: tc.level, Temperature: 0.2})
+		if got := c.temperatureParam(); got != tc.want {
+			t.Errorf("model %s level %q: temperature %v, want %v", tc.model, tc.level, got, tc.want)
+		}
 	}
 }

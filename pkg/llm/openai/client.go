@@ -382,7 +382,7 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 	req := &ChatCompletionRequest{
 		Model:       c.model,
 		Messages:    apiMessages,
-		Temperature: c.temperature,
+		Temperature: c.temperatureParam(),
 		Thinking:    c.thinkingParam(),
 	}
 	if c.usesMaxCompletionTokens() {
@@ -622,6 +622,18 @@ func (c *Client) thinkingParam() map[string]interface{} {
 		return nil
 	}
 	return map[string]interface{}{"type": "adaptive"}
+}
+
+// temperatureParam returns the request temperature, or 1 when thinking rides.
+// The gateway forwards these requests to Anthropic, which rejects any
+// temperature other than 1 alongside thinking — a configured 0.2 would fail
+// every request at any level above off. No budget clamp is needed here: this
+// path only ever requests adaptive thinking, which carries no budget_tokens.
+func (c *Client) temperatureParam() float64 {
+	if c.thinkingParam() != nil {
+		return 1.0
+	}
+	return c.temperature
 }
 
 // withCacheControl rewrites a message's content into the block form carrying a
@@ -1064,7 +1076,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	req := &ChatCompletionRequest{
 		Model:         c.model,
 		Messages:      apiMessages,
-		Temperature:   c.temperature,
+		Temperature:   c.temperatureParam(),
 		Thinking:      c.thinkingParam(),
 		Stream:        true,                               // Enable streaming
 		StreamOptions: &StreamOptions{IncludeUsage: true}, // final usage chunk (tokens + cache)

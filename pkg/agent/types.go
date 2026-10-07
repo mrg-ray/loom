@@ -148,7 +148,8 @@ type Agent struct {
 	// agent. It lets a host runtime own MCP resolution — per-user auth, endpoint
 	// routing — that loom cannot perform itself. When nil, enforcement falls
 	// back to the executor's own dynamic resolver (ResolveAndRegister).
-	skillMCPResolver func(ctx context.Context, name string, servers []string) error
+	skillMCPResolver   func(ctx context.Context, name string, servers []string) error
+	skillMCPResolverMu sync.RWMutex
 	// skillTaskEmitter materializes tasks for newly-activated skills onto
 	// the agent's task board. nil means skill activations do not emit tasks.
 	// Driven from the manage_skills load path via Agent.emitSkillTasksAsync.

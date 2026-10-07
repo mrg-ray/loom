@@ -1100,7 +1100,18 @@ func (a *Agent) GetDescription() string {
 // construction, once the host's accessible-server map is built. When unset,
 // enforceRequiredSkillTools falls back to the executor's own resolver.
 func (a *Agent) SetSkillMCPResolver(fn func(ctx context.Context, name string, servers []string) error) {
+	a.skillMCPResolverMu.Lock()
+	defer a.skillMCPResolverMu.Unlock()
 	a.skillMCPResolver = fn
+}
+
+// skillMCPResolverFn reads the installed resolver under the lock. The host may
+// install it after construction while turns are already running, so the field
+// is never read bare.
+func (a *Agent) skillMCPResolverFn() func(ctx context.Context, name string, servers []string) error {
+	a.skillMCPResolverMu.RLock()
+	defer a.skillMCPResolverMu.RUnlock()
+	return a.skillMCPResolver
 }
 
 // resolveSkillTool mounts a non-builtin skill-required tool by name, bounded to
@@ -1109,8 +1120,8 @@ func (a *Agent) SetSkillMCPResolver(fn func(ctx context.Context, name string, se
 // registry. Uses a background context: resolution is an index lookup plus a
 // cached MCP client, with no request-scoped cancellation to honor.
 func (a *Agent) resolveSkillTool(name string, servers []string) error {
-	if a.skillMCPResolver != nil {
-		return a.skillMCPResolver(context.Background(), name, servers)
+	if fn := a.skillMCPResolverFn(); fn != nil {
+		return fn(context.Background(), name, servers)
 	}
 	if a.executor == nil {
 		return fmt.Errorf("no skill tool resolver available")

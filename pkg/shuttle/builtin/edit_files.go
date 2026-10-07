@@ -122,6 +122,14 @@ func (t *EditFilesTool) applyOne(path, find, replace string) error {
 	if isSensitivePath(cleanPath) {
 		return fmt.Errorf("sensitive location, not editable")
 	}
+	// Follow symlinks before deciding anything. The write below replaces the
+	// path by rename, which would replace the LINK with a regular file and
+	// leave its target untouched — reporting success while changing nothing
+	// the caller meant to change. Editing resolves to the real file, as an
+	// in-place write always did.
+	if resolved, rerr := filepath.EvalSymlinks(cleanPath); rerr == nil {
+		cleanPath = resolved
+	}
 	info, err := os.Stat(cleanPath)
 	if err != nil {
 		return fmt.Errorf("not found")

@@ -235,22 +235,22 @@ func (t *ShellExecuteTool) Execute(ctx context.Context, params map[string]interf
 		// LOOM_SANDBOX_DIR is the agent execution context (the workspace) and
 		// is honored exactly as this guard's Suggestion advertises — without
 		// it, an anchored workspace outside the data dir rejects every call.
-		isAllowed := strings.HasPrefix(absWorkingDir, absLoomDataDir)
+		isAllowed := pathWithin(absWorkingDir, absLoomDataDir)
 		if !isAllowed {
 			absSandboxDir, _ := filepath.Abs(config.GetLoomSandboxDir())
-			if absSandboxDir != "" && strings.HasPrefix(absWorkingDir, absSandboxDir) {
+			if pathWithin(absWorkingDir, absSandboxDir) {
 				isAllowed = true
 			}
 		}
 		if !isAllowed {
 			// Whitelist /tmp for temporary file operations (common for agent workflows)
-			if runtime.GOOS != "windows" && strings.HasPrefix(absWorkingDir, "/tmp") {
+			if runtime.GOOS != "windows" && pathWithin(absWorkingDir, "/tmp") {
 				isAllowed = true
 			}
 			// Windows temp directory
 			if runtime.GOOS == "windows" && os.Getenv("TEMP") != "" {
 				absTempDir, _ := filepath.Abs(os.Getenv("TEMP"))
-				if strings.HasPrefix(absWorkingDir, absTempDir) {
+				if pathWithin(absWorkingDir, absTempDir) {
 					isAllowed = true
 				}
 			}
@@ -823,6 +823,22 @@ func checkCommandTokenSize(command string) error {
 	}
 
 	return nil
+}
+
+// pathWithin reports whether path is dir itself or sits beneath it. A bare
+// strings.HasPrefix accepts a sibling whose name merely starts the same way —
+// /work/proj also admitting /work/proj-evil — so containment is tested on
+// whole path segments.
+func pathWithin(path, dir string) bool {
+	if dir == "" || path == "" {
+		return false
+	}
+	path = filepath.Clean(path)
+	dir = filepath.Clean(dir)
+	if path == dir {
+		return true
+	}
+	return strings.HasPrefix(path, dir+string(filepath.Separator))
 }
 
 // ansiEscape matches CSI/OSC terminal escape sequences — pure rendering bytes

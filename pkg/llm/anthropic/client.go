@@ -201,7 +201,7 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 		Model:        c.model,
 		Messages:     apiMessages,
 		MaxTokens:    c.maxTokens,
-		Temperature:  c.temperature,
+		Temperature:  c.temperatureParam(),
 		Thinking:     c.thinkingParam(),
 		OutputConfig: c.outputConfigParam(),
 	}
@@ -252,7 +252,28 @@ func (c *Client) thinkingParam() map[string]interface{} {
 	case "high":
 		budget = 32768
 	}
+	// The API requires budget_tokens < max_tokens. A model missing from the
+	// catalog falls back to a 4096 max_tokens, which equals the low tier and
+	// would make every request invalid, so the budget yields to the ceiling.
+	// Below the API's 1024 floor no valid budget exists, so thinking is
+	// omitted rather than sent malformed.
+	if c.maxTokens > 0 && budget >= c.maxTokens {
+		budget = c.maxTokens - 1024
+		if budget < 1024 {
+			return nil
+		}
+	}
 	return map[string]interface{}{"type": "enabled", "budget_tokens": budget}
+}
+
+// temperatureParam returns the request temperature, or 1 when thinking is on.
+// Anthropic rejects any other temperature alongside thinking, so a configured
+// 0.2 would fail every request at any level above off.
+func (c *Client) temperatureParam() float64 {
+	if c.thinkingParam() != nil || c.outputConfigParam() != nil {
+		return 1.0
+	}
+	return c.temperature
 }
 
 // outputConfigParam returns the request's output_config, or nil (omitted).
@@ -661,7 +682,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		Model:        c.model,
 		Messages:     apiMessages,
 		MaxTokens:    c.maxTokens,
-		Temperature:  c.temperature,
+		Temperature:  c.temperatureParam(),
 		Thinking:     c.thinkingParam(),
 		OutputConfig: c.outputConfigParam(),
 		Stream:       true, // Enable streaming

@@ -17,7 +17,10 @@ import (
 )
 
 func bedrockThinkingClient(model, level string) *SDKClient {
-	return &SDKClient{modelID: model, thinkingLevel: level, maxTokens: 64, temperature: 1.0}
+	// A realistic ceiling: budget_tokens must stay under max_tokens, so a
+	// fixture with a token-sized ceiling would exercise the clamp rather than
+	// the tier mapping these cases are about.
+	return &SDKClient{modelID: model, thinkingLevel: level, maxTokens: 64000, temperature: 1.0}
 }
 
 // TestBedrockThinking_ConfigMapping — adaptive (summarized) on 4.6+/5 ids,
@@ -101,5 +104,37 @@ func TestBedrockThinking_ResponseParse(t *testing.T) {
 	}
 	if r.Content != "ok" {
 		t.Errorf("Content = %q", r.Content)
+	}
+}
+
+// The API requires budget_tokens < max_tokens, and rejects any temperature
+// other than 1 when thinking is on. A model missing from the catalog falls
+// back to a 4096 ceiling, which equals the low tier — so the budget yields,
+// and where no valid budget fits, thinking is omitted rather than sent
+// malformed.
+func TestBedrockThinking_BudgetAndTemperatureStayValid(t *testing.T) {
+	older := "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+	c := &SDKClient{modelID: older, thinkingLevel: "low", maxTokens: 4096, temperature: 1.0}
+	cfg := c.thinkingConfig()
+	if cfg.OfEnabled != nil && cfg.OfEnabled.BudgetTokens >= 4096 {
+		t.Errorf("budget %d is not below max_tokens 4096", cfg.OfEnabled.BudgetTokens)
+	}
+
+	c = &SDKClient{modelID: older, thinkingLevel: "low", maxTokens: 1500, temperature: 1.0}
+	if cfg := c.thinkingConfig(); cfg.OfEnabled != nil || cfg.OfAdaptive != nil {
+		b, _ := json.Marshal(cfg)
+		t.Errorf("no valid budget fits under max_tokens 1500, thinking should be omitted: %s", b)
+	}
+
+	// Temperature rides only when thinking is off.
+	for _, tc := range []struct {
+		level string
+		want  bool
+	}{{"", false}, {"none", false}, {"low", true}, {"high", true}} {
+		c = &SDKClient{modelID: older, thinkingLevel: tc.level, maxTokens: 64000, temperature: 0.2}
+		if omitted := !c.temperatureParam().Valid(); omitted != tc.want {
+			t.Errorf("level %q: temperature omitted=%v, want %v", tc.level, omitted, tc.want)
+		}
 	}
 }

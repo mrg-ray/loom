@@ -277,6 +277,15 @@ func (t *FileWriteTool) writeOne(path, content, mode string) (string, error) {
 		// existing file says so with mode:"overwrite".
 		mode = "create"
 	}
+	// An unrecognized mode is refused, never guessed. The write path used to
+	// be the switch's default, so "Create", "write" or "replace" — all far
+	// likelier from a model than an empty string — reached os.WriteFile and
+	// clobbered the file. Only the three advertised modes write.
+	switch mode {
+	case "create", "overwrite", "append":
+	default:
+		return "", fmt.Errorf("unknown mode %q — use create, overwrite, or append", mode)
+	}
 	if len(content) > MaxSafeContentSize {
 		return "", fmt.Errorf("content exceeds 50KB limit (%d bytes)", len(content))
 	}
@@ -296,6 +305,26 @@ func (t *FileWriteTool) writeOne(path, content, mode string) (string, error) {
 		return "", fmt.Errorf("mkdir failed: %v", err)
 	}
 	switch mode {
+	case "create":
+		// O_EXCL is the only honest form of "create": the Stat above is a
+		// check-then-write, and it reads a dangling symlink as "does not
+		// exist" and then writes through it to wherever it points. O_EXCL
+		// refuses both — the existing file and the dangling link.
+		f, err := os.OpenFile(cleanPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			if os.IsExist(err) {
+				return "", fmt.Errorf("already exists (mode create)")
+			}
+			return "", err
+		}
+		n, werr := f.WriteString(content)
+		if cerr := f.Close(); werr == nil {
+			werr = cerr
+		}
+		if werr != nil {
+			return "", werr
+		}
+		return fmt.Sprintf("created %s (%d bytes)", path, n), nil
 	case "append":
 		f, err := os.OpenFile(cleanPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
@@ -307,7 +336,7 @@ func (t *FileWriteTool) writeOne(path, content, mode string) (string, error) {
 			return "", werr
 		}
 		return fmt.Sprintf("appended %s (%d bytes)", path, n), nil
-	default: // create or overwrite
+	default: // overwrite — the only remaining mode
 		if err := os.WriteFile(cleanPath, []byte(content), 0600); err != nil {
 			return "", err
 		}
