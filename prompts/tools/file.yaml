@@ -14,11 +14,8 @@ prompts:
       - file
       - read
     metadata:
-      version: "v1.0"
-      description: "File reading tool (DEPRECATED)"
-      alternatives:
-        - workspace
-        - shell_execute
+      version: "v2.0"
+      description: "File reading and project-wide search"
 
   - id: edit_files
     content: |
@@ -47,11 +44,8 @@ prompts:
       - file
       - write
     metadata:
-      version: "v1.0"
-      description: "File writing tool (DEPRECATED)"
-      alternatives:
-        - workspace
-        - shell_execute
+      version: "v2.0"
+      description: "Batched file writing"
 
   - id: list_files
     content: |

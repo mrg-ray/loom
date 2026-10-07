@@ -75,8 +75,18 @@ if len(paths) == 1:
     con = duckdb.connect(paths[0], read_only=True)
 else:
     con = duckdb.connect()
+    aliases = set()
     for p in paths:
         stem = os.path.splitext(os.path.basename(p))[0]
+        # The alias is a quoted identifier, so a quote in the filename has to
+        # be doubled; two paths with the same stem would otherwise collide on
+        # ATTACH, so a repeat gets a suffix and the caller sees it in
+        # SHOW DATABASES.
+        stem = stem.replace('"', '""')
+        base, n = stem, 2
+        while stem in aliases:
+            stem, n = "%s_%d" % (base, n), n + 1
+        aliases.add(stem)
         con.execute('ATTACH %s AS "%s" (READ_ONLY)' % ("'" + p.replace("'", "''") + "'", stem))
 # Seal the filesystem before the caller's query runs. read_only guards the
 # database; without this, read_csv('/etc/passwd') and friends would turn a SQL
@@ -202,7 +212,7 @@ func (b *DuckDBBackend) ListResources(ctx context.Context, filters map[string]st
 // GetMetadata returns row count for a resource.
 func (b *DuckDBBackend) GetMetadata(ctx context.Context, resource string) (map[string]interface{}, error) {
 	_, raw, err := b.pythonQuery(ctx,
-		fmt.Sprintf("SELECT count(*) FROM %q", resource), 1)
+		fmt.Sprintf("SELECT count(*) FROM %s", quoteQualified(resource)), 1)
 	if err != nil {
 		return nil, err
 	}
@@ -254,6 +264,19 @@ func pythonErrorLine(stderr string) string {
 // schemaInfoQuery builds the information_schema lookup for a resource that
 // may be bare (hosts), schema-qualified (main.hosts) or catalog-qualified
 // (airbnb.main.hosts — attached-database form).
+// quoteQualified quotes each dot-separated segment of a resource name, so a
+// catalog-qualified reference stays three identifiers. Quoting the whole
+// string made "alpha.main.orders" one identifier containing dots, which
+// resolves to nothing — every qualified name failed. Embedded quotes are
+// doubled, the SQL escape for a quoted identifier.
+func quoteQualified(resource string) string {
+	parts := strings.Split(resource, ".")
+	for i, p := range parts {
+		parts[i] = `"` + strings.ReplaceAll(p, `"`, `""`) + `"`
+	}
+	return strings.Join(parts, ".")
+}
+
 func schemaInfoQuery(resource string) string {
 	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
 	parts := strings.Split(resource, ".")

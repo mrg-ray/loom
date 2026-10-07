@@ -205,3 +205,46 @@ func TestDuckDBBackendSealsFilesystem(t *testing.T) {
 		}
 	}
 }
+
+// A catalog-qualified resource stays three identifiers, and two files sharing
+// a stem each get their own alias.
+func TestDuckDBBackendQualifiedMetadataAndAliasCollision(t *testing.T) {
+	if !havePythonDuckDB() {
+		t.Skip("python3-duckdb not available")
+	}
+	dir := t.TempDir()
+	one := filepath.Join(dir, "a", "shared.duckdb")
+	two := filepath.Join(dir, "b", "shared.duckdb")
+	for _, p := range []string{one, two} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		seedDuckDB(t, p)
+	}
+
+	b, err := NewDuckDBBackend("dup", one+","+two)
+	if err != nil {
+		t.Fatalf("backend failed: %v", err)
+	}
+	ctx := context.Background()
+
+	// Both attachments are reachable: the second stem is suffixed.
+	res, err := b.ExecuteQuery(ctx, "SELECT count(*) AS n FROM shared.main.hosts")
+	if err != nil || res.Rows[0]["n"] != "2" {
+		t.Fatalf("first attachment unreadable: %v %+v", err, res)
+	}
+	if res, err := b.ExecuteQuery(ctx, "SELECT count(*) AS n FROM shared_2.main.hosts"); err != nil ||
+		res.Rows[0]["n"] != "2" {
+		t.Fatalf("the colliding stem did not get its own alias: %v %+v", err, res)
+	}
+
+	// GetMetadata on a qualified name resolves rather than looking for one
+	// identifier that happens to contain dots.
+	meta, err := b.GetMetadata(ctx, "shared.main.hosts")
+	if err != nil {
+		t.Fatalf("qualified GetMetadata failed: %v", err)
+	}
+	if meta["row_count"] != "2" {
+		t.Fatalf("row_count = %v, want 2", meta["row_count"])
+	}
+}
