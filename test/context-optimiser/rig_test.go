@@ -49,8 +49,6 @@ const (
 	envGate = "LOOM_CONTEXT_OPTIMISER"
 )
 
-// requireGate skips unless the suite was asked for explicitly. Keeps the routes
-// out of every ordinary `go test ./...` while leaving them compiled.
 // requireGate reserves a slot for a route that needs an opt-in. The suite runs
 // by default; LOOM_CONTEXT_OPTIMISER=0 holds it back where a machine cannot
 // give it the processes it spawns.

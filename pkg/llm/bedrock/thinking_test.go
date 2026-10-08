@@ -120,7 +120,10 @@ func TestBedrockThinking_BudgetAndTemperatureStayValid(t *testing.T) {
 
 	c := &SDKClient{modelID: older, thinkingLevel: "low", maxTokens: 4096, temperature: 1.0}
 	cfg := c.thinkingConfig(context.Background())
-	if cfg.OfEnabled != nil && cfg.OfEnabled.BudgetTokens >= 4096 {
+	if cfg.OfEnabled == nil {
+		t.Fatal("a smaller budget fits under 4096, so thinking must still be sent")
+	}
+	if cfg.OfEnabled.BudgetTokens >= 4096 {
 		t.Errorf("budget %d is not below max_tokens 4096", cfg.OfEnabled.BudgetTokens)
 	}
 

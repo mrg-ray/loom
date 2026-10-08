@@ -17,7 +17,7 @@ import "strings"
 // the others would take adaptive thinking while being told an effort tier it
 // cannot use, or the reverse. One list, one answer.
 var adaptiveThinkingMarkers = []string{
-	"sonnet-5", "opus-5", "fable-5", "-4-6", "-4-7", "-4-8",
+	"sonnet-5", "opus-5", "haiku-5", "fable-5", "-4-6", "-4-7", "-4-8",
 }
 
 // IsAdaptiveThinkingModel reports whether model takes adaptive thinking.

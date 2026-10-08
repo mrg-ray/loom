@@ -983,7 +983,7 @@ func TestReleasePressure_NeverFoldsCurrentTurnUserRows(t *testing.T) {
 
 // Invariant: with no working compressor there is NO fold — no heuristic
 // fallback, no "(unsummarized)" marker, no mutation.
-func TestReleasePressure_FoldAbortsWithoutSummary(t *testing.T) {
+func TestReleasePressure_FoldDropsUnsummarisedWhenTheCompressorFails(t *testing.T) {
 	sm := reliefSingleTurnFixture(t)
 	fc := &flakyCompressor{failN: 99}
 	sm.SetCompressor(fc)
@@ -992,8 +992,22 @@ func TestReleasePressure_FoldAbortsWithoutSummary(t *testing.T) {
 	sm.ReleasePressure(context.Background(), 0)
 
 	assert.Equal(t, 3, fc.calls, "compressor must be retried exactly compressAttempts times")
-	assert.NotContains(t, sm.summary.text, "unsummarized", "the heuristic fallback must not exist")
-	assert.Equal(t, before, len(sm.GetMessages()), "an aborted fold mutates nothing")
+	assert.Contains(t, sm.summary.text, "unsummarized",
+		"a region that could not be summarised is dropped and said to be dropped")
+	assert.Less(t, len(sm.GetMessages()), before,
+		"the fold still sheds — it is the only rung that reaches a turn whose bulk is reasoning")
+}
+
+// The same drop happens with no compressor at all, and without an LLM call:
+// a caller that wires none still needs a lossy rung.
+func TestReleasePressure_FoldDropsUnsummarisedWithNoCompressor(t *testing.T) {
+	sm := reliefSingleTurnFixture(t)
+
+	before := len(sm.GetMessages())
+	sm.ReleasePressure(context.Background(), 0)
+
+	assert.Contains(t, sm.summary.text, "unsummarized")
+	assert.Less(t, len(sm.GetMessages()), before, "the region is shed, not abandoned")
 }
 
 // Invariant: a transient compressor failure is retried and the fold commits

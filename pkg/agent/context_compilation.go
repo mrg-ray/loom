@@ -187,8 +187,9 @@ func (sm *SegmentedMemory) compileLocked() []Message {
 	// append rather than rewrite, so this marker is read back by every
 	// following call of the same turn. At turn settle the region re-renders
 	// and the request falls back to the lastStable marker — cross-turn
-	// behavior unchanged. Clients that spend a marker on the tool list cap
-	// message markers at three, which skips exactly this one.
+	// behavior unchanged. This is the third marker — ROM and lastStable are
+	// the others — which is what a client that spends one on the tool list
+	// has room for.
 	for i := len(out) - 1; i >= 0 && i != lastStable; i-- {
 		if out[i].Content != "" {
 			out[i].CacheBreakpoint = true
@@ -1306,24 +1307,28 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 	// of the snapshot built above, and holding the write lock through a
 	// network call would serialize every reader behind it for the duration.
 	// The compressor is REQUIRED: a fold without a real summary is task
-	// amnesia, not relief. There is no heuristic fallback — if the compressor
-	// is absent or still failing after retries, the fold aborts with no
-	// mutation and the ladder moves on honestly.
-	if sm.compressor == nil || !sm.compressor.IsEnabled() {
-		zap.L().Warn("releasePressure: fold skipped — no compressor configured",
+	// amnesia when a summary was possible. A compressor that is absent or
+	// still failing after retries drops the region and says so in one line,
+	// which sheds the space without claiming a summary it does not have.
+	// Without a summariser the region is dropped and SAID to be dropped: the
+	// summary gains one line naming the span and its first user ask. Lossy and
+	// honest, and the only rung that sheds a turn whose bulk is reasoning
+	// rather than tool results — offload and eviction have nothing to take
+	// there, so a session with no compressor would otherwise meet the window
+	// with no rung left. A caller that wires no compressor relies on this.
+	fallback := false
+	askCompressor := sm.compressor != nil && sm.compressor.IsEnabled()
+	if askCompressor && sm.compressorFailedThisPass {
+		// The compressor already failed this pass; another region is another
+		// three attempts against the same fault. Drop with the marker instead.
+		askCompressor = false
+		zap.L().Warn("releasePressure: fold dropping the region unsummarised — the compressor already failed in this pass",
 			zap.String("session_id", sm.sessionID),
 			zap.Int64("boundary_turn", b))
-		return false
-	}
-	if sm.compressorFailedThisPass {
-		zap.L().Warn("releasePressure: fold skipped — the compressor already failed in this pass",
-			zap.String("session_id", sm.sessionID),
-			zap.Int64("boundary_turn", b))
-		return false
 	}
 	newText := ""
 	const compressAttempts = 3
-	for attempt := 1; attempt <= compressAttempts; attempt++ {
+	for attempt := 1; askCompressor && attempt <= compressAttempts; attempt++ {
 		sm.mu.Unlock()
 		compressCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 		// The re-lock is DEFERRED, not sequential. ReleasePressure holds a
@@ -1373,13 +1378,21 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 			zap.Error(err))
 	}
 	if newText == "" {
-		// Remember it for the rest of the pass: the next region's fold would
-		// pay the same attempts against the same broken provider.
-		sm.compressorFailedThisPass = true
-		zap.L().Error("releasePressure: fold aborted — compressor failed after retries; no fallback exists (a fold without a summary is amnesia)",
-			zap.String("session_id", sm.sessionID),
-			zap.Int64("boundary_turn", b))
-		return false
+		if askCompressor {
+			// Remember it for the rest of the pass: the next region would pay
+			// the same attempts against the same fault.
+			sm.compressorFailedThisPass = true
+			zap.L().Error("releasePressure: compressor failed after retries; the region is dropped unsummarised",
+				zap.String("session_id", sm.sessionID),
+				zap.Int64("boundary_turn", b))
+		}
+		fallback = true
+		line := fmt.Sprintf("also covers msg:%d-%d (unsummarized): %s", loSeq, hiSeq, firstUserLine(region))
+		if sm.summary.text == "" {
+			newText = line
+		} else {
+			newText = sm.summary.text + "\n" + line
+		}
 	}
 
 	// Skills whose load pair folds are deactivated (§4.5). Accumulate them on the
@@ -1471,8 +1484,26 @@ func (sm *SegmentedMemory) foldLocked(ctx context.Context, b int64) bool {
 		zap.Int64("seq_lo", loSeq),
 		zap.Int64("seq_hi", hiSeq),
 		zap.Int("version", n1),
-		zap.Int("output_bytes", len(newText)))
+		zap.Int("output_bytes", len(newText)),
+		zap.Bool("unsummarised", fallback))
 	return true
+}
+
+// firstUserLine returns the first line of the region's first user message, so
+// a dropped region still names what it was about.
+func firstUserLine(region []Message) string {
+	for i := range region {
+		if region[i].Role != "user" || region[i].Content == "" {
+			continue
+		}
+		line := region[i].Content
+		if j := strings.IndexByte(line, '\n'); j >= 0 {
+			line = line[:j]
+		}
+		line = strings.TrimSpace(line)
+		return collapseTo(line, 120)
+	}
+	return "(no user message in the region)"
 }
 
 // coversThrough reports whether text opens with a "covers msg:A-B" line whose

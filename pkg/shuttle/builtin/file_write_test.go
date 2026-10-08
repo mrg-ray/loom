@@ -409,3 +409,100 @@ func TestFileWriteCreateRefusesDanglingSymlink(t *testing.T) {
 		t.Error("the symlink target was created")
 	}
 }
+
+// Through Execute, which is the shape a model sends. The earlier tests called
+// writeOne directly and so could not see that the single-path form carried its
+// own copy of the mode handling.
+func TestFileWriteExecuteSinglePathHonoursModes(t *testing.T) {
+	dir := t.TempDir()
+	tool := NewFileWriteTool(dir)
+	ctx := context.Background()
+	f := filepath.Join(dir, "a.txt")
+
+	for _, mode := range []string{"Create", "write", "replace", "OVERWRITE", " create", "truncate"} {
+		if err := os.WriteFile(f, []byte("ORIGINAL"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		res, err := tool.Execute(ctx, map[string]interface{}{
+			"path": f, "content": "CLOBBERED", "mode": mode,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Success {
+			t.Errorf("mode %q was accepted", mode)
+		}
+		b, rerr := os.ReadFile(f)
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		if string(b) != "ORIGINAL" {
+			t.Errorf("mode %q clobbered the file", mode)
+		}
+	}
+
+	// create refuses an existing file and says why.
+	res, err := tool.Execute(ctx, map[string]interface{}{"path": f, "content": "X"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Success || res.Error.Code != "FILE_EXISTS" {
+		t.Errorf("an omitted mode must not clobber: %+v", res)
+	}
+
+	// overwrite replaces, and the result still carries the single form's shape.
+	res, err = tool.Execute(ctx, map[string]interface{}{
+		"path": f, "content": "NEW", "mode": "overwrite",
+	})
+	if err != nil || !res.Success {
+		t.Fatalf("overwrite failed: %v %+v", err, res)
+	}
+	data := res.Data.(map[string]interface{})
+	if data["bytes_written"] != 3 || data["mode"] != "overwrite" || data["created"] != false {
+		t.Errorf("result shape changed: %+v", data)
+	}
+}
+
+// create is O_EXCL through Execute too, so a dangling symlink is refused
+// rather than written through to its target.
+func TestFileWriteExecuteCreateRefusesDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	tool := NewFileWriteTool(dir)
+	link := filepath.Join(dir, "dangle")
+	target := filepath.Join(dir, "absent")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skip("symlinks unsupported")
+	}
+	res, err := tool.Execute(context.Background(), map[string]interface{}{
+		"path": link, "content": "X",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Success {
+		t.Error("create wrote through a dangling symlink")
+	}
+	if _, serr := os.Stat(target); serr == nil {
+		t.Error("the symlink target was created")
+	}
+}
+
+// Safe mode confines the single-path form as well, including a write aimed
+// through a symlinked directory.
+func TestFileWriteExecuteSafeModeConfinesSinglePath(t *testing.T) {
+	t.Setenv("LOOM_FILE_SAFE_MODE", "1")
+	base := t.TempDir()
+	tool := NewFileWriteTool(base)
+	res, err := tool.Execute(context.Background(), map[string]interface{}{
+		"path": "../../../../../../tmp-escape-probe.txt", "content": "X",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Success {
+		t.Error("a traversal out of the workspace was written")
+	}
+	if res.Error.Code != "UNSAFE_PATH" {
+		t.Errorf("code = %s, want UNSAFE_PATH", res.Error.Code)
+	}
+}

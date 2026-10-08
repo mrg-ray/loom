@@ -27,7 +27,12 @@ type EditFilesTool struct {
 }
 
 // NewEditFilesTool creates the edit tool. If baseDir is empty, edits resolve
-// against the current directory (with safety checks).
+// against the current directory.
+//
+// A config or skill can mount this tool by name (builtin.ByName). Without safe
+// mode it reaches any path the process can write that isSensitivePath does not
+// refuse; --safe-files confines it to the working directory, the sandbox dir,
+// the loom data dir and temp.
 func NewEditFilesTool(baseDir string) *EditFilesTool {
 	if baseDir == "" {
 		baseDir, _ = os.Getwd()
@@ -157,6 +162,9 @@ func (t *EditFilesTool) applyOne(path, find, replace string) error {
 	if info.Size() > MaxFileReadSize {
 		return fmt.Errorf("too large (%d bytes, max %d)", info.Size(), MaxFileReadSize)
 	}
+	// #nosec G304 -- the path is the tool input, cleaned, resolved through
+	// symlinks and checked against isSensitivePath (and the workspace roots
+	// in safe mode). Reaching a caller-named path is what a file tool is for.
 	data, err := os.ReadFile(cleanPath)
 	if err != nil {
 		return fmt.Errorf("read failed: %v", err)
@@ -182,6 +190,7 @@ func (t *EditFilesTool) applyOne(path, find, replace string) error {
 		// edited in place before this change and must still be editable: the
 		// temp file is an upgrade, not a new requirement. Falling back costs
 		// the atomicity guarantee for exactly that case.
+		// #nosec G304 -- see the read above: same resolved, checked path.
 		if werr := os.WriteFile(cleanPath, []byte(content), info.Mode().Perm()); werr != nil {
 			return fmt.Errorf("write failed: %v", werr)
 		}

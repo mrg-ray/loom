@@ -305,9 +305,8 @@ func (c *Client) convertMessages(messages []llmtypes.Message) ([]TextBlockParam,
 
 	// Anthropic allows 4 cache_control blocks per request and this client
 	// spends one on the tool list, so at most 3 message markers pass through.
-	// The compile emits up to 4 (ROM, summary, lastStable, till-NOW); the cap
-	// drops the last — the till-NOW marker, whose value is harvested on the
-	// gateway path that has the spare slot.
+	// The compile emits at most 3 — ROM, lastStable, till-NOW — so all of
+	// them reach the wire; the summary carries none.
 	const maxMessageMarkers = 3
 	marked := 0
 

@@ -99,11 +99,11 @@ func (t *FileWriteTool) Execute(ctx context.Context, params map[string]interface
 				failed++
 				continue
 			}
-			if line, err := t.writeOne(p, c, mode); err != nil {
+			if out, err := t.writeOne(p, c, mode); err != nil {
 				lines = append(lines, fmt.Sprintf("FAILED %s: %v", p, err))
 				failed++
 			} else {
-				lines = append(lines, line)
+				lines = append(lines, out.line(p))
 			}
 		}
 		return &shuttle.Result{
@@ -169,83 +169,22 @@ func (t *FileWriteTool) Execute(ctx context.Context, params map[string]interface
 		mode = m
 	}
 
-	// Safety: Clean the path and make it absolute
-	cleanPath := filepath.Clean(path)
-
-	// If relative, make it relative to baseDir
-	if !filepath.IsAbs(cleanPath) {
-		cleanPath = filepath.Join(t.baseDir, cleanPath)
-	}
-
-	// Safety: Prevent writing to sensitive locations
-	if isSensitivePath(cleanPath) {
-		return &shuttle.Result{
-			Success: false,
-			Error: &shuttle.Error{
-				Code:       "UNSAFE_PATH",
-				Message:    fmt.Sprintf("Cannot write to sensitive location: %s", cleanPath),
-				Suggestion: "Use a path in the current directory or a user data directory",
-			},
-			ExecutionTimeMs: time.Since(start).Milliseconds(),
-		}, nil
-	}
-
-	// Check if file exists
-	_, err := os.Stat(cleanPath)
-	fileExists := err == nil
-
-	if fileExists && mode == "create" {
-		return &shuttle.Result{
-			Success: false,
-			Error: &shuttle.Error{
-				Code:       "FILE_EXISTS",
-				Message:    fmt.Sprintf("File already exists: %s", cleanPath),
-				Suggestion: "Use mode='overwrite' to replace, or mode='append' to add content",
-			},
-			ExecutionTimeMs: time.Since(start).Milliseconds(),
-		}, nil
-	}
-
-	// Create parent directories (Apple-style: just works)
-	dir := filepath.Dir(cleanPath)
-	if err := os.MkdirAll(dir, 0750); err != nil {
-		return &shuttle.Result{
-			Success: false,
-			Error: &shuttle.Error{
-				Code:    "MKDIR_FAILED",
-				Message: fmt.Sprintf("Failed to create directory: %v", err),
-			},
-			ExecutionTimeMs: time.Since(start).Milliseconds(),
-		}, nil
-	}
-
-	// Write the file
-	var writeErr error
-	var bytesWritten int
-
-	switch mode {
-	case "append":
-		f, err := os.OpenFile(cleanPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-		if err != nil {
-			writeErr = err
-		} else {
-			n, err := f.WriteString(content)
-			bytesWritten = n
-			writeErr = err
-			_ = f.Close()
+	// One implementation for both shapes. This form used to carry its own
+	// copy — its own mode switch, its own stat-then-write, its own default
+	// branch into os.WriteFile — so a fix to one shape left the other
+	// untouched, and this is the shape a model actually sends.
+	out, err := t.writeOne(path, content, mode)
+	if err != nil {
+		code := out.code
+		if code == "" {
+			code = "WRITE_FAILED"
 		}
-	default: // create or overwrite
-		data := []byte(content)
-		writeErr = os.WriteFile(cleanPath, data, 0600)
-		bytesWritten = len(data)
-	}
-
-	if writeErr != nil {
 		return &shuttle.Result{
 			Success: false,
 			Error: &shuttle.Error{
-				Code:    "WRITE_FAILED",
-				Message: fmt.Sprintf("Failed to write file: %v", writeErr),
+				Code:       code,
+				Message:    err.Error(),
+				Suggestion: writeFailureSuggestion(code),
 			},
 			ExecutionTimeMs: time.Since(start).Milliseconds(),
 		}, nil
@@ -254,23 +193,61 @@ func (t *FileWriteTool) Execute(ctx context.Context, params map[string]interface
 	return &shuttle.Result{
 		Success: true,
 		Data: map[string]interface{}{
-			"path":          cleanPath,
-			"bytes_written": bytesWritten,
-			"mode":          mode,
-			"created":       !fileExists,
+			"path":          out.path,
+			"bytes_written": out.bytes,
+			"mode":          out.mode,
+			"created":       out.created,
 		},
 		Metadata: map[string]interface{}{
-			"file_path": cleanPath,
-			"size":      bytesWritten,
+			"file_path": out.path,
+			"size":      out.bytes,
 		},
 		ExecutionTimeMs: time.Since(start).Milliseconds(),
 	}, nil
 }
 
+// writeFailureSuggestion gives the caller the next move for a failure code.
+func writeFailureSuggestion(code string) string {
+	switch code {
+	case "FILE_EXISTS":
+		return "Use mode='overwrite' to replace, or mode='append' to add content"
+	case "UNSAFE_PATH":
+		return "Write inside the workspace, the loom data dir, or /tmp"
+	case "INVALID_PARAMS":
+		return "mode must be create, overwrite, or append"
+	case "CONTENT_TOO_LARGE":
+		return "Split the content across files, or append in parts"
+	default:
+		return ""
+	}
+}
+
+// writeOutcome is what one write did, so the batch form can render its line
+// and the single-path form its Data map from the same implementation.
+type writeOutcome struct {
+	path    string // resolved, absolute
+	bytes   int
+	mode    string
+	created bool
+	code    string // shuttle.Error code when err is non-nil
+}
+
+// line renders the batch form's one-line report.
+func (o writeOutcome) line(reported string) string {
+	switch o.mode {
+	case "append":
+		return fmt.Sprintf("appended %s (%d bytes)", reported, o.bytes)
+	case "create":
+		return fmt.Sprintf("created %s (%d bytes)", reported, o.bytes)
+	default:
+		return fmt.Sprintf("wrote %s (%d bytes)", reported, o.bytes)
+	}
+}
+
 // writeOne applies a single batch entry with the same semantics as the
 // single-file form: sensitive-path guard, 50KB cap, mode handling (default
 // overwrite), parent-directory creation. Returns a one-line report.
-func (t *FileWriteTool) writeOne(path, content, mode string) (string, error) {
+func (t *FileWriteTool) writeOne(path, content, mode string) (writeOutcome, error) {
 	if mode == "" {
 		// Same default as the single-file form and the schema: create. An
 		// omitted mode must never clobber — a batch that means to replace an
@@ -284,25 +261,25 @@ func (t *FileWriteTool) writeOne(path, content, mode string) (string, error) {
 	switch mode {
 	case "create", "overwrite", "append":
 	default:
-		return "", fmt.Errorf("unknown mode %q — use create, overwrite, or append", mode)
+		return writeOutcome{code: "INVALID_PARAMS"}, fmt.Errorf("unknown mode %q — use create, overwrite, or append", mode)
 	}
 	if len(content) > MaxSafeContentSize {
-		return "", fmt.Errorf("content exceeds 50KB limit (%d bytes)", len(content))
+		return writeOutcome{code: "CONTENT_TOO_LARGE"}, fmt.Errorf("content exceeds 50KB limit (%d bytes)", len(content))
 	}
 	cleanPath, scopeErr := resolveInScope(t.baseDir, path)
 	if scopeErr != nil {
-		return "", scopeErr
+		return writeOutcome{code: "UNSAFE_PATH"}, scopeErr
 	}
 	if isSensitivePath(cleanPath) {
-		return "", fmt.Errorf("sensitive location, not writable")
+		return writeOutcome{code: "UNSAFE_PATH"}, fmt.Errorf("sensitive location, not writable")
 	}
 	_, statErr := os.Stat(cleanPath)
 	fileExists := statErr == nil
 	if fileExists && mode == "create" {
-		return "", fmt.Errorf("already exists (mode create)")
+		return writeOutcome{code: "FILE_EXISTS"}, fmt.Errorf("already exists (mode create)")
 	}
 	if err := os.MkdirAll(filepath.Dir(cleanPath), 0750); err != nil {
-		return "", fmt.Errorf("mkdir failed: %v", err)
+		return writeOutcome{code: "MKDIR_FAILED"}, fmt.Errorf("mkdir failed: %v", err)
 	}
 	switch mode {
 	case "create":
@@ -310,41 +287,42 @@ func (t *FileWriteTool) writeOne(path, content, mode string) (string, error) {
 		// check-then-write, and it reads a dangling symlink as "does not
 		// exist" and then writes through it to wherever it points. O_EXCL
 		// refuses both — the existing file and the dangling link.
+		// #nosec G304 -- the path is the tool input, cleaned, resolved through
+		// symlinks and checked against isSensitivePath (and the workspace roots
+		// in safe mode); O_EXCL additionally refuses an existing target.
 		f, err := os.OpenFile(cleanPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
 			if os.IsExist(err) {
-				return "", fmt.Errorf("already exists (mode create)")
+				return writeOutcome{code: "FILE_EXISTS"}, fmt.Errorf("already exists (mode create)")
 			}
-			return "", err
+			return writeOutcome{code: "WRITE_FAILED"}, err
 		}
 		n, werr := f.WriteString(content)
 		if cerr := f.Close(); werr == nil {
 			werr = cerr
 		}
 		if werr != nil {
-			return "", werr
+			return writeOutcome{code: "WRITE_FAILED"}, werr
 		}
-		return fmt.Sprintf("created %s (%d bytes)", path, n), nil
+		return writeOutcome{path: cleanPath, bytes: n, mode: mode, created: true}, nil
 	case "append":
+		// #nosec G304 -- see the create branch: same resolved, checked path.
 		f, err := os.OpenFile(cleanPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
-			return "", err
+			return writeOutcome{code: "WRITE_FAILED"}, err
 		}
 		n, werr := f.WriteString(content)
 		_ = f.Close()
 		if werr != nil {
-			return "", werr
+			return writeOutcome{code: "WRITE_FAILED"}, werr
 		}
-		return fmt.Sprintf("appended %s (%d bytes)", path, n), nil
+		return writeOutcome{path: cleanPath, bytes: n, mode: mode, created: !fileExists}, nil
 	default: // overwrite — the only remaining mode
+		// #nosec G304 -- see the create branch: same resolved, checked path.
 		if err := os.WriteFile(cleanPath, []byte(content), 0600); err != nil {
-			return "", err
+			return writeOutcome{code: "WRITE_FAILED"}, err
 		}
-		verb := "wrote"
-		if !fileExists {
-			verb = "created"
-		}
-		return fmt.Sprintf("%s %s (%d bytes)", verb, path, len(content)), nil
+		return writeOutcome{path: cleanPath, bytes: len(content), mode: mode, created: !fileExists}, nil
 	}
 }
 

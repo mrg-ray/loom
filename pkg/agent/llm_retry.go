@@ -141,7 +141,6 @@ func (a *Agent) observeSchedulerOutcome(err error) {
 	}
 }
 
-// dispatchChat routes one LLM call to streaming, direct, or the retry loop.
 // providerCtx returns the context for one provider call, suppressing extended
 // thinking when this history cannot be sent with it on.
 //
@@ -184,6 +183,7 @@ func rebuiltToolTurn(messages []Message) bool {
 	return false
 }
 
+// dispatchChat routes one LLM call to streaming, direct, or the retry loop.
 func (a *Agent) dispatchChat(ctx Context, messages []Message, tools []shuttle.Tool) (*LLMResponse, error) {
 	// Check if provider supports streaming and we have a progress callback
 	supportsStreaming := llmtypes.SupportsStreaming(a.llm)

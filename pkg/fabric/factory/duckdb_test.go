@@ -248,3 +248,40 @@ func TestDuckDBBackendQualifiedMetadataAndAliasCollision(t *testing.T) {
 		t.Fatalf("row_count = %v, want 2", meta["row_count"])
 	}
 }
+
+// DuckDB matches catalog names case-insensitively and reserves a few, so the
+// alias de-dup folds case and a reserved stem takes a suffix.
+func TestDuckDBBackendAliasCaseAndReservedNames(t *testing.T) {
+	if !havePythonDuckDB() {
+		t.Skip("python3-duckdb not available")
+	}
+	dir := t.TempDir()
+	upper := filepath.Join(dir, "a", "Sales.duckdb")
+	lower := filepath.Join(dir, "b", "sales.duckdb")
+	reserved := filepath.Join(dir, "c", "main.duckdb")
+	for _, p := range []string{upper, lower, reserved} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		seedDuckDB(t, p)
+	}
+
+	b, err := NewDuckDBBackend("aliases", upper+","+lower+","+reserved)
+	if err != nil {
+		t.Fatalf("backend failed: %v", err)
+	}
+	ctx := context.Background()
+
+	// All three attach: the case-colliding stem and the reserved one are
+	// suffixed rather than failing the whole session.
+	res, err := b.ExecuteQuery(ctx, "SELECT count(*) AS n FROM Sales.main.hosts")
+	if err != nil || res.Rows[0]["n"] != "2" {
+		t.Fatalf("first attachment unreadable: %v %+v", err, res)
+	}
+	if _, err := b.ExecuteQuery(ctx, "SELECT count(*) AS n FROM sales_2.main.hosts"); err != nil {
+		t.Fatalf("case-colliding stem did not get its own alias: %v", err)
+	}
+	if _, err := b.ExecuteQuery(ctx, "SELECT count(*) AS n FROM main_2.main.hosts"); err != nil {
+		t.Fatalf("reserved stem was not suffixed: %v", err)
+	}
+}

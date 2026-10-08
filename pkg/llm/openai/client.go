@@ -613,17 +613,41 @@ func completeThinkingBlocks(blocks []llmtypes.ThinkingBlock, text string) {
 }
 
 // thinkingParam returns the request's thinking field, or nil (omitted on the
-// wire) when thinking is off or the model is not Claude-family — the same
-// gate as cache_control, kept one predicate on purpose. Every non-off level
-// maps to adaptive: budget_tokens is rejected by Claude 4.6+/5, and adaptive
-// carries no effort knob on this wire.
+// wire) when thinking is off or the model is not Claude-family — the same gate
+// as cache_control, kept one predicate on purpose.
+//
+// The form follows the model, from the shared list: adaptive where the model
+// takes it, enabled with a budget below max_tokens otherwise. A model that
+// takes only one shape rejects the other outright — adaptive on sonnet-4-5
+// answers "adaptive thinking is not supported on this model", and enabled on
+// a 5-family model answers that enabled is not supported — so the gateway
+// path cannot send one shape for every Claude id.
 func (c *Client) thinkingParam(ctx context.Context) map[string]interface{} {
-	// No suppression branch: this path only ever requests adaptive thinking,
-	// which accepts a rebuilt tool_use row with no thinking block.
 	if c.thinkingLevel == "" || c.thinkingLevel == "none" || !c.emitsCacheControl() {
 		return nil
 	}
-	return map[string]interface{}{"type": "adaptive"}
+	if llm.IsAdaptiveThinkingModel(c.model) {
+		return map[string]interface{}{"type": "adaptive"}
+	}
+	// Suppression applies to this form alone: the thinking-block requirement
+	// belongs to it, and a rebuilt tool_use row is what cannot satisfy it.
+	if llm.ThinkingSuppressed(ctx) {
+		return nil
+	}
+	budget := 16384
+	switch c.thinkingLevel {
+	case "low":
+		budget = 4096
+	case "high":
+		budget = 32768
+	}
+	if c.maxTokens > 0 && budget >= c.maxTokens {
+		budget = c.maxTokens - 1024
+		if budget < 1024 {
+			return nil
+		}
+	}
+	return map[string]interface{}{"type": "enabled", "budget_tokens": budget}
 }
 
 // temperatureParam returns the request temperature, or 1 when thinking rides.

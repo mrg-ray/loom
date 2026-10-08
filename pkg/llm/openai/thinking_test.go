@@ -200,3 +200,55 @@ func TestThinking_StreamAssembly(t *testing.T) {
 		t.Errorf("token callback saw %q — thinking must never reach it", streamed.String())
 	}
 }
+
+// The gateway path sends the form the model accepts, from the shared list:
+// adaptive where the model takes it, enabled with a clamped budget otherwise.
+// A model that takes only one shape rejects the other outright.
+func TestGatewayThinking_FormFollowsTheModel(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		model, want string
+	}{
+		{"claude-opus-5-5", "adaptive"},
+		{"claude-sonnet-5", "adaptive"},
+		{"claude-haiku-5-5", "adaptive"},
+		{"claude-opus-4-6", "adaptive"},
+		{"claude-sonnet-4-5-20250929", "enabled"},
+		{"claude-haiku-4-5-20251001", "enabled"},
+		{"claude-sonnet-4-20250514", "enabled"},
+	} {
+		c := NewClient(Config{APIKey: "k", Model: tc.model, MaxTokens: 64000, ThinkingLevel: "high"})
+		p := c.thinkingParam(ctx)
+		if p == nil {
+			t.Errorf("%s: thinking omitted entirely", tc.model)
+			continue
+		}
+		if p["type"] != tc.want {
+			t.Errorf("%s: type = %v, want %s", tc.model, p["type"], tc.want)
+		}
+		if tc.want == "enabled" {
+			b, ok := p["budget_tokens"].(int)
+			if !ok || b >= 64000 {
+				t.Errorf("%s: budget %v is not below max_tokens", tc.model, p["budget_tokens"])
+			}
+		} else if _, carries := p["budget_tokens"]; carries {
+			t.Errorf("%s: adaptive must not carry budget_tokens", tc.model)
+		}
+	}
+
+	// A non-Claude model takes no thinking field at all.
+	if p := NewClient(Config{APIKey: "k", Model: "gpt-5", MaxTokens: 64000, ThinkingLevel: "high"}).thinkingParam(ctx); p != nil {
+		t.Errorf("non-Claude model got a thinking field: %v", p)
+	}
+
+	// The budget yields to a small ceiling, and is omitted when none fits.
+	c := NewClient(Config{APIKey: "k", Model: "claude-sonnet-4-20250514", MaxTokens: 4096, ThinkingLevel: "low"})
+	if p := c.thinkingParam(ctx); p == nil || p["budget_tokens"].(int) >= 4096 {
+		t.Errorf("budget did not yield to max_tokens: %v", p)
+	}
+	c = NewClient(Config{APIKey: "k", Model: "claude-sonnet-4-20250514", MaxTokens: 1500, ThinkingLevel: "low"})
+	if p := c.thinkingParam(ctx); p != nil {
+		t.Errorf("no valid budget fits under 1500; thinking should be omitted: %v", p)
+	}
+}

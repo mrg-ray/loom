@@ -83,10 +83,13 @@ else:
         # ATTACH, so a repeat gets a suffix and the caller sees it in
         # SHOW DATABASES.
         stem = stem.replace('"', '""')
+        # DuckDB matches catalog names case-insensitively and reserves a few,
+        # so the de-dup folds case and a reserved stem takes a suffix too.
+        reserved = {"main", "temp", "system"}
         base, n = stem, 2
-        while stem in aliases:
+        while stem.lower() in aliases or stem.lower() in reserved:
             stem, n = "%s_%d" % (base, n), n + 1
-        aliases.add(stem)
+        aliases.add(stem.lower())
         con.execute('ATTACH %s AS "%s" (READ_ONLY)' % ("'" + p.replace("'", "''") + "'", stem))
 # Seal the filesystem before the caller's query runs. read_only guards the
 # database; without this, read_csv('/etc/passwd') and friends would turn a SQL
@@ -261,9 +264,6 @@ func pythonErrorLine(stderr string) string {
 	return lines[len(lines)-1]
 }
 
-// schemaInfoQuery builds the information_schema lookup for a resource that
-// may be bare (hosts), schema-qualified (main.hosts) or catalog-qualified
-// (airbnb.main.hosts — attached-database form).
 // quoteQualified quotes each dot-separated segment of a resource name, so a
 // catalog-qualified reference stays three identifiers. Quoting the whole
 // string made "alpha.main.orders" one identifier containing dots, which
@@ -277,6 +277,9 @@ func quoteQualified(resource string) string {
 	return strings.Join(parts, ".")
 }
 
+// schemaInfoQuery builds the information_schema lookup for a resource that
+// may be bare (hosts), schema-qualified (main.hosts) or catalog-qualified
+// (airbnb.main.hosts — attached-database form).
 func schemaInfoQuery(resource string) string {
 	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
 	parts := strings.Split(resource, ".")
