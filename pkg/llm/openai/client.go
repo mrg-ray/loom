@@ -48,7 +48,7 @@ type Client struct {
 	streamIdleTimeout      time.Duration
 	maxTokens              int
 	temperature            float64
-	thinkingLevel          string // "", "none": off; any other value requests adaptive thinking on Claude models
+	thinkingLevel          string // "", "none": off; any other value requests thinking on Claude models (adaptive or enabled+budget, per model)
 	rateLimiter            *llm.RateLimiter
 	toolNameMap            map[string]string // sanitized name → original name
 	extraHeaders           map[string]string // additional headers sent with every request
@@ -76,9 +76,10 @@ type Config struct {
 	MaxTokens              int     // Default: 4096
 	Temperature            float64 // Default: 1.0
 	// ThinkingLevel requests extended thinking ("", "none" = off; "low",
-	// "medium", "high", "auto" = on). On this wire every non-off level maps
-	// to Anthropic adaptive thinking, and only for Claude-family models —
-	// other models' requests are byte-identical to a client without it.
+	// "medium", "high", "auto" = on). Only Claude-family models get it:
+	// models that support adaptive thinking get {"type":"adaptive"}, older
+	// ones get {"type":"enabled"} with a budget clamped below max_tokens.
+	// Other models' requests are byte-identical to a client without it.
 	ThinkingLevel     string
 	RateLimiterConfig llm.RateLimiterConfig
 	// ExtraHeaders are additional HTTP headers sent with every request.
@@ -653,8 +654,8 @@ func (c *Client) thinkingParam(ctx context.Context) map[string]interface{} {
 // temperatureParam returns the request temperature, or 1 when thinking rides.
 // The gateway forwards these requests to Anthropic, which rejects any
 // temperature other than 1 alongside thinking — a configured 0.2 would fail
-// every request at any level above off. No budget clamp is needed here: this
-// path only ever requests adaptive thinking, which carries no budget_tokens.
+// every request at any level above off. The enabled form's budget is clamped
+// in thinkingParam, so no clamp is needed here.
 func (c *Client) temperatureParam(ctx context.Context) float64 {
 	if c.thinkingParam(ctx) != nil {
 		return 1.0

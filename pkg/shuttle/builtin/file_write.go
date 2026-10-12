@@ -246,7 +246,7 @@ func (o writeOutcome) line(reported string) string {
 
 // writeOne applies a single batch entry with the same semantics as the
 // single-file form: sensitive-path guard, 50KB cap, mode handling (default
-// overwrite), parent-directory creation. Returns a one-line report.
+// create), parent-directory creation. Returns the outcome for the caller's report.
 func (t *FileWriteTool) writeOne(path, content, mode string) (writeOutcome, error) {
 	if mode == "" {
 		// Same default as the single-file form and the schema: create. An

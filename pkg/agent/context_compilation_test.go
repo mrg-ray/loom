@@ -981,8 +981,8 @@ func TestReleasePressure_NeverFoldsCurrentTurnUserRows(t *testing.T) {
 	assert.Contains(t, sm.summary.text, "summary of the analysis prose", "the fold itself must have committed")
 }
 
-// Invariant: with no working compressor there is NO fold — no heuristic
-// fallback, no "(unsummarized)" marker, no mutation.
+// Invariant: with no working compressor the fold still sheds the region, but
+// drops it with an "(unsummarized)" marker instead of inventing a summary.
 func TestReleasePressure_FoldDropsUnsummarisedWhenTheCompressorFails(t *testing.T) {
 	sm := reliefSingleTurnFixture(t)
 	fc := &flakyCompressor{failN: 99}

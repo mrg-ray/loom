@@ -94,7 +94,9 @@ func (c *LLMCompressor) CompressMessages(ctx context.Context, messages []Message
 }
 
 // simpleCompress performs basic keyword extraction without LLM.
-// Used as fallback when LLM is unavailable or errors occur.
+// Used only when CompressMessages is called on a disabled compressor (no
+// LLMCaller); LLM errors are returned, never replaced by this. The fold does
+// not reach it: it checks IsEnabled and drops with an "(unsummarized)" marker.
 func (c *LLMCompressor) simpleCompress(messages []Message) string {
 	var parts []string
 
@@ -162,8 +164,8 @@ type promptRegistryCompressor struct {
 
 // newPromptRegistryCompressor builds an LLMCaller backed by an LLM provider and
 // a prompt registry. Both must be non-nil for compression to run; a nil registry
-// or a failed prompt load surfaces as an error so LLMCompressor falls back to
-// the heuristic.
+// or a failed prompt load surfaces as an error, which LLMCompressor returns to
+// its caller (the fold then drops the region with an "(unsummarized)" marker).
 func newPromptRegistryCompressor(llm LLMProvider, registry prompts.PromptRegistry) *promptRegistryCompressor {
 	return &promptRegistryCompressor{llm: llm, prompts: registry}
 }

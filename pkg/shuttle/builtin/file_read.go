@@ -229,6 +229,9 @@ func (t *FileReadTool) Execute(ctx context.Context, params map[string]interface{
 	}
 
 	// Read the file
+	// #nosec G304 -- the path is the tool input, resolved through symlinks by
+	// resolveInScope (workspace roots in safe mode) and checked against
+	// isSensitiveReadPath above.
 	data, err := os.ReadFile(cleanPath)
 	if err != nil {
 		return &shuttle.Result{

@@ -223,8 +223,9 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		// Default-on memory compression: wire an LLM-backed compressor so L2
 		// compaction preserves decisions and approvals-with-scope via the
 		// registry-sourced compaction prompt. Requires both an LLM (dedicated
-		// compressor LLM preferred) and a prompt registry; without either, the
-		// heuristic summariser remains the fallback.
+		// compressor LLM preferred) and a prompt registry; without either, no
+		// compressor is wired and the fold drops old turns with an
+		// "(unsummarized)" marker instead of summarising them.
 		compressorLLM := a.llm
 		if a.compressorLLM != nil {
 			compressorLLM = a.compressorLLM
