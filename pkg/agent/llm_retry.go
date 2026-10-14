@@ -349,9 +349,15 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 	// NotifyStreamActivity; emit them as a throttled, content-free progress
 	// event so they count as activity without leaking JSON into the text.
 	var lastToolInputEmit time.Time
+	// toolInputReported flips once a provider reports per-call progress; that
+	// hook then owns the events, so the bare activity pulse stays silent.
+	toolInputReported := false
 	// Same suppression as the non-streaming path: a resumed turn's rebuilt
 	// rows carry no thinking blocks, and the provider rejects that pairing.
 	streamCtx := llmtypes.WithStreamActivity(a.providerCtx(ctx, messages), func() {
+		if toolInputReported {
+			return
+		}
 		now := time.Now()
 		if now.Sub(lastToolInputEmit) < toolInputActivityInterval {
 			return
@@ -371,6 +377,56 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 			Droppable:         true,
 			TokenCount:        tokenCount,
 			TTFT:              ttft,
+		})
+	})
+
+	// Providers that know which call is streaming also report its id, name and
+	// size so far. The first delta of each call (and the delta that first
+	// supplies its name or id) is emitted immediately so a consumer can show
+	// the tool before its arguments finish; later deltas are throttled.
+	type toolInputCall struct {
+		id, name string
+		lastEmit time.Time
+	}
+	toolInputCalls := map[int]*toolInputCall{}
+	streamCtx = llmtypes.WithToolInputProgress(streamCtx, func(p llmtypes.ToolInputProgress) {
+		toolInputReported = true
+		now := time.Now()
+		call, seen := toolInputCalls[p.Index]
+		if !seen {
+			call = &toolInputCall{}
+			toolInputCalls[p.Index] = call
+		}
+		identityChanged := !seen ||
+			(p.ToolName != "" && p.ToolName != call.name) ||
+			(p.ToolCallID != "" && p.ToolCallID != call.id)
+		if p.ToolName != "" {
+			call.name = p.ToolName
+		}
+		if p.ToolCallID != "" {
+			call.id = p.ToolCallID
+		}
+		if !identityChanged && now.Sub(call.lastEmit) < toolInputActivityInterval {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		call.lastEmit = now
+		progressCallback(ProgressEvent{
+			Stage:             StageLLMGeneration,
+			Progress:          50,
+			Message:           "Generating tool call...",
+			Timestamp:         now,
+			IsToolInputStream: true,
+			Droppable:         true,
+			TokenCount:        tokenCount,
+			TTFT:              ttft,
+			ToolName:          call.name,
+			ToolCallID:        call.id,
+			ToolInputBytes:    int64(p.Bytes),
 		})
 	})
 
