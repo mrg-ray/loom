@@ -30,6 +30,7 @@ func (g Git) bin() string {
 }
 
 func (g Git) run(ctx context.Context, dir string, args ...string) (string, error) {
+	// #nosec G204 -- the binary is this package's git and args are git verbs with workspace-row paths; no user text is spliced in
 	cmd := exec.CommandContext(ctx, g.bin(), args...)
 	if dir != "" {
 		cmd.Dir = dir
@@ -111,7 +112,7 @@ func (g Git) Worktree(ctx context.Context, path string) WorktreeState {
 
 	// A worktree's .git is a file: "gitdir: <clone>/worktrees/<name>". If that
 	// target is gone, the worktree has been orphaned by a deleted clone.
-	raw, err := os.ReadFile(filepath.Join(path, ".git"))
+	raw, err := os.ReadFile(filepath.Join(path, ".git")) // #nosec G304 -- path is a worktree this pool laid out; the read is its own .git pointer
 	if err != nil {
 		return st
 	}
@@ -119,7 +120,7 @@ func (g Git) Worktree(ctx context.Context, path string) WorktreeState {
 	if !filepath.IsAbs(gitdir) {
 		gitdir = filepath.Join(path, gitdir)
 	}
-	if _, err := os.Stat(gitdir); err != nil {
+	if _, err := os.Stat(gitdir); err != nil { // #nosec G304 -- gitdir is the pointer the worktree's own .git file names
 		return st
 	}
 	st.Attached = true
@@ -181,7 +182,7 @@ func (p *Pool) EnsureClone(ctx context.Context, name, url string) (bool, error) 
 	if p.HasClone(name) {
 		return false, nil
 	}
-	if err := os.MkdirAll(p.Root, 0o755); err != nil {
+	if err := os.MkdirAll(p.Root, 0o750); err != nil {
 		return false, err
 	}
 	dest := p.ClonePath(name)
@@ -218,6 +219,7 @@ func (p *Pool) Fetch(ctx context.Context, name string) error {
 // RefExistsRemote asks the remote whether a branch still exists. The one network
 // call the open check makes; skipped offline.
 func (p *Pool) RefExistsRemote(ctx context.Context, name, ref string) (bool, error) {
+	// #nosec G204 -- the binary is this package's git; ref is the branch a workspace row names
 	cmd := exec.CommandContext(ctx, p.git.bin(), "ls-remote", "--exit-code", "--heads", "origin", ref)
 	cmd.Dir = p.ClonePath(name)
 	var errb bytes.Buffer
@@ -237,7 +239,7 @@ func (p *Pool) RefExistsRemote(ctx context.Context, name, ref string) (bool, err
 // branch exists only locally in the clone, it is checked out as-is.
 func (p *Pool) AddWorktree(ctx context.Context, name, path, ref string) error {
 	clone := p.ClonePath(name)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
 	_ = p.Fetch(ctx, name) // best effort; the worktree can be cut from what is already there

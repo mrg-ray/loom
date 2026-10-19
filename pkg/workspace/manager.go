@@ -237,7 +237,7 @@ func (m *Manager) Bind(ctx context.Context, sessionID, workspaceID string) error
 
 func (m *Manager) layout(root string) error {
 	for _, d := range Layout {
-		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o750); err != nil {
 			return fmt.Errorf("workspace layout %s: %w", d, err)
 		}
 	}

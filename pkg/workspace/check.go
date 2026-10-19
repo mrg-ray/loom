@@ -89,7 +89,7 @@ func (m *Manager) Check(ctx context.Context, ws *Workspace, opts CheckOptions) (
 	for _, d := range Layout {
 		p := filepath.Join(ws.RootPath, d)
 		if _, err := os.Stat(p); err != nil {
-			if err := os.MkdirAll(p, 0o755); err != nil {
+			if err := os.MkdirAll(p, 0o750); err != nil {
 				add("", LevelReport, "could not create %s: %v", d, err)
 			} else {
 				add("", LevelRepaired, "%s/ was missing — created", d)

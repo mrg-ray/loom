@@ -660,7 +660,7 @@ func (e *StateMachineExecutor) runChild(ctx context.Context, d *loomv1.DelegateS
 	// handing over a piece of the world, and a directory that does not exist is
 	// not a piece of the world — every tool the child runs would refuse.
 	if dir := child.GetStateMachine().GetDir(); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return "", nil, nil, nil, fmt.Errorf("could not make %s for %q: %w", dir, item, err)
 		}
 	}

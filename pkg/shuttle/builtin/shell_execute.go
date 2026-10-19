@@ -346,13 +346,11 @@ func (t *ShellExecuteTool) Execute(ctx context.Context, params map[string]interf
 			if pathWithin(absWorkingDir, absSandboxDir) {
 				isAllowed = true
 			}
-		}
-		if !isAllowed {
-			// Whitelist /tmp for temporary file operations (common for agent workflows)
+			// The temp directory is open to an unplaced tool (common for agent
+			// workflows); a placed tool's folders are only the ones it was given.
 			if runtime.GOOS != "windows" && pathWithin(absWorkingDir, "/tmp") {
 				isAllowed = true
 			}
-			// Windows temp directory
 			if runtime.GOOS == "windows" && os.Getenv("TEMP") != "" {
 				absTempDir, _ := filepath.Abs(os.Getenv("TEMP"))
 				if pathWithin(absWorkingDir, absTempDir) {
