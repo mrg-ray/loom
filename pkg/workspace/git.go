@@ -120,7 +120,7 @@ func (g Git) Worktree(ctx context.Context, path string) WorktreeState {
 	if !filepath.IsAbs(gitdir) {
 		gitdir = filepath.Join(path, gitdir)
 	}
-	if _, err := os.Stat(gitdir); err != nil { // #nosec G304 -- gitdir is the pointer the worktree's own .git file names
+	if _, err := os.Stat(gitdir); err != nil { // #nosec G703 -- gitdir is the pointer the worktree's own .git file names
 		return st
 	}
 	st.Attached = true
