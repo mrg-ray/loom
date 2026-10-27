@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Run record and run variables.** Every run, top or child, has one record of where it stands and what it has worked out. `{loom_dir}`, `{loom_state}`, `{loom_signal}` and `{loom_message}` interpolate everywhere a state speaks; `fork:<agent>` seats an agent in a copy of an earlier conversation, `session:<agent>` in the conversation itself.
 - **The rest of the engine knows the pattern**: `validation`, the config loader's agent collection, HITL gates (a state has a path, not a number), interpolation, and the task board (one task per state; a machine is a graph, not an order).
 
+- **`pkg/loops`**: the run store — loop runs and agent runs in one table, steps with per-state cost, lease, checkpoint and status — over SQLite. A host fills `RunObserver` with it, so runs survive the process that started them.
+- **`pkg/workspace`**: workspaces as rows — a body of work, the repositories it spans, its sessions — with a repo pool, worktrees and a personal workspace per owner (migration 000030; sessions gain `workspace_id`).
+
 #### Sessions: one turn at a time, routing, run attribution
 - **One turn at a time per session.** A turn claims its session row before it touches it and releases it when it ends, on every path; a second turn is refused with `ErrSessionBusy`, and a claim left by a dead process is taken over. The claim is on the row (`turn_holder`, `turn_since`, `turns`), so it holds across agent objects and processes (migration 000029).
 - **Holding.** `sessions.holding` names the run that currently has a conversation; read on every arriving message, set only on the root session, only by the router (migration 000028).
@@ -109,7 +112,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The LLM retry policy is fixed, not configured.** `Config.Retry` and `RetryConfig` are gone; every call runs under the same backoff.
 - **Postgres migrations 000025–000027 are new.** `000024_task_attribution` keeps its number.
 - **`file_write` defaults to `overwrite`** (was `create`).
-- **Postgres migrations 000028–000029 are new.**
+- **Postgres migrations 000028–000030 are new.**
 
 ### Breaking Changes
 

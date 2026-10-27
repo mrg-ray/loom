@@ -383,7 +383,11 @@ func (s *SessionStore) initSchema() error {
 		// initSchema (not the pkg/storage/sqlite migrator, whose 000001 only
 		// bootstraps): a numbered migration here would double-ALTER.
 		"user_id": "ALTER TABLE sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default-user'",
-		// Routing: which run currently has this
+		// Workspace binding (pkg/workspace): a session lives in exactly one
+		// workspace, set once by BindSession and never updated. '' means not yet
+		// bound; the personal workspace adopts those on first launch.
+		"workspace_id": "ALTER TABLE sessions ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''",
+		// Routing (pkg/loops agent runs): which run currently has this
 		// conversation. '' means nobody else does, which is every existing row
 		// and so is exactly today's behaviour. Only ever set on a conversation's
 		// root session.
@@ -467,6 +471,8 @@ func (s *SessionStore) initSchema() error {
 					indexSQL = "CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id)"
 				case "user_id":
 					indexSQL = "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)"
+				case "workspace_id":
+					indexSQL = "CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id)"
 				case "task_id":
 					// Partial: task_id is NULL for most rows, so the NULL
 					// majority costs nothing to index.
