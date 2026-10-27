@@ -1190,7 +1190,7 @@ func TestToolFiltering_NoToolsSection(t *testing.T) {
 	// load_pattern (pattern library always configured) plus recall (registered
 	// always — HLD §6). No shell_execute, no
 	// other builtins, and workspace registers only with an artifact store.
-	assert.ElementsMatch(t, []string{"load_pattern", "recall"}, registeredTools,
+	assert.ElementsMatch(t, []string{"load_pattern", "recall", "task_list"}, registeredTools,
 		"Expected only the base verbs with no tools section and no artifact store")
 
 	// Verify no unexpected tools

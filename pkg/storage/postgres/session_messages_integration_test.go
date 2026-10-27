@@ -128,3 +128,41 @@ func TestMessages_CrossAgentReadsFilterFolded(t *testing.T) {
 		require.NotEqual(t, "folded-away", m.Content, "LoadMessagesFromParentSession must not return folded rows")
 	}
 }
+
+// TestMessages_ARowIsForWhoeverItsTurnIsFor proves on real postgres what the
+// SQLite store does: a row that does not say who it is for takes the
+// session_context of its turn's first row, and RETURNING stamps it onto the
+// in-memory message; a row that says keeps it; a turn that says nothing is
+// direct.
+func TestMessages_ARowIsForWhoeverItsTurnIsFor(t *testing.T) {
+	pool := testPool(t)
+	store := testSessionStore(t, pool)
+
+	userID := uniqueID("user-kind")
+	sessionID := createTestSession(t, store, userID, uniqueID("sess-kind"), "kind-agent")
+	ctx := ContextWithUserID(context.Background(), userID)
+
+	var thinking agent.Message
+	save := func(msg *agent.Message, turnStart bool) {
+		t.Helper()
+		require.NoError(t, store.SaveMessage(ctx, sessionID, msg, turnStart))
+	}
+	save(&agent.Message{Role: "user", Content: "hi"}, true)
+	save(&agent.Message{Role: "assistant", Content: "hello"}, false)
+	save(&agent.Message{Role: "user", Content: "loop stopped", SessionContext: "loop:run-1@7"}, true)
+	thinking = agent.Message{Role: "assistant", ToolCalls: []agent.ToolCall{{ID: "c1", Name: "work"}}}
+	save(&thinking, false)
+	save(&agent.Message{Role: "tool", ToolUseID: "c1", Content: "done"}, false)
+	save(&agent.Message{Role: "assistant", Content: "report", SessionContext: "coordinator"}, false)
+	save(&agent.Message{Role: "user", Content: "tell them", SessionContext: "speak"}, true)
+	save(&agent.Message{Role: "assistant", Content: "it stopped"}, false)
+
+	msgs, err := store.LoadMessages(ctx, sessionID)
+	require.NoError(t, err)
+	want := []string{"direct", "direct", "loop:run-1@7", "loop:run-1@7", "loop:run-1@7", "coordinator", "speak", "speak"}
+	require.Len(t, msgs, len(want))
+	for i, m := range msgs {
+		require.Equal(t, want[i], string(m.SessionContext), "row %d (%s, turn %d)", i+1, m.Role, m.Turn)
+	}
+	require.Equal(t, "loop:run-1@7", string(thinking.SessionContext), "RETURNING stamps the in-memory message")
+}

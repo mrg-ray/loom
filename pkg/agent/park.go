@@ -923,6 +923,14 @@ func parkSummary(items []parkItem) string {
 // post-resume loop only — the parked batch's executions are authoritative in
 // the persisted tool rows and tool-execution records.
 func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkDecision, progressCallback types.ProgressCallback) (*Response, error) {
+	// The resumed turn is a turn like any other: claimed before the session
+	// is loaded or written, released on every way out.
+	endTurn, err := a.takeTurn(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer endTurn()
+
 	if a.hitlPark == nil {
 		return nil, ErrParkDisabled
 	}

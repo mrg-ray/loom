@@ -75,8 +75,8 @@ func (s *SessionStore) SaveSession(ctx context.Context, session *agent.Session) 
 		}
 
 		_, err = tx.Exec(ctx, `
-		INSERT INTO sessions (id, name, agent_id, user_id, parent_session_id, context_json, created_at, updated_at, total_cost_usd, total_tokens)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		INSERT INTO sessions (id, name, agent_id, user_id, parent_session_id, context_json, created_at, updated_at, total_cost_usd, total_tokens, run_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (id) DO UPDATE SET
 			name = EXCLUDED.name,
 			agent_id = EXCLUDED.agent_id,
@@ -84,7 +84,10 @@ func (s *SessionStore) SaveSession(ctx context.Context, session *agent.Session) 
 			context_json = EXCLUDED.context_json,
 			updated_at = EXCLUDED.updated_at,
 			total_cost_usd = EXCLUDED.total_cost_usd,
-			total_tokens = EXCLUDED.total_tokens`,
+			total_tokens = EXCLUDED.total_tokens,
+			-- run_id is set once at creation and never overwritten. NULLIF
+			-- keeps the existing value if the caller left session.RunID empty.
+			run_id = COALESCE(NULLIF(EXCLUDED.run_id, ''), sessions.run_id)`,
 			session.ID,
 			nullableString(session.Name),
 			nullableString(session.AgentID),
@@ -95,6 +98,7 @@ func (s *SessionStore) SaveSession(ctx context.Context, session *agent.Session) 
 			session.UpdatedAt,
 			session.TotalCostUSD,
 			session.TotalTokens,
+			session.RunID,
 		)
 		if err != nil {
 			span.RecordError(err)
@@ -138,11 +142,12 @@ func (s *SessionStore) LoadSession(ctx context.Context, sessionID string) (*agen
 			totalTokens     int
 		)
 
+		var runID string
 		scanErr := tx.QueryRow(ctx, `
-		SELECT name, agent_id, parent_session_id, context_json, created_at, updated_at, total_cost_usd, total_tokens
+		SELECT name, agent_id, parent_session_id, context_json, created_at, updated_at, total_cost_usd, total_tokens, run_id
 		FROM sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
 			sessionID, userID,
-		).Scan(&sessionName, &agentID, &parentSessionID, &contextJSON, &createdAt, &updatedAt, &totalCost, &totalTokens)
+		).Scan(&sessionName, &agentID, &parentSessionID, &contextJSON, &createdAt, &updatedAt, &totalCost, &totalTokens, &runID)
 		if scanErr != nil {
 			if scanErr == pgx.ErrNoRows {
 				// Benign on the common path: a client-supplied session_id is looked
@@ -167,6 +172,7 @@ func (s *SessionStore) LoadSession(ctx context.Context, sessionID string) (*agen
 			UpdatedAt:    updatedAt,
 			TotalCostUSD: totalCost,
 			TotalTokens:  totalTokens,
+			RunID:        runID,
 		}
 		if sessionName != nil {
 			sess.Name = *sessionName
@@ -387,22 +393,30 @@ func (s *SessionStore) SaveMessage(ctx context.Context, sessionID string, msg *a
 			turnIncrement = 1
 		}
 
+		// A row that says who it is for keeps it; one that does not takes the
+		// session_context of its turn's first row, derived at insert like the
+		// turn itself. A turn's first row that says nothing is direct.
 		// task_id is stamped from the turn's ambient attribution, the same rule
-		// the SQLite session store applies — before this, migration 000024
-		// installed a column this store never wrote, and the whole
-		// message-attribution half of the timeline was dead on Postgres while
-		// the doc claimed stamping was implemented.
+		// the SQLite session store applies.
 		taskIDValue := msg.TaskID
 		if taskIDValue == "" {
 			taskIDValue = taskctx.TaskIDFromContext(ctx)
 		}
 
 		var seq, turn int64
+		var kind string
 		err := tx.QueryRow(ctx, `
-		INSERT INTO messages (session_id, user_id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, task_id, timestamp, token_count, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, model, effort, cache_create_1h_tokens, cache_create_5m_tokens, thinking_tokens, evicted, folded, turn)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-			(SELECT COALESCE(MAX(turn), 0) + $25 FROM messages WHERE session_id = $1))
-		RETURNING id, turn`,
+		INSERT INTO messages (session_id, user_id, role, content, tool_calls_json, tool_use_id, tool_result_json, session_context, agent_id, timestamp, token_count, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, evicted, folded, turn, model, effort, cache_create_1h_tokens, cache_create_5m_tokens, thinking_tokens, task_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7,
+			COALESCE(NULLIF($8, ''),
+				CASE WHEN $19 = 0 THEN (SELECT m.session_context FROM messages m
+					WHERE m.session_id = $1 AND m.turn = (SELECT COALESCE(MAX(turn), 0) FROM messages WHERE session_id = $1)
+					ORDER BY m.id LIMIT 1) END,
+				'direct'),
+			$9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+			(SELECT COALESCE(MAX(turn), 0) + $19 FROM messages WHERE session_id = $1),
+			$20, $21, $22, $23, $24, $25)
+		RETURNING id, turn, session_context`,
 			sessionID,
 			userID,
 			msg.Role,
@@ -412,7 +426,6 @@ func (s *SessionStore) SaveMessage(ctx context.Context, sessionID string, msg *a
 			nullableBytes(toolResultJSON),
 			string(msg.SessionContext),
 			nullableString(msg.AgentID),
-			nullableString(taskIDValue),
 			msg.Timestamp,
 			msg.TokenCount,
 			msg.CostUSD,
@@ -420,19 +433,21 @@ func (s *SessionStore) SaveMessage(ctx context.Context, sessionID string, msg *a
 			msg.OutputTokens,
 			msg.CacheReadTokens,
 			msg.CacheCreateTokens,
+			msg.Evicted,
+			msg.Folded,
+			turnIncrement,
 			msg.Model,
 			msg.Effort,
 			msg.CacheCreate1hTokens,
 			msg.CacheCreate5mTokens,
 			msg.ThinkingTokens,
-			msg.Evicted,
-			msg.Folded,
-			turnIncrement,
-		).Scan(&seq, &turn)
+			nullableString(taskIDValue),
+		).Scan(&seq, &turn, &kind)
 		if err == nil {
-			// RETURNING stamps both onto the in-memory message (HLD §4.5).
+			// RETURNING stamps all three onto the in-memory message (HLD §4.5).
 			msg.ID = fmt.Sprintf("%d", seq)
 			msg.Turn = turn
+			msg.SessionContext = types.SessionContext(kind)
 		}
 		if err != nil {
 			var pgErr *pgconn.PgError
@@ -487,6 +502,60 @@ func (s *SessionStore) LoadMessages(ctx context.Context, sessionID string) ([]ag
 		return nil, err
 	}
 	return messages, nil
+}
+
+// TruncateFrom deletes every message from the given turn onward and reports how
+// many rows went. See agent.SessionStorage for why turn is the unit and why this
+// is a delete rather than an eviction.
+func (s *SessionStore) TruncateFrom(ctx context.Context, sessionID string, turn int) (int, error) {
+	if turn <= 0 {
+		return 0, fmt.Errorf("turn must be positive, got %d", turn)
+	}
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.truncate_from")
+	defer s.tracer.EndSpan(span)
+	span.SetAttribute("session_id", sessionID)
+	span.SetAttribute("turn", fmt.Sprintf("%d", turn))
+
+	var rows int
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			"DELETE FROM messages WHERE session_id = $1 AND user_id = $2 AND turn >= $3",
+			sessionID, UserIDFromContext(ctx), turn,
+		)
+		if err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to truncate messages: %w", err)
+		}
+		rows = int(tag.RowsAffected())
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	span.SetAttribute("rows", fmt.Sprintf("%d", rows))
+	return rows, nil
+}
+
+// MaxTurn reports the highest turn number in a session, or 0 when it has no
+// messages.
+func (s *SessionStore) MaxTurn(ctx context.Context, sessionID string) (int, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.max_turn")
+	defer s.tracer.EndSpan(span)
+	span.SetAttribute("session_id", sessionID)
+
+	var turn *int
+	err := s.pool.QueryRow(ctx,
+		"SELECT MAX(turn) FROM messages WHERE session_id = $1 AND user_id = $2",
+		sessionID, UserIDFromContext(ctx),
+	).Scan(&turn)
+	if err != nil {
+		span.RecordError(err)
+		return 0, fmt.Errorf("failed to read max turn: %w", err)
+	}
+	if turn == nil {
+		return 0, nil
+	}
+	return *turn, nil
 }
 
 // FoldMessages writes summary version n (snapshot_type='fold', content = JSON
@@ -738,6 +807,46 @@ func (s *SessionStore) SearchMessagesByAgent(ctx context.Context, agentID, query
 }
 
 // SaveToolExecution persists a tool execution record.
+// ToolExecutions reads a session's tool calls, oldest first.
+//
+// The same read as the SQLite store's, and it has to exist here for the same
+// reason every other pair does: a host that swaps the backend must not lose a
+// view. Result size is measured in the query rather than fetched, because the
+// result itself is already in the transcript and only its weight is news.
+func (s *SessionStore) ToolExecutions(ctx context.Context, sessionID string) ([]agent.ToolRecord, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.tool_executions")
+	defer s.tracer.EndSpan(span)
+	span.SetAttribute("session_id", sessionID)
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT tool_name, COALESCE(input_json::text, ''), COALESCE(error, ''),
+		       COALESCE(execution_time_ms, 0),
+		       COALESCE(LENGTH(result_json::text), 0),
+		       COALESCE(admission_decision, ''), timestamp
+		FROM tool_executions WHERE session_id = $1
+		ORDER BY timestamp, id`, sessionID)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []agent.ToolRecord
+	for rows.Next() {
+		var rec agent.ToolRecord
+		var ms int
+		var at time.Time
+		if err := rows.Scan(&rec.Tool, &rec.Input, &rec.Error, &ms,
+			&rec.ResultBytes, &rec.Admission, &at); err != nil {
+			return nil, err
+		}
+		rec.Duration = time.Duration(ms) * time.Millisecond
+		rec.At = at
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
 func (s *SessionStore) SaveToolExecution(ctx context.Context, sessionID string, exec agent.ToolExecution) error {
 	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.save_tool_execution")
 	defer s.tracer.EndSpan(span)
@@ -1115,3 +1224,156 @@ func nullableBytes(b []byte) []byte {
 
 // Compile-time check: SessionStore implements agent.SessionStorage.
 var _ agent.SessionStorage = (*SessionStore)(nil)
+
+// SessionsInRun returns every session stamped with this run_id. Same
+// semantics as the SQLite backend.
+func (s *SessionStore) SessionsInRun(ctx context.Context, runID string) ([]string, error) {
+	if runID == "" {
+		return nil, nil
+	}
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.sessions_in_run")
+	defer s.tracer.EndSpan(span)
+
+	var ids []string
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			"SELECT id FROM sessions WHERE run_id = $1 AND user_id = $2 AND deleted_at IS NULL",
+			runID, UserIDFromContext(ctx))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		span.RecordError(err)
+		return nil, fmt.Errorf("list sessions in run: %w", err)
+	}
+	return ids, nil
+}
+
+// StampRunID sets a session's run_id, once. Same semantics as the SQLite
+// backend: requires an empty run_id, so a later run cannot rebind a session an
+// earlier one owns.
+func (s *SessionStore) StampRunID(ctx context.Context, sessionID, runID string) error {
+	if runID == "" {
+		return nil
+	}
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.stamp_run_id")
+	defer s.tracer.EndSpan(span)
+
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			"UPDATE sessions SET run_id = $1 WHERE id = $2 AND user_id = $3 AND run_id = '' AND deleted_at IS NULL",
+			runID, sessionID, UserIDFromContext(ctx))
+		return err
+	})
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("stamp run_id: %w", err)
+	}
+	return nil
+}
+
+// SetHolding records which run has a conversation. An empty runID hands it back.
+//
+// Routing is the CLI's today; this is here because SessionStorage is one
+// interface over both backends and a method that exists on only one of them is
+// not an interface. The column and the semantics are the same in both.
+func (s *SessionStore) SetHolding(ctx context.Context, sessionID, runID string) error {
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.set_holding")
+	defer s.tracer.EndSpan(span)
+
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			"UPDATE sessions SET holding = $1 WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL",
+			runID, sessionID, UserIDFromContext(ctx))
+		return err
+	})
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to set holding: %w", err)
+	}
+	return nil
+}
+
+// Holding returns the run that has this conversation, or "" for nobody.
+func (s *SessionStore) Holding(ctx context.Context, sessionID string) (string, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.holding")
+	defer s.tracer.EndSpan(span)
+
+	var holding string
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			"SELECT COALESCE(holding, '') FROM sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+			sessionID, UserIDFromContext(ctx)).Scan(&holding)
+	})
+	if err != nil {
+		return "", nil // absent reads as nobody holding it
+	}
+	return holding, nil
+}
+
+// TakeTurn claims a session for a turn by holder: taken when nobody holds it,
+// when replacing names the holder now on it, or when the claim was last
+// refreshed before staleBefore. The claim and the read are one transaction.
+func (s *SessionStore) TakeTurn(ctx context.Context, sessionID, holder, replacing string, staleBefore time.Time) (agent.TurnClaim, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.take_turn")
+	defer s.tracer.EndSpan(span)
+
+	claim := agent.TurnClaim{}
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		user := UserIDFromContext(ctx)
+		if _, err := tx.Exec(ctx,
+			`UPDATE sessions SET turn_holder = $1, turn_since = $2
+			 WHERE id = $3 AND user_id = $4 AND deleted_at IS NULL
+			   AND (turn_holder = '' OR turn_holder = $5 OR turn_since < $6)`,
+			holder, time.Now().UnixMilli(), sessionID, user, replacing, staleBefore.UnixMilli()); err != nil {
+			return err
+		}
+		err := tx.QueryRow(ctx,
+			`SELECT turn_holder, turns FROM sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+			sessionID, user).Scan(&claim.Holder, &claim.Turns)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		claim.Exists, claim.Taken = true, claim.Holder == holder
+		return nil
+	})
+	if err != nil {
+		span.RecordError(err)
+		return agent.TurnClaim{}, fmt.Errorf("take a turn in session %s: %w", sessionID, err)
+	}
+	return claim, nil
+}
+
+// KeepTurn refreshes a held claim, so a long turn is not taken as stale.
+func (s *SessionStore) KeepTurn(ctx context.Context, sessionID, holder string) error {
+	return execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE sessions SET turn_since = $1 WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL AND turn_holder = $4`,
+			time.Now().UnixMilli(), sessionID, UserIDFromContext(ctx), holder)
+		return err
+	})
+}
+
+// EndTurn releases a held claim and counts the turn.
+func (s *SessionStore) EndTurn(ctx context.Context, sessionID, holder string) error {
+	return execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE sessions SET turn_holder = '', turn_since = 0, turns = turns + 1
+			 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND turn_holder = $3`,
+			sessionID, UserIDFromContext(ctx), holder)
+		return err
+	})
+}

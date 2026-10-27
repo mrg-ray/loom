@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### State-machine workflows: loops with a manager seat
+- **A workflow can be a graph.** The `state-machine` pattern (`entry_state`, `states`, per-state `route` tables) walks states of four kinds — agent, tool, delegate, terminal — and routes on the signal a state produced. A healthy transition is a map lookup: no LLM call, no cost. Models appear only inside agent-bodied states and at the exceptions the route table cannot resolve. Suspension happens only between states, so a checkpoint is a position, not a copy of the machine, and a run resumes on the pattern as it stands now.
+- **A machine names its manager.** `logic_seat` names the agent that handles the machine's trouble: every agent step's escalation and every child machine's non-done end route to it, and it may send the walk back to any step by naming it. The manager's own escalation is the park — the only way anything leaves the machine.
+- **Delegation.** A `delegate` state hands work to a child workflow once or once per item (fanned, or stepping one entry at a time), each child on its own run record, with `min_budget_usd` refusing children the budget cannot carry. `max_cost_usd` budgets a run; the checkpoint carries `granted_cost_usd`.
+- **Run record and run variables.** Every run, top or child, has one record of where it stands and what it has worked out. `{loom_dir}`, `{loom_state}`, `{loom_signal}` and `{loom_message}` interpolate everywhere a state speaks; `fork:<agent>` seats an agent in a copy of an earlier conversation, `session:<agent>` in the conversation itself.
+- **The rest of the engine knows the pattern**: `validation`, the config loader's agent collection, HITL gates (a state has a path, not a number), interpolation, and the task board (one task per state; a machine is a graph, not an order).
+
+#### Sessions: one turn at a time, routing, run attribution
+- **One turn at a time per session.** A turn claims its session row before it touches it and releases it when it ends, on every path; a second turn is refused with `ErrSessionBusy`, and a claim left by a dead process is taken over. The claim is on the row (`turn_holder`, `turn_since`, `turns`), so it holds across agent objects and processes (migration 000029).
+- **Holding.** `sessions.holding` names the run that currently has a conversation; read on every arriving message, set only on the root session, only by the router (migration 000028).
+- **Cost of a run is a sum over its sessions.** `StampRunID` binds a session to the loop run that created it, once; `SessionsInRun` lists them (migration 000028).
+- **A conversation spread across agents reads back in order.** `LoadThreadMessages` gathers a root session and the sessions of every agent that was handed it, ordered as it happened. `ToolExecutions` reads back what a session's tools did — the write side had no reader.
+- **Fork and rewind.** `ForkSession` starts a conversation that remembers another's, from its folded context; `RewindSession` removes the last turns from both storage and the loaded copy.
+- **`task_list`**: the session's checklist, registered by default. It lives on the session object, outside Messages, so relief cannot touch it; when an item completes, the transcript span it occupied folds to the item's completion summary.
+
+#### Tools
+- **`shell_execute` batch mode.** Up to a fixed number of commands in one call, each in its own shell, all in parallel, rendered in submission order so the same batch renders the same bytes; each command has its own wall-clock budget and output byte budget.
+- **A turn says where it works.** `shuttle.ContextWithWorkDir` installs the turn's working directory on the context; `file_read`, `file_write` and `shell_execute` stand there instead of the directory they were built with.
+- **`table_profile`**: a table's shape in one call — row count, per-column profile, sample rows — composed from `ExecutionBackend` primitives and constructed by the embedder with its backend (not in `builtin.ByName`).
+- **A tool can end the turn it ran in** by setting `agent.EndsTurnKey` on its result metadata.
+
 #### Agent turn: tool results bounded at arrival, in-loop fold, per-call accounting
 - **Every billed message carries what it cost.** `model`, `effort`, input/output, cache-create split by TTL (1h/5m), cache-read and thinking tokens, on the assistant row the LLM call produced (migrations 000025–000027).
 - **In-loop fold.** When the estimate crosses the start mark, the next call carries one transient fold instruction; the agent itself answers with the summary, on its own warm cache, and the harness performs the collapse. The compressor subsystem remains as the failsafe.
@@ -87,6 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`behavior.context_relief_warning` and `Config.ContextReliefWarning` are removed**, with the context-window warning they enabled. Relief folds every G of growth — an absolute budget, not a share of the model's window — so there is no fill percentage to report, and the model is not told about its context budget: a budget signal pushes a model to cut corners, and the one context relief cannot shrink, a single step returning many results, is prevented by bounding each result as it arrives. An agent file that still sets the key loads; the key is ignored.
 - **The LLM retry policy is fixed, not configured.** `Config.Retry` and `RetryConfig` are gone; every call runs under the same backoff.
 - **Postgres migrations 000025–000027 are new.** `000024_task_attribution` keeps its number.
+- **`file_write` defaults to `overwrite`** (was `create`).
+- **Postgres migrations 000028–000029 are new.**
 
 ### Breaking Changes
 

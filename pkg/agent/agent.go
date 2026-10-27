@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -57,6 +58,13 @@ type progressCallbackKey struct{}
 // so that nested operations (like tool executions) can emit progress events.
 func ContextWithProgressCallback(ctx context.Context, callback ProgressCallback) context.Context {
 	return context.WithValue(ctx, progressCallbackKey{}, callback)
+}
+
+// ContextWithoutProgressCallback drops whatever progress callback the context
+// carries. Work that outlives the call it was started from — a loop walking in
+// the background — must not stream into the caller's reply.
+func ContextWithoutProgressCallback(ctx context.Context) context.Context {
+	return context.WithValue(ctx, progressCallbackKey{}, nil)
 }
 
 // ProgressCallbackFromContext retrieves the progress callback from context.
@@ -258,10 +266,17 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	// An oversize result renders truncated with a tail naming where the rest
 	// is, so the producing tool itself is the only other door.
 	recallTool := shuttle.Tool(NewRecallTool(a))
+	// task_list: the session-internal checklist. Registered by default like
+	// the two above — base-advertised from turn one, suppressible via the
+	// WithoutBuiltinTool set. Its state lives on the session (types.TaskList),
+	// outside Messages, so context relief cannot touch it.
+	taskTool := shuttle.Tool(NewTaskListTool(a))
 	if a.prompts != nil {
 		recallTool = shuttle.NewPromptAwareTool(recallTool, a.prompts, "tools.recall")
+		taskTool = shuttle.NewPromptAwareTool(taskTool, a.prompts, "tools.task_list")
 	}
 	a.RegisterTool(recallTool)
+	a.RegisterTool(taskTool)
 
 	// Register graph_memory tool eagerly (not progressive disclosure).
 	// Unlike conversation_memory which depends on runtime state (L2 swap events),
@@ -813,6 +828,25 @@ func (a *Agent) advertisedTools(session *Session) []shuttle.Tool {
 
 	out = a.applySkillExcludedTools(out, session)
 	out = a.applyPermissionToolFilter(out)
+
+	// Experiment knob: LOOM_DISABLED_TOOLS="name,name" removes tools from the
+	// advertised set for A/B runs (e.g. file_read off, reads via the shell).
+	// Unset in any normal deployment.
+	if v := os.Getenv("LOOM_DISABLED_TOOLS"); v != "" {
+		off := make(map[string]bool)
+		for _, n := range strings.Split(v, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				off[n] = true
+			}
+		}
+		kept := out[:0]
+		for _, t := range out {
+			if !off[t.Name()] {
+				kept = append(kept, t)
+			}
+		}
+		out = kept
+	}
 
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Name() < out[j].Name()
@@ -1852,6 +1886,23 @@ func (a *Agent) ChatWithProgress(ctx context.Context, sessionID string, userMess
 	})
 }
 
+// ChatWithProgressAs is ChatWithProgress with the input message's own context
+// stated rather than assumed.
+//
+// A turn's input is usually a person addressing this agent, which is `direct`.
+// It is sometimes machinery: a report handed back when another agent released
+// the conversation is the router's next input, and recording that as `direct`
+// would put it on screen as something somebody said. The agent reads it either
+// way; only what is shown changes.
+func (a *Agent) ChatWithProgressAs(ctx context.Context, sessionID string, userMessage string, sessionContext types.SessionContext, progressCallback ProgressCallback) (*Response, error) {
+	return a.chat(ctx, sessionID, userMessage, chatParams{
+		spanName:         "agent.chat_with_progress",
+		progressCallback: progressCallback,
+		reportProgress:   true,
+		sessionContext:   sessionContext,
+	})
+}
+
 // ChatWithContentBlocks is like ChatWithProgress but the user turn carries
 // multimodal content blocks (text and/or images) alongside the plain-text
 // content. userMessage remains the canonical text (used for persistence,
@@ -1899,6 +1950,13 @@ type chatParams struct {
 	// reportContentBlocks adds the "message.content_blocks" span attribute and
 	// the "content_blocks" started-event field. ChatWithContentBlocks only.
 	reportContentBlocks bool
+
+	// sessionContext is what the turn's own input message is recorded as. Empty
+	// means `direct` — someone addressed this agent — which is every ordinary
+	// turn. `coordinator` marks an input that machinery produced rather than a
+	// person, so a renderer showing a conversation can leave it out while the
+	// agent still reads it as its input.
+	sessionContext types.SessionContext
 }
 
 // hasTextBlock reports whether any of the blocks is a text block.
@@ -1930,6 +1988,14 @@ func truncatePreview(s string) string {
 // how each entry point tailors span name, multimodal content, and progress
 // reporting.
 func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, p chatParams) (*Response, error) {
+	// One turn at a time in a session, whoever runs it: claimed before the
+	// session is loaded or written, released on every way out.
+	endTurn, err := a.takeTurn(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer endTurn()
+
 	// Providers build the request exclusively from ContentBlocks when present,
 	// dropping Content — so an image-only block set would silently send the
 	// image without the question text. Keep userMessage truly canonical by
@@ -2034,11 +2100,12 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	// is restored by rendering that Timestamp into the compiled view only
 	// (renderLocked), never into the stored body.
 	userMsg, _ := a.appendMessage(ctx, session, Message{
-		Role:          "user",
-		Content:       userMessage,
-		ContentBlocks: p.contentBlocks,
-		AgentID:       a.GetID(), // Track which agent received this message
-		Timestamp:     time.Now(),
+		Role:           "user",
+		Content:        userMessage,
+		ContentBlocks:  p.contentBlocks,
+		AgentID:        a.GetID(), // Track which agent received this message
+		SessionContext: p.sessionContext,
+		Timestamp:      time.Now(),
 	}, true)
 
 	// A leading slash command is the user activating a skill. It runs here,
@@ -2047,9 +2114,6 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	// turn that asked for them — and, for a MANUAL skill, this is the only
 	// route in. A message that names no known command is left alone.
 	a.loadSkillFromSlashCommand(ctx, session, userMessage)
-
-	// Graph memory extraction of this message starts in runConversationLoop,
-	// after recall, so the turn's own facts are never recalled as past memory.
 
 	// Store progressCallback in context so nested operations (tools, backends) can access it.
 	// This enables sub-agent progress reporting (e.g., weaver's sub-agents).
@@ -2172,8 +2236,9 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	// Add assistant response to history. response.Usage is the final LLM
 	// call's Usage (last-turn); intermediate tool-use turns already wrote
 	// their own rows above, so SUM(messages.cost) over the session equals
-	// the whole conversation's cost.
-	{
+	// the whole conversation's cost. A turn a tool ended has no final call:
+	// its words were stored with the call that ended it.
+	if _, ended := response.Metadata["ended_by"]; !ended {
 		a.appendMessage(ctx, session, Message{
 			Role: "assistant",
 			// Turn-ending message: thinking text rides for persistence; blocks
@@ -2391,6 +2456,24 @@ type Response struct {
 	Thinking string
 }
 
+// latest is the later of two settings, when the later one says anything.
+func latest(later, earlier string) string {
+	if later != "" {
+		return later
+	}
+	return earlier
+}
+
+// TurnFailed is a turn that failed after its calls had spent something: the
+// failure, and what the turn spent before it.
+type TurnFailed struct {
+	Err   error
+	Spent Usage
+}
+
+func (e *TurnFailed) Error() string { return e.Err.Error() }
+func (e *TurnFailed) Unwrap() error { return e.Err }
+
 // ToolExecution records a tool execution.
 type ToolExecution struct {
 	ToolName string
@@ -2542,7 +2625,7 @@ func extractHITLInfo(input map[string]interface{}) *HITLRequestInfo {
 // runConversationLoop executes the LLM-driven conversation loop.
 // This implements the core agent behavior: LLM generates tool calls,
 // we execute them, feed results back to LLM, repeat until completion.
-func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
+func (a *Agent) runConversationLoop(ctx Context) (resp *Response, err error) {
 	// Start trace span — always created; NoOpTracer handles disabled case
 	_, span := ctx.Tracer().StartSpan(ctx, "agent.conversation_loop")
 	defer ctx.Tracer().EndSpan(span)
@@ -2564,6 +2647,14 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 	var hygieneLast *hygiene.EnforcementOutcome // last outcome, surfaced into Response.Metadata
 	var prevToolNames []string                  // names advertised on this turn's previous provider call; nil before the first
 	var turnUsage Usage                         // every LLM call of this turn, summed
+
+	// A turn that fails part-way has still spent what its calls cost. The
+	// error carries it, so whoever ran the turn can count it.
+	defer func() {
+		if err != nil && (turnUsage.CostUSD > 0 || turnUsage.TotalTokens > 0) {
+			err = &TurnFailed{Err: err, Spent: turnUsage}
+		}
+	}()
 
 	// Self-healing orchestrator (Tier 1 recovery).
 	var recovery *recoveryOrchestrator
@@ -2717,12 +2808,19 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			}
 		}
 
-		// withReminder appends the transient tail — the turn's soft reminder —
-		// as one trailing message on a copy: transient, past every cache
-		// breakpoint, never stored, carried by both the normal send and the
-		// recovery resend.
+		// withReminder appends the transient tail — task-list block first,
+		// then the turn's soft reminder and any tool-change note — as one
+		// trailing message on a copy: transient, past every cache breakpoint,
+		// never stored, carried by both the normal send and the recovery
+		// resend. The task block is re-rendered every iteration, so a status
+		// update between calls changes only this trailing message and no
+		// cached byte.
+		taskBlock := ""
+		if session.Tasks != nil {
+			taskBlock = session.Tasks.Render(taskListRenderBudget)
+		}
 		withReminder := func(msgs []Message, toolNote string) []Message {
-			tail := strings.TrimSpace(softReminder + "\n" + toolNote)
+			tail := strings.TrimSpace(taskBlock + "\n\n" + softReminder + "\n" + toolNote)
 			if tail == "" {
 				return msgs
 			}
@@ -3183,6 +3281,20 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		if parkErr := a.maybeParkResourceBatch(ctx, session, st, llmResp); parkErr != nil {
 			return nil, parkErr
 		}
+		if st.endedBy != "" {
+			return &Response{
+				Content:        llmResp.Content,
+				Usage:          llmResp.Usage,
+				TurnUsage:      turnUsage,
+				ToolExecutions: allToolExecutions,
+				Thinking:       llmResp.Thinking,
+				Metadata: map[string]interface{}{
+					"turns":           turnCount,
+					"tool_executions": toolExecutionCount,
+					"ended_by":        st.endedBy,
+				},
+			}, nil
+		}
 	}
 
 	// If we hit max turns/executions, make one final LLM call to synthesize results
@@ -3208,6 +3320,9 @@ type batchState struct {
 	turnToolCount   int
 	turnDedup       map[string]*shuttle.Result
 	pendingSidecars []Message
+	// endedBy names a tool whose result ended the turn: the model is not
+	// asked for anything more once it is in place.
+	endedBy string
 
 	// Resource-await park (park_resource.go). parkableTail mirrors the
 	// pre-scan's durability gate and is set ONLY by the conversation loop —
@@ -3223,6 +3338,12 @@ type batchState struct {
 	// dispatch attributes.
 	barrierReason string
 }
+
+// EndsTurnKey is the result metadata a tool sets to end the turn it ran in.
+// The turn's reply is then the words the model said alongside the call —
+// nothing is generated after it. For a tool that hands something off, where
+// anything said afterwards would be said to nobody.
+const EndsTurnKey = "end_turn"
 
 // dispatchOneCall runs one call of a tool batch through the full per-call
 // ceremony — caps, dedup, progress emits, spans, execution with
@@ -3552,6 +3673,12 @@ func (a *Agent) commitToolRow(ctx Context, session *Session, toolCall ToolCall, 
 		})
 		st.recovery.setRepeatHint(strings.Join(strings.Fields(msg), " "))
 		span.AddEvent("recovery.repeat_hint", map[string]interface{}{"tool_name": toolCall.Name, "count": n})
+	}
+
+	if result != nil && result.Metadata != nil {
+		if ends, _ := result.Metadata[EndsTurnKey].(bool); ends {
+			st.endedBy = toolCall.Name
+		}
 	}
 
 	// Add tool result to conversation
@@ -4469,6 +4596,193 @@ func (a *Agent) DeleteSession(sessionID string) {
 	// nil-receiver-safe, and a.implicitTasks is nil until a task manager is
 	// wired.
 	a.implicitTasks.ForgetSession(sessionID)
+}
+
+// StampSessionRunID binds a session to the loop run that created it. Idempotent:
+// once set the value stays. Empty runID is a no-op. Errors are surfaced but the
+// caller usually only warns — the accounting roll-up degrades to missing this
+// session, and the walk itself is not affected.
+func (a *Agent) StampSessionRunID(ctx context.Context, sessionID, runID string) error {
+	store := a.memory.GetStore()
+	if store == nil {
+		return nil
+	}
+	return store.StampRunID(ctx, sessionID, runID)
+}
+
+// SessionExists reports whether this session has any history, in memory or in
+// durable storage.
+//
+// GetSession answers only from the in-memory map, which is empty in a freshly
+// built process. Callers that decide behaviour from "has this conversation
+// happened before" — resuming a long-running workflow, choosing a first-entry
+// prompt over a re-entry one — must consult storage too, or every cold start
+// silently looks like a first entry.
+func (a *Agent) SessionExists(ctx context.Context, sessionID string) (bool, error) {
+	if _, ok := a.memory.GetSession(sessionID); ok {
+		return true, nil
+	}
+	store := a.memory.GetStore()
+	if store == nil {
+		return false, nil
+	}
+	return store.SessionExists(ctx, sessionID)
+}
+
+// SessionHasUserTurnWithPrefix reports whether the session's live history holds
+// a user message that starts with prefix.
+//
+// "Live" means not folded into the session summary: a message folded away is no
+// longer in front of the model, so a caller asking "does this conversation
+// still hold what I sent it" must not count it. Storage is the authority when
+// there is one — its read already leaves folded rows out — so a freshly built
+// process answers the same as the one that wrote the history. Without storage
+// the in-memory session is all there is.
+func (a *Agent) SessionHasUserTurnWithPrefix(ctx context.Context, sessionID, prefix string) (bool, error) {
+	var msgs []Message
+	if store := a.memory.GetStore(); store != nil {
+		loaded, err := store.LoadMessages(ctx, sessionID)
+		if err != nil {
+			return false, err
+		}
+		msgs = loaded
+	} else if sess, ok := a.memory.GetSession(sessionID); ok {
+		msgs = sess.GetMessages()
+	}
+	for _, m := range msgs {
+		if m.Role == "user" && !m.Folded && strings.HasPrefix(m.Content, prefix) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ForkSession starts a new conversation that remembers everything another one
+// has said, and leaves the other untouched.
+//
+// A seat that continues someone else's thinking — a lead planning from the
+// design the architect just finished — is worth more warm than cold: it does not
+// re-read what its parent already worked out, and it holds the reasons, not only
+// the documents. The fork is a copy of the parent's messages under a new id, so
+// the two diverge from the first turn after it and neither can see the other.
+//
+// What the parent's turns cost is the parent's: the copied rows carry no cost
+// and no usage, or every roll-up that sums a run's messages would bill the same
+// tokens twice.
+//
+// The fork starts from the context the parent works in, not from its raw
+// history: folded rows stay folded and the parent's newest summary is the
+// fork's. Unfolding them would hand the fork everything the parent had already
+// put behind it, and its first call would be a fold.
+//
+// It is an error to fork onto an id that already has history; a fork happens
+// once, on the turn that would otherwise mint.
+func (a *Agent) ForkSession(ctx context.Context, fromID, toID string) error {
+	store := a.memory.GetStore()
+	if store == nil {
+		return fmt.Errorf("session storage is not configured")
+	}
+	if exists, err := a.SessionExists(ctx, toID); err != nil {
+		return err
+	} else if exists {
+		return fmt.Errorf("session %q already has history; a fork happens once", toID)
+	}
+	parent, err := store.LoadSession(ctx, fromID)
+	if err != nil {
+		return fmt.Errorf("load fork parent %q: %w", fromID, err)
+	}
+	if parent == nil {
+		return fmt.Errorf("fork parent %q does not exist", fromID)
+	}
+	history, err := store.ListMessagesBySeqRange(ctx, fromID, 0, math.MaxInt64)
+	if err != nil {
+		return fmt.Errorf("read fork parent %q: %w", fromID, err)
+	}
+
+	now := time.Now()
+	fork := &Session{
+		ID:        toID,
+		AgentID:   a.GetName(),
+		UserID:    types.UserIDFromContext(ctx),
+		Messages:  []Message{},
+		Context:   map[string]interface{}{"forked_from": fromID},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := store.SaveSession(ctx, fork); err != nil {
+		return fmt.Errorf("create fork %q: %w", toID, err)
+	}
+	// The summary goes first, so no folded row ever stands without it.
+	if n, text, err := newestFold(ctx, store, fromID); err != nil {
+		return fmt.Errorf("read fork parent %q summary: %w", fromID, err)
+	} else if n > 0 {
+		if err := store.FoldMessages(ctx, toID, nil, n, text); err != nil {
+			return fmt.Errorf("copy summary of %q into fork: %w", fromID, err)
+		}
+	}
+	var turn int64
+	for i := range history {
+		msg := history[i]
+		turnStart := msg.Turn > turn
+		turn = msg.Turn
+		msg.ID = ""
+		msg.CostUSD = 0
+		msg.InputTokens, msg.OutputTokens = 0, 0
+		msg.CacheReadTokens, msg.CacheCreateTokens = 0, 0
+		msg.CacheCreate1hTokens, msg.CacheCreate5mTokens, msg.ThinkingTokens = 0, 0, 0
+		if err := store.SaveMessage(ctx, toID, &msg, turnStart); err != nil {
+			return fmt.Errorf("copy message %d of %q into fork: %w", i+1, fromID, err)
+		}
+	}
+	return nil
+}
+
+// RewindSession undoes the last n turns of a conversation and reports how many
+// turns it actually removed, which is fewer than asked when the session is
+// shorter than that.
+//
+// Both halves are required and neither is sufficient. Deleting the rows alone
+// leaves the loaded session in memory still holding them, so the next turn
+// compiles history that no longer exists on disk; dropping the in-memory
+// session alone makes the next access reload the very messages the user asked
+// to remove. Doing both means the reload sees the truncated history, which is
+// why the memory eviction is not an optimisation here but the point.
+//
+// Rewinding is only meaningful between turns. A caller must not run this while
+// a turn is in flight: that turn holds the session and would write its result
+// back on top of the rewind.
+func (a *Agent) RewindSession(ctx context.Context, sessionID string, turns int) (int, error) {
+	if turns <= 0 {
+		return 0, fmt.Errorf("turns must be positive, got %d", turns)
+	}
+	store := a.memory.GetStore()
+	if store == nil {
+		return 0, fmt.Errorf("session storage is not configured")
+	}
+
+	maxTurn, err := store.MaxTurn(ctx, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	if maxTurn == 0 {
+		return 0, nil
+	}
+	from := maxTurn - turns + 1
+	if from < 1 {
+		from = 1
+	}
+	if _, err := store.TruncateFrom(ctx, sessionID, from); err != nil {
+		return 0, err
+	}
+	// The loaded copy is now stale. Dropping it makes the next access reload
+	// the truncated history from the store.
+	//
+	// Only the loaded copy: retiring the whole session here would also discard
+	// its recorded approvals, leases and in-turn databases, and a rewind of one
+	// exchange must not revoke permission a human gave for the turns that
+	// remain.
+	a.memory.DeleteSession(sessionID)
+	return maxTurn - from + 1, nil
 }
 
 // ApprovedSet returns the executor's approved-set accessor; nil until one is
