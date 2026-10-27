@@ -8,7 +8,7 @@ package orchestration
 import (
 	"context"
 	"fmt"
-	"strings"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -43,7 +43,7 @@ func (f *fanTools) Execute(_ context.Context, name string, params map[string]int
 
 	case "review":
 		dir, _ := params[ParamDir].(string)
-		item := dir[strings.LastIndex(dir, "/")+1:]
+		item := filepath.Base(dir)
 		f.ran = append(f.ran, item)
 		f.dirs[item] = dir
 		if told, _ := params["told"].(string); told != "" {
@@ -123,9 +123,9 @@ func TestDelegate_RunsOnePerItemInItsOwnDirectory(t *testing.T) {
 	assert.Equal(t, "DONE", result.Metadata["terminal_state"])
 
 	assert.ElementsMatch(t, []string{"alpha", "beta", "gamma"}, tools.ran)
-	assert.Equal(t, "set/repos/alpha", tools.dirs["alpha"],
+	assert.Equal(t, filepath.Join("set", "repos", "alpha"), tools.dirs["alpha"],
 		"a child works on its own part of the world, not its parent's")
-	assert.Equal(t, "set/repos/gamma", tools.dirs["gamma"])
+	assert.Equal(t, filepath.Join("set", "repos", "gamma"), tools.dirs["gamma"])
 }
 
 // A parked child parks the whole set — and the ones that finished stay

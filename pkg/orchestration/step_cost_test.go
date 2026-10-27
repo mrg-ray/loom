@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -216,7 +217,7 @@ func (f *twiceParked) Execute(_ context.Context, name string, params map[string]
 		return &shuttle.Result{Success: true, Data: `{"signal": "listed", "repos": "alpha\nbeta"}`}, nil
 	}
 	dir, _ := params[ParamDir].(string)
-	item := dir[strings.LastIndex(dir, "/")+1:]
+	item := filepath.Base(dir)
 	f.looked[item]++
 	if item == "beta" && f.looked[item]%2 == 1 {
 		return &shuttle.Result{Success: true, Data: "needs a look\nhitl"}, nil

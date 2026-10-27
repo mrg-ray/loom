@@ -9,6 +9,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,6 +31,9 @@ import (
 // of items that could not be written on the one line a signal rides. None of
 // them are visible until something actually runs.
 func TestLiveRun_PublishDeliverValidate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the states run POSIX shell; shell_execute on Windows is PowerShell")
+	}
 	t.Parallel()
 
 	dir := t.TempDir()

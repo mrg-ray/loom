@@ -8,7 +8,7 @@ package orchestration
 import (
 	"context"
 	"errors"
-	"strings"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -53,7 +53,7 @@ func (l *listTools) Execute(ctx context.Context, name string, params map[string]
 		return &shuttle.Result{Success: true, Data: "judged\nok"}, nil
 	case "review":
 		dir, _ := params[ParamDir].(string)
-		item := dir[strings.LastIndex(dir, "/")+1:]
+		item := filepath.Base(dir)
 		msg, _ := params[ParamMessage].(string)
 		l.opened[item] = msg
 	}
@@ -168,8 +168,8 @@ func TestListState_AnEntryMayPlaceItsChild(t *testing.T) {
 	tools := newListTools(`{"signal": "listed", "repos": [{"item": "alpha", "dir": "work/alpha"}, {"item": "beta"}]}`)
 	runList(t, tools, listPattern(false))
 
-	assert.Equal(t, "set/work/alpha", tools.dirs["alpha"], "placed where the list said")
-	assert.Equal(t, "set/repos/beta", tools.dirs["beta"], "placed by the state's template when the list did not say")
+	assert.Equal(t, filepath.Join("set", "work", "alpha"), tools.dirs["alpha"], "placed where the list said")
+	assert.Equal(t, filepath.Join("set", "repos", "beta"), tools.dirs["beta"], "placed by the state's template when the list did not say")
 }
 
 // A set of one is a fresh walk each time a transition enters it, so a phase
