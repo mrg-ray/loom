@@ -301,7 +301,7 @@ func NormalizeURL(input string) string {
 func NameFromURL(url string) string {
 	s := strings.TrimRight(strings.TrimSpace(url), "/")
 	s = strings.TrimSuffix(s, ".git")
-	if i := strings.LastIndexAny(s, "/:"); i >= 0 {
+	if i := strings.LastIndexAny(s, `/\:`); i >= 0 {
 		s = s[i+1:]
 	}
 	return s

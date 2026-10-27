@@ -361,6 +361,8 @@ func TestNames(t *testing.T) {
 	assert.Equal(t, "loom", NameFromURL("git@github.com:mrg-ray/loom.git"))
 	assert.Equal(t, "up-tera", NameFromURL("https://github.com/Teradata-PE/up-tera"))
 	assert.Equal(t, "loom", NameFromURL("file:///tmp/x/loom.git/"))
+	assert.Equal(t, "loom", NameFromURL(`file://C:\Users\me\remotes\loom.git`), "a Windows path names the repo, not the drive")
+	assert.Equal(t, "loom", NameFromURL(`C:\src\loom`))
 	assert.Equal(t, "git@github.com:Teradata-PE/loom.git", NormalizeURL("Teradata-PE/loom"))
 	assert.Equal(t, "https://x/y.git", NormalizeURL("https://x/y.git"))
 }
