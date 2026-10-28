@@ -824,7 +824,11 @@ func (e *StateMachineExecutor) childPattern(d *loomv1.DelegateState, template *l
 	}
 	child.WorkflowId = childID(e.workflowID, name, en.Item)
 	if sm := child.GetStateMachine(); sm != nil {
-		sm.Dir = e.childDir(d, en)
+		dir, err := e.childDir(d, en)
+		if err != nil {
+			return nil, err
+		}
+		sm.Dir = dir
 		// A child's ceiling is its own or its share of the parent's, whichever is
 		// less. Its own is what the work should cost; the share is what is left to
 		// spend. Taking the share alone hands the first child of a long run the
@@ -855,20 +859,28 @@ func itemOf(workflowID, state, childWorkflowID string) string {
 }
 
 // childDir is where a child works: where the list said, else where the
-// state's template says, else where the parent works. A relative place is
-// under the parent's.
-func (e *StateMachineExecutor) childDir(d *loomv1.DelegateState, en listEntry) string {
+// state's template says, else where the parent works. The place is always
+// under the parent's folder: a list is a model's words, and a place that
+// climbs out of the parent's folder or names an absolute one is refused
+// rather than created.
+func (e *StateMachineExecutor) childDir(d *loomv1.DelegateState, en listEntry) (string, error) {
 	sub := en.Dir
 	if sub == "" {
 		if d.GetDirTemplate() == "" {
-			return e.dir
+			return e.dir, nil
+		}
+		if strings.ContainsAny(en.Item, `/\`) || en.Item == ".." {
+			return "", fmt.Errorf("child %q is not one name, so it cannot be spelled into a folder", en.Item)
 		}
 		sub = strings.ReplaceAll(d.GetDirTemplate(), "{item}", en.Item)
 	}
-	if e.dir == "" || filepath.IsAbs(sub) {
-		return sub
+	if filepath.IsAbs(sub) || !filepath.IsLocal(sub) {
+		return "", fmt.Errorf("child %q is placed at %q, which is not under its parent's folder", en.Item, sub)
 	}
-	return filepath.Join(e.dir, sub)
+	if e.dir == "" {
+		return sub, nil
+	}
+	return filepath.Join(e.dir, sub), nil
 }
 
 // outcomes reads what the children have finished as so far, so a re-entered
