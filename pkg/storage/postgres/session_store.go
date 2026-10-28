@@ -544,10 +544,12 @@ func (s *SessionStore) MaxTurn(ctx context.Context, sessionID string) (int, erro
 	span.SetAttribute("session_id", sessionID)
 
 	var turn *int
-	err := s.pool.QueryRow(ctx,
-		"SELECT MAX(turn) FROM messages WHERE session_id = $1 AND user_id = $2",
-		sessionID, UserIDFromContext(ctx),
-	).Scan(&turn)
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			"SELECT MAX(turn) FROM messages WHERE session_id = $1 AND user_id = $2 AND deleted_at IS NULL",
+			sessionID, UserIDFromContext(ctx),
+		).Scan(&turn)
+	})
 	if err != nil {
 		span.RecordError(err)
 		return 0, fmt.Errorf("failed to read max turn: %w", err)
@@ -818,33 +820,38 @@ func (s *SessionStore) ToolExecutions(ctx context.Context, sessionID string) ([]
 	defer s.tracer.EndSpan(span)
 	span.SetAttribute("session_id", sessionID)
 
-	rows, err := s.pool.Query(ctx, `
+	var out []agent.ToolRecord
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
 		SELECT tool_name, COALESCE(input_json::text, ''), COALESCE(error, ''),
 		       COALESCE(execution_time_ms, 0),
 		       COALESCE(LENGTH(result_json::text), 0),
 		       COALESCE(admission_decision, ''), timestamp
-		FROM tool_executions WHERE session_id = $1
-		ORDER BY timestamp, id`, sessionID)
+		FROM tool_executions WHERE session_id = $1 AND user_id = $2 AND deleted_at IS NULL
+		ORDER BY timestamp, id`, sessionID, UserIDFromContext(ctx))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var rec agent.ToolRecord
+			var ms int
+			var at time.Time
+			if err := rows.Scan(&rec.Tool, &rec.Input, &rec.Error, &ms,
+				&rec.ResultBytes, &rec.Admission, &at); err != nil {
+				return err
+			}
+			rec.Duration = time.Duration(ms) * time.Millisecond
+			rec.At = at
+			out = append(out, rec)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []agent.ToolRecord
-	for rows.Next() {
-		var rec agent.ToolRecord
-		var ms int
-		var at time.Time
-		if err := rows.Scan(&rec.Tool, &rec.Input, &rec.Error, &ms,
-			&rec.ResultBytes, &rec.Admission, &at); err != nil {
-			return nil, err
-		}
-		rec.Duration = time.Duration(ms) * time.Millisecond
-		rec.At = at
-		out = append(out, rec)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (s *SessionStore) SaveToolExecution(ctx context.Context, sessionID string, exec agent.ToolExecution) error {

@@ -44,6 +44,13 @@ func (s *SessionStore) ToolExecutions(ctx context.Context, sessionID string) ([]
 	defer s.tracer.EndSpan(span)
 	span.SetAttribute("session_id", sessionID)
 
+	// Inputs hold commands and paths: another user's session reads as missing.
+	if owned, err := s.ownsSession(ctx, sessionID); err != nil {
+		return nil, err
+	} else if !owned {
+		return nil, nil
+	}
+
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT tool_name, COALESCE(input_json, ''), COALESCE(error, ''),
 		       COALESCE(execution_time_ms, 0), LENGTH(COALESCE(result_json, '')),

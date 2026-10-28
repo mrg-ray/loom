@@ -13,6 +13,7 @@ import (
 
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/shuttle"
+	"github.com/teradata-labs/loom/pkg/types"
 )
 
 // A tool call has been recorded since the beginning and nothing could read it, so
@@ -160,5 +161,40 @@ func TestASessionWithNoToolsIsEmptyRatherThanAnError(t *testing.T) {
 	}
 	if len(recs) != 0 {
 		t.Errorf("read %d records from a session that used no tools", len(recs))
+	}
+}
+
+// TestAnotherUsersToolCallsAreNotReadable — what a session's tools did includes
+// their inputs, which hold commands and paths. A user who names another user's
+// session reads nothing, as if the session were not there.
+func TestAnotherUsersToolCallsAreNotReadable(t *testing.T) {
+	store, err := NewSessionStore(filepath.Join(t.TempDir(), "s.db"), observability.NewNoOpTracer())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	userA := types.ContextWithUserID(context.Background(), "user-a")
+	userB := types.ContextWithUserID(context.Background(), "user-b")
+	sess := &Session{ID: "a-session", AgentID: "agent"}
+	if err := store.SaveSession(userA, sess); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveToolExecution(userA, sess.ID, ToolExecution{
+		ToolName: "shell_execute", Input: map[string]interface{}{"command": "cat ~/.ssh/id_ed25519"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mine, err := store.ToolExecutions(userA, sess.ID)
+	if err != nil || len(mine) != 1 {
+		t.Fatalf("the owner reads their own tools: %+v, %v", mine, err)
+	}
+	theirs, err := store.ToolExecutions(userB, sess.ID)
+	if err != nil {
+		t.Fatalf("another user's session reads as missing, not as an error: %v", err)
+	}
+	if len(theirs) != 0 {
+		t.Errorf("user-b read user-a's tool calls: %+v", theirs)
 	}
 }
