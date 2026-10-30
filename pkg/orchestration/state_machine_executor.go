@@ -299,7 +299,7 @@ func (e *StateMachineExecutor) Resume(ctx context.Context, ckpt *loomv1.Workflow
 			// state's output is done here: what it worked out is kept, its signal
 			// is read the way every signal is, and what it said is handed on.
 			gated := ckpt.PendingGate.GetStageOutput()
-			applyVars(state, gated, st.GetAgent() != nil)
+			applyVars(state, gated, st.GetAgent() != nil, RunVarsFromContext(ctx))
 			next, err := e.resolveTransition(ctx, state, st, current, signalOf(gated), gated)
 			if err != nil {
 				if errors.Is(err, errUnroutable) {
@@ -532,7 +532,7 @@ func (e *StateMachineExecutor) walk(ctx context.Context, startTime time.Time, st
 		// will fan over, the task a cursor has reached. It rides the same JSON
 		// line the signal does, because a state that has just worked something
 		// out is the only thing that knows it.
-		applyVars(state, output, st.GetAgent() != nil)
+		applyVars(state, output, st.GetAgent() != nil, RunVarsFromContext(ctx))
 
 		if _, routed := st.GetRoute()[normalizeSignal(signal)]; !routed &&
 			isNested(ctx) && contains(e.pattern.GetBubbleSignals(), normalizeSignal(signal)) {
@@ -1598,7 +1598,7 @@ func managedAbove(ctx context.Context) bool {
 
 // applyVars keeps what a state worked out on its way out: the `vars` of the
 // object it ended on.
-func applyVars(state *machineState, output string, byModel bool) {
+func applyVars(state *machineState, output string, byModel bool, started map[string]string) {
 	payload := parseSignalPayload(output)
 	raw, ok := payload["vars"].(map[string]any)
 	if !ok {
@@ -1608,15 +1608,28 @@ func applyVars(state *machineState, output string, byModel bool) {
 		state.vars = map[string]string{}
 	}
 	for k, v := range raw {
-		if byModel && engineKey(k) {
+		if byModel && (engineKey(k) || reservedParam(k)) {
+			continue
+		}
+		if _, set := started[k]; byModel && set {
 			continue
 		}
 		state.vars[k] = fmt.Sprintf("%v", v)
 	}
 }
 
+// reservedParam is a name the engine fills itself wherever a state speaks.
+func reservedParam(k string) bool {
+	switch k {
+	case ParamDir, ParamState, ParamSignal, ParamMessage, ParamRun:
+		return true
+	}
+	return false
+}
+
 // engineKey is a variable a model may not write: the engine's own notes on the
-// walk, and the conversation a seat is placed in. A tool state is the spec
+// walk, and the conversation a seat is placed in. Nor may a model write a name
+// the run was started with, or one the engine fills (applyVars). A tool state is the spec
 // author's code and may name a seat's parent; an agent state is a model's
 // words, and a model writing these could clear a child's budget or move a seat
 // into someone else's conversation.

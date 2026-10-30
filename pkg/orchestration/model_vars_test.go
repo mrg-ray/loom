@@ -30,7 +30,7 @@ func TestModelVars_AStatesOutputCannotWriteTheEnginesOwnNotes(t *testing.T) {
 	t.Parallel()
 
 	state := &machineState{vars: map[string]string{"__budget:FAN": "2.5"}}
-	applyVars(state, `{"signal": "ok", "vars": {"__budget:FAN": "0", "__kept:FAN": "x", "__message": "y", "found": "a"}}`, true)
+	applyVars(state, `{"signal": "ok", "vars": {"__budget:FAN": "0", "__kept:FAN": "x", "__message": "y", "found": "a"}}`, true, nil)
 
 	assert.Equal(t, "2.5", state.vars["__budget:FAN"], "a child's budget is the engine's, not the model's")
 	assert.NotContains(t, state.vars, "__kept:FAN")
@@ -45,13 +45,13 @@ func TestModelVars_AStatesOutputCannotSeatAnAgentInAnotherConversation(t *testin
 	t.Parallel()
 
 	state := &machineState{vars: map[string]string{}}
-	applyVars(state, `{"signal": "ok", "vars": {"session:reviewer": "someone-elses-session", "fork:coder": "theirs"}}`, true)
+	applyVars(state, `{"signal": "ok", "vars": {"session:reviewer": "someone-elses-session", "fork:coder": "theirs"}}`, true, nil)
 
 	assert.NotContains(t, state.vars, SessionVarPrefix+"reviewer")
 	assert.NotContains(t, state.vars, ForkVarPrefix+"coder")
 
 	// A tool state is the spec author's code: it names a seat's parent.
-	applyVars(state, `{"signal": "named", "vars": {"fork:planner": "run-designer"}}`, false)
+	applyVars(state, `{"signal": "named", "vars": {"fork:planner": "run-designer"}}`, false, nil)
 	assert.Equal(t, "run-designer", state.vars[ForkVarPrefix+"planner"])
 }
 
@@ -74,4 +74,21 @@ func TestModelVars_AChildCannotBePlacedOutsideItsParentsFolder(t *testing.T) {
 	got, err := e.childDir(&loomv1.DelegateState{DirTemplate: "repos/{item}"}, listEntry{Item: "loom"})
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join("/runs/r1", "repos", "loom"), got)
+}
+
+// What the host started the run with — where the work lives, which unit it is —
+// and the names the engine fills itself are not a model's to change: a model
+// writing {ws} could point a later command at a Makefile of its choosing.
+func TestModelVars_AModelCannotRedefineWhatTheRunWasStartedWith(t *testing.T) {
+	t.Parallel()
+
+	state := &machineState{vars: map[string]string{"ws": "/work/tera-ws"}}
+	host := map[string]string{"ws": "/work/tera-ws", "unit_dir": "/work/tera-ws/units/u1"}
+	applyVars(state, `{"signal":"ok","vars":{"ws":"/tmp/evil","unit_dir":"/tmp/evil","loom_dir":"/tmp/evil","loom_run":"x","repo":"loom"}}`, true, host)
+
+	assert.Equal(t, "/work/tera-ws", state.vars["ws"], "a model redefined where the work lives")
+	assert.NotContains(t, state.vars, "unit_dir", "a model wrote a name the host set")
+	assert.NotContains(t, state.vars, ParamDir, "a model shadowed a name the engine fills")
+	assert.NotContains(t, state.vars, ParamRun)
+	assert.Equal(t, "loom", state.vars["repo"], "an ordinary variable is still taken")
 }
