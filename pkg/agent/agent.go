@@ -4603,8 +4603,8 @@ func (a *Agent) DeleteSession(sessionID string) {
 // caller usually only warns — the accounting roll-up degrades to missing this
 // session, and the walk itself is not affected.
 func (a *Agent) StampSessionRunID(ctx context.Context, sessionID, runID string) error {
-	store := a.memory.GetStore()
-	if store == nil {
+	store, ok := a.memory.GetStore().(RunAttribution)
+	if !ok {
 		return nil
 	}
 	return store.StampRunID(ctx, sessionID, runID)
@@ -4737,6 +4737,10 @@ func (a *Agent) ForkSession(ctx context.Context, fromID, toID string) error {
 	return nil
 }
 
+// ErrRewindUnsupported is RewindSession on a session store that does not
+// implement Rewinder.
+var ErrRewindUnsupported = errors.New("session storage does not support rewind")
+
 // RewindSession undoes the last n turns of a conversation and reports how many
 // turns it actually removed, which is fewer than asked when the session is
 // shorter than that.
@@ -4755,9 +4759,9 @@ func (a *Agent) RewindSession(ctx context.Context, sessionID string, turns int) 
 	if turns <= 0 {
 		return 0, fmt.Errorf("turns must be positive, got %d", turns)
 	}
-	store := a.memory.GetStore()
-	if store == nil {
-		return 0, fmt.Errorf("session storage is not configured")
+	store, ok := a.memory.GetStore().(Rewinder)
+	if !ok {
+		return 0, ErrRewindUnsupported
 	}
 
 	maxTurn, err := store.MaxTurn(ctx, sessionID)
