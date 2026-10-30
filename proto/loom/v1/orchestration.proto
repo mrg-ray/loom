@@ -968,6 +968,9 @@ message StateMachinePattern {
   // Safety bound on how many times a loopback state may be re-entered
   // (default: 100). Exceeding it suspends with MAX_TRANSITIONS so a graph that
   // is turning without converging parks for a human rather than running forever.
+  // Every walk is also bounded absolutely at ten times this many transitions
+  // since it last started or resumed, which stops a cycle through states not
+  // listed in loopback_states.
   int32 max_transitions = 3;
 
   // States whose re-entry counts toward that bound. A run that legitimately

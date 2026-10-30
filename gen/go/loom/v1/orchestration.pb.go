@@ -3756,6 +3756,9 @@ type StateMachinePattern struct {
 	// Safety bound on how many times a loopback state may be re-entered
 	// (default: 100). Exceeding it suspends with MAX_TRANSITIONS so a graph that
 	// is turning without converging parks for a human rather than running forever.
+	// Every walk is also bounded absolutely at ten times this many transitions
+	// since it last started or resumed, which stops a cycle through states not
+	// listed in loopback_states.
 	MaxTransitions int32 `protobuf:"varint,3,opt,name=max_transitions,json=maxTransitions,proto3" json:"max_transitions,omitempty"`
 	// States whose re-entry counts toward that bound. A run that legitimately
 	// walks two hundred states is not stalling; a plan revised six times is, and

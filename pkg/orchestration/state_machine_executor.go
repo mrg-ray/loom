@@ -37,6 +37,15 @@ const (
 	// deliberately generous: the bound exists to turn a runaway into a
 	// suspension a human can look at, not to cap normal work.
 	defaultMaxTransitions = 100
+
+	// totalTransitionFactor bounds every walk absolutely: since it last
+	// started or resumed, a walk takes at most this many times its loopback
+	// bound in transitions. Loopback counting deliberately ignores states the
+	// author did not list, so a long legitimate walk is never mistaken for a
+	// stall; this ceiling is what still stops a cycle through unlisted states.
+	// It sits far above any real walk — the longest recorded is under a sixth
+	// of it — and scales with the author's own bound.
+	totalTransitionFactor = 10
 )
 
 // StateMachineExecutor walks a StateMachinePattern.
@@ -390,7 +399,13 @@ func (e *StateMachineExecutor) Resume(ctx context.Context, ckpt *loomv1.Workflow
 
 // walk is the machine itself: run the state, route on what it emitted, repeat.
 func (e *StateMachineExecutor) walk(ctx context.Context, startTime time.Time, state *machineState) (*loomv1.WorkflowResult, error) {
+	ceiling := state.transitions + totalTransitionFactor*e.maxTransitions()
 	for {
+		// A cancelled walk stops between states, whatever the states it runs
+		// do with their context.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		st, ok := e.pattern.GetStates()[state.current]
 		if !ok {
 			return nil, fmt.Errorf("state machine entered unknown state %q", state.current)
@@ -582,6 +597,11 @@ func (e *StateMachineExecutor) walk(ctx context.Context, startTime time.Time, st
 		state.entered = len(state.allResults)
 		state.current = next
 		state.transitions++
+		if state.transitions >= ceiling {
+			e.orchestrator.logger.Info("State machine reached its transition ceiling",
+				zap.String("state", next), zap.Int32("transitions", state.transitions))
+			return nil, e.suspend(ctx, state, loomv1.SuspendReason_SUSPEND_REASON_MAX_TRANSITIONS, nil)
+		}
 		if e.isLoopback(next) {
 			state.visits[next]++ // 1 after the first re-entry, which is what ⟲ means
 			if state.visits[next] >= state.transitionCeiling {

@@ -9004,7 +9004,7 @@
         "maxTransitions": {
           "type": "integer",
           "format": "int32",
-          "description": "Safety bound on how many times a loopback state may be re-entered\n(default: 100). Exceeding it suspends with MAX_TRANSITIONS so a graph that\nis turning without converging parks for a human rather than running forever."
+          "description": "Safety bound on how many times a loopback state may be re-entered\n(default: 100). Exceeding it suspends with MAX_TRANSITIONS so a graph that\nis turning without converging parks for a human rather than running forever.\nEvery walk is also bounded absolutely at ten times this many transitions\nsince it last started or resumed, which stops a cycle through states not\nlisted in loopback_states."
         },
         "loopbackStates": {
           "type": "array",
