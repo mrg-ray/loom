@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -995,5 +996,66 @@ func TestPathWithinRejectsSiblingPrefix(t *testing.T) {
 		if got := pathWithin(tc.path, tc.dir); got != tc.want {
 			t.Errorf("pathWithin(%q, %q) = %v, want %v", tc.path, tc.dir, got, tc.want)
 		}
+	}
+}
+
+// One command's output reaching the cap leaves the others' sections whole: a
+// command that finished reports its exit, and a later command's output and
+// exit are its own — the budget is per command, not shared.
+func TestShellExecute_BatchOneCommandAtItsCapLeavesTheOthersWhole(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash batch")
+	}
+	dir := t.TempDir()
+	tool := NewShellExecuteTool(dir)
+	tool.SetRestrictWrites(false)
+	res, err := tool.Execute(context.Background(), map[string]interface{}{
+		"working_dir":      dir,
+		"max_output_bytes": float64(2000),
+		"commands": []interface{}{
+			"head -c 5000 /dev/zero | tr '\\0' 'a'; echo; echo one-done",
+			"echo second-ran",
+		},
+	})
+	if err != nil || res == nil {
+		t.Fatalf("batch must run: err=%v", err)
+	}
+	data, _ := res.Data.(map[string]interface{})
+	text, _ := data["result"].(string)
+	if strings.Contains(text, "did not finish") {
+		t.Fatalf("a command that finished is reported as not finishing:\n%s", text)
+	}
+	if !strings.Contains(text, "== command 2 ==\nsecond-ran") {
+		t.Fatalf("the second command's output was lost to the first's:\n%s", text)
+	}
+	if !strings.Contains(text, "cut at a") {
+		t.Fatalf("the first command's cut is not stated:\n%s", text)
+	}
+	if data["failed"] != 0 {
+		t.Fatalf("no command failed, got failed=%v:\n%s", data["failed"], text)
+	}
+}
+
+// A command whose output is multi-byte text cut at its budget still renders
+// valid UTF-8: the replay's byte cut never reaches what is shown.
+func TestShellExecute_BatchCutKeepsTextValid(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash batch")
+	}
+	dir := t.TempDir()
+	tool := NewShellExecuteTool(dir)
+	tool.SetRestrictWrites(false)
+	res, _ := tool.Execute(context.Background(), map[string]interface{}{
+		"working_dir":      dir,
+		"max_output_bytes": float64(1500),
+		"commands":         []interface{}{"for i in $(seq 1 800); do printf 'é€'; done; echo", "echo after"},
+	})
+	data, _ := res.Data.(map[string]interface{})
+	text, _ := data["result"].(string)
+	if !utf8.ValidString(text) {
+		t.Fatalf("the rendered batch is not valid UTF-8")
+	}
+	if !strings.Contains(text, "== command 2 ==\nafter") {
+		t.Fatalf("the second command was lost:\n%s", text)
 	}
 }

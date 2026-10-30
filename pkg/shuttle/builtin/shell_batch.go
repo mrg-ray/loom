@@ -126,6 +126,23 @@ func parseBatchCommands(params map[string]interface{}, defaultBudget int) (cmds 
 	return cmds, true, nil
 }
 
+// replayCap is how much of one command's stream the driver replays: its budget
+// with room to show it was cut.
+func replayCap(budget int) int { return budget + replaySlack }
+
+// replaySlack is what a replay carries past its budget, so a cut is visible.
+const replaySlack = 1024
+
+// batchCaptureBytes is what the call must capture to hold every command's
+// replay whole, with the markers around each.
+func batchCaptureBytes(cmds []batchCmd) int64 {
+	var n int64
+	for _, c := range cmds {
+		n += int64(replayCap(c.budget)) + 256
+	}
+	return n
+}
+
 // buildBatchDriver renders the bash program that runs the batch. Every command
 // is launched concurrently in its own shell, each writing to its own pair of
 // files under a scratch directory, each wrapped in its own timeout so that one
@@ -158,8 +175,11 @@ func buildBatchDriver(cmds []batchCmd) string {
 	for i := range cmds {
 		idx := strconv.Itoa(i)
 		fmt.Fprintf(&b, "__loom_mark __LOOM_S__ %s\n", idx)
-		fmt.Fprintf(&b, "cat \"$__loom_d/%s.o\" 2>/dev/null\n", idx)
-		fmt.Fprintf(&b, "cat \"$__loom_d/%s.e\" >&2 2>/dev/null\n", idx)
+		// Each command's replay is bounded on its own, a little past its
+		// budget so the renderer still sees that it was cut: one command
+		// cannot spend another's share of what the call captures.
+		fmt.Fprintf(&b, "head -c %d \"$__loom_d/%s.o\" 2>/dev/null\n", replayCap(cmds[i].budget), idx)
+		fmt.Fprintf(&b, "head -c %d \"$__loom_d/%s.e\" >&2 2>/dev/null\n", replayCap(cmds[i].budget), idx)
 		fmt.Fprintf(&b, "__loom_rc=$(cat \"$__loom_d/%s.r\" 2>/dev/null); [ -n \"$__loom_rc\" ] || __loom_rc=-1\n", idx)
 		fmt.Fprintf(&b, "__loom_mark __LOOM_E__ \"%s $__loom_rc\"\n", idx)
 	}

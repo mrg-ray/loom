@@ -265,6 +265,14 @@ func (t *ShellExecuteTool) Execute(ctx context.Context, params map[string]interf
 	if mob, ok := params["max_output_bytes"].(float64); ok && mob > 0 {
 		maxOutputBytes = int64(mob)
 	}
+	// In a batch, max_output_bytes is each command's budget, and the driver
+	// bounds each replay to it. The call captures all of them, so a command
+	// that reaches its budget cannot cut off the commands after it.
+	if batchMode {
+		if need := batchCaptureBytes(batchCmds); need > maxOutputBytes {
+			maxOutputBytes = need
+		}
+	}
 
 	// Extract environment variables
 	envVars := make(map[string]string)
