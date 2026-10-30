@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/teradata-labs/loom/pkg/agent"
 	"github.com/teradata-labs/loom/pkg/observability"
+	"github.com/teradata-labs/loom/pkg/types"
 )
 
 // The store shares the sessions database. The session store opens first — it
@@ -91,7 +92,7 @@ func TestCreate_MakesRowAndLayout(t *testing.T) {
 	for _, d := range Layout {
 		assert.DirExists(t, filepath.Join(ws.RootPath, d), d)
 	}
-	got, err := store.Get(context.Background(), ws.ID)
+	got, err := store.Get(context.Background(), "anuj", ws.ID)
 	require.NoError(t, err)
 	assert.Equal(t, KindSoftwareDelivery, got.Kind)
 	assert.Equal(t, StatusActive, got.Status)
@@ -106,19 +107,19 @@ func TestPersonal_OnePerOwner_AdoptsUnboundSessions(t *testing.T) {
 	ctx := context.Background()
 
 	// Sessions from before workspaces existed.
-	require.NoError(t, sess.SaveSession(ctx, &agent.Session{ID: "old-1", UserID: "anuj"}))
-	require.NoError(t, sess.SaveSession(ctx, &agent.Session{ID: "old-2", UserID: "anuj"}))
-	require.NoError(t, sess.SaveSession(ctx, &agent.Session{ID: "other", UserID: "someone-else"}))
+	require.NoError(t, sess.SaveSession(types.ContextWithUserID(ctx, "anuj"), &agent.Session{ID: "old-1"}))
+	require.NoError(t, sess.SaveSession(types.ContextWithUserID(ctx, "anuj"), &agent.Session{ID: "old-2"}))
+	require.NoError(t, sess.SaveSession(types.ContextWithUserID(ctx, "someone-else"), &agent.Session{ID: "other"}))
 
 	ws, err := m.EnsurePersonal(ctx, "anuj")
 	require.NoError(t, err)
 	assert.True(t, ws.IsPersonal)
 	assert.Equal(t, KindScratch, ws.Kind)
 
-	got, err := store.SessionWorkspace(ctx, "old-1")
+	got, err := store.SessionWorkspace(ctx, "anuj", "old-1")
 	require.NoError(t, err)
 	assert.Equal(t, ws.ID, got, "pre-existing sessions have somewhere to live")
-	got, _ = store.SessionWorkspace(ctx, "other")
+	got, _ = store.SessionWorkspace(ctx, "someone-else", "other")
 	assert.Empty(t, got, "another owner's sessions are not touched")
 
 	again, err := m.EnsurePersonal(ctx, "anuj")
@@ -135,18 +136,18 @@ func TestBind_IsSetOnce(t *testing.T) {
 	require.NoError(t, err)
 	b, err := m.Create(ctx, "anuj", "b", KindScratch)
 	require.NoError(t, err)
-	require.NoError(t, sess.SaveSession(ctx, &agent.Session{ID: "s1", UserID: "anuj"}))
+	require.NoError(t, sess.SaveSession(types.ContextWithUserID(ctx, "anuj"), &agent.Session{ID: "s1"}))
 
-	require.NoError(t, m.Bind(ctx, "s1", a.ID))
-	assert.ErrorIs(t, m.Bind(ctx, "s1", b.ID), ErrAlreadyBound, "a session's workspace is for life")
-	assert.ErrorIs(t, m.Bind(ctx, "s1", a.ID), ErrAlreadyBound, "even to the same one")
-	assert.ErrorIs(t, m.Bind(ctx, "nope", a.ID), ErrSessionNotFound)
+	require.NoError(t, m.Bind(ctx, "anuj", "s1", a.ID))
+	assert.ErrorIs(t, m.Bind(ctx, "anuj", "s1", b.ID), ErrAlreadyBound, "a session's workspace is for life")
+	assert.ErrorIs(t, m.Bind(ctx, "anuj", "s1", a.ID), ErrAlreadyBound, "even to the same one")
+	assert.ErrorIs(t, m.Bind(ctx, "anuj", "nope", a.ID), ErrSessionNotFound)
 
-	require.NoError(t, m.Archive(ctx, b.ID))
-	require.NoError(t, sess.SaveSession(ctx, &agent.Session{ID: "s2", UserID: "anuj"}))
-	assert.ErrorIs(t, m.Bind(ctx, "s2", b.ID), ErrArchived, "archived refuses new sessions")
+	require.NoError(t, m.Archive(ctx, "anuj", b.ID))
+	require.NoError(t, sess.SaveSession(types.ContextWithUserID(ctx, "anuj"), &agent.Session{ID: "s2"}))
+	assert.ErrorIs(t, m.Bind(ctx, "anuj", "s2", b.ID), ErrArchived, "archived refuses new sessions")
 
-	ids, err := store.Sessions(ctx, a.ID)
+	ids, err := store.Sessions(ctx, "anuj", a.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"s1"}, ids)
 }
@@ -160,7 +161,7 @@ func TestAddRepo_ByPath_DerivesAndForgetsThePath(t *testing.T) {
 	ws, err := m.Create(ctx, "anuj", "tera", KindSoftwareDelivery)
 	require.NoError(t, err)
 
-	repo, err := m.AddRepo(ctx, ws.ID, checkout, "")
+	repo, err := m.AddRepo(ctx, "anuj", ws.ID, checkout, "")
 	require.NoError(t, err)
 	assert.Equal(t, "loom", repo.Name)
 	assert.Equal(t, url, repo.URL, "the URL is the truth")
@@ -188,19 +189,19 @@ func TestAddRepo_ByURL_SharesThePoolClone(t *testing.T) {
 	b, err := m.Create(ctx, "anuj", "b", KindSoftwareDelivery)
 	require.NoError(t, err)
 
-	ra, err := m.AddRepo(ctx, a.ID, url, "")
+	ra, err := m.AddRepo(ctx, "anuj", a.ID, url, "")
 	require.NoError(t, err)
 	assert.Equal(t, "develop", ra.Ref, "no ref given: the remote's default branch")
 
 	// A second workspace on the same repo needs its own branch — one branch
 	// lives in one worktree.
-	_, err = m.AddRepo(ctx, b.ID, url, "develop")
+	_, err = m.AddRepo(ctx, "anuj", b.ID, url, "develop")
 	assert.ErrorIs(t, err, ErrBranchInUse)
 
 	// The branch exists on the remote and nobody has it checked out.
 	git(t, ra.WorktreePath, "branch", "loop/TER-1")
 	git(t, ra.WorktreePath, "push", "-q", "origin", "loop/TER-1")
-	rb, err := m.AddRepo(ctx, b.ID, url, "loop/TER-1")
+	rb, err := m.AddRepo(ctx, "anuj", b.ID, url, "loop/TER-1")
 	require.NoError(t, err)
 	assert.FileExists(t, filepath.Join(rb.WorktreePath, "README.md"))
 
@@ -216,7 +217,7 @@ func TestAddRepo_PersonalRefuses(t *testing.T) {
 
 	ws, err := m.EnsurePersonal(ctx, "anuj")
 	require.NoError(t, err)
-	_, err = m.AddRepo(ctx, ws.ID, url, "")
+	_, err = m.AddRepo(ctx, "anuj", ws.ID, url, "")
 	assert.ErrorIs(t, err, ErrPersonalNoRepos)
 }
 
@@ -229,7 +230,7 @@ func TestCheck_RepairsMirrors_ReportsState(t *testing.T) {
 
 	ws, err := m.Create(ctx, "anuj", "tera", KindSoftwareDelivery)
 	require.NoError(t, err)
-	repo, err := m.AddRepo(ctx, ws.ID, url, "")
+	repo, err := m.AddRepo(ctx, "anuj", ws.ID, url, "")
 	require.NoError(t, err)
 
 	only := func(findings []Finding, level Level) []Finding {
@@ -243,7 +244,7 @@ func TestCheck_RepairsMirrors_ReportsState(t *testing.T) {
 	}
 
 	t.Run("clean workspace is all ok", func(t *testing.T) {
-		_, findings, err := m.Open(ctx, ws.ID, CheckOptions{})
+		_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{})
 		require.NoError(t, err)
 		assert.Empty(t, only(findings, LevelReport))
 		assert.Empty(t, only(findings, LevelRepaired))
@@ -251,7 +252,7 @@ func TestCheck_RepairsMirrors_ReportsState(t *testing.T) {
 
 	t.Run("pool clone deleted → re-cloned", func(t *testing.T) {
 		require.NoError(t, os.RemoveAll(m.Pool.ClonePath("loom")))
-		_, findings, err := m.Open(ctx, ws.ID, CheckOptions{})
+		_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{})
 		require.NoError(t, err)
 		repaired := only(findings, LevelRepaired)
 		require.NotEmpty(t, repaired)
@@ -272,7 +273,7 @@ func TestCheck_RepairsMirrors_ReportsState(t *testing.T) {
 
 	t.Run("worktree deleted by hand → re-cut", func(t *testing.T) {
 		require.NoError(t, os.RemoveAll(repo.WorktreePath))
-		_, findings, err := m.Open(ctx, ws.ID, CheckOptions{})
+		_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{})
 		require.NoError(t, err)
 		repaired := only(findings, LevelRepaired)
 		require.Len(t, repaired, 1)
@@ -283,7 +284,7 @@ func TestCheck_RepairsMirrors_ReportsState(t *testing.T) {
 	t.Run("uncommitted changes → reported, untouched", func(t *testing.T) {
 		mine := filepath.Join(repo.WorktreePath, "mine.txt")
 		require.NoError(t, os.WriteFile(mine, []byte("work in progress\n"), 0o644))
-		_, findings, err := m.Open(ctx, ws.ID, CheckOptions{})
+		_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{})
 		require.NoError(t, err)
 		reports := only(findings, LevelReport)
 		require.Len(t, reports, 1)
@@ -294,7 +295,7 @@ func TestCheck_RepairsMirrors_ReportsState(t *testing.T) {
 
 	t.Run("wrong branch → reported", func(t *testing.T) {
 		git(t, repo.WorktreePath, "checkout", "-q", "-b", "elsewhere")
-		_, findings, err := m.Open(ctx, ws.ID, CheckOptions{})
+		_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{})
 		require.NoError(t, err)
 		reports := only(findings, LevelReport)
 		require.Len(t, reports, 1)
@@ -306,7 +307,7 @@ func TestCheck_RepairsMirrors_ReportsState(t *testing.T) {
 	t.Run("unregistered directory under repos/ → reported", func(t *testing.T) {
 		stray := filepath.Join(ws.RootPath, DirRepos, "stray")
 		require.NoError(t, os.MkdirAll(stray, 0o755))
-		_, findings, err := m.Open(ctx, ws.ID, CheckOptions{})
+		_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{})
 		require.NoError(t, err)
 		reports := only(findings, LevelReport)
 		require.Len(t, reports, 1)
@@ -317,7 +318,7 @@ func TestCheck_RepairsMirrors_ReportsState(t *testing.T) {
 
 	t.Run("ref gone on the remote → reported", func(t *testing.T) {
 		git(t, repo.WorktreePath, "push", "-q", "origin", "--delete", "develop")
-		_, findings, err := m.Open(ctx, ws.ID, CheckOptions{})
+		_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{})
 		require.NoError(t, err)
 		reports := only(findings, LevelReport)
 		require.Len(t, reports, 1)
@@ -327,7 +328,7 @@ func TestCheck_RepairsMirrors_ReportsState(t *testing.T) {
 
 	t.Run("root directory gone → reported, nothing else attempted", func(t *testing.T) {
 		require.NoError(t, os.Rename(ws.RootPath, ws.RootPath+".moved"))
-		_, findings, err := m.Open(ctx, ws.ID, CheckOptions{Offline: true})
+		_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{Offline: true})
 		require.NoError(t, err)
 		require.Len(t, findings, 1)
 		assert.Equal(t, LevelReport, findings[0].Level)
@@ -344,16 +345,16 @@ func TestRemoveRepo_RefusesDirty(t *testing.T) {
 
 	ws, err := m.Create(ctx, "anuj", "tera", KindSoftwareDelivery)
 	require.NoError(t, err)
-	repo, err := m.AddRepo(ctx, ws.ID, url, "")
+	repo, err := m.AddRepo(ctx, "anuj", ws.ID, url, "")
 	require.NoError(t, err)
 
 	require.NoError(t, os.WriteFile(filepath.Join(repo.WorktreePath, "wip.txt"), []byte("x"), 0o644))
-	assert.Error(t, m.RemoveRepo(ctx, ws.ID, "loom"), "uncommitted work is never deleted")
+	assert.Error(t, m.RemoveRepo(ctx, "anuj", ws.ID, "loom"), "uncommitted work is never deleted")
 	require.NoError(t, os.Remove(filepath.Join(repo.WorktreePath, "wip.txt")))
 
-	require.NoError(t, m.RemoveRepo(ctx, ws.ID, "loom"))
+	require.NoError(t, m.RemoveRepo(ctx, "anuj", ws.ID, "loom"))
 	assert.NoDirExists(t, repo.WorktreePath)
-	repos, _ := store.Repos(ctx, ws.ID)
+	repos, _ := store.Repos(ctx, "anuj", ws.ID)
 	assert.Empty(t, repos)
 }
 
@@ -390,12 +391,12 @@ func TestCheck_AdoptsACheckoutALoopMadeWithoutAskingAnyone(t *testing.T) {
 	git(t, plain, "checkout", "-q", "--detach")
 	git(t, plain, "worktree", "add", "-q", wt, branch)
 
-	_, findings, err := m.Open(ctx, ws.ID, CheckOptions{})
+	_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{})
 	require.NoError(t, err)
 	for _, f := range findings {
 		assert.NotEqual(t, LevelReport, f.Level, "nothing here is for a person: %+v", f)
 	}
-	repos, err := store.Repos(ctx, ws.ID)
+	repos, err := store.Repos(ctx, "anuj", ws.ID)
 	require.NoError(t, err)
 	require.Len(t, repos, 1)
 	assert.Equal(t, "loom", repos[0].Name)
@@ -408,7 +409,7 @@ func TestCheck_AdoptsACheckoutALoopMadeWithoutAskingAnyone(t *testing.T) {
 	assert.True(t, os.IsNotExist(err), "no second clone was made")
 
 	// The next open is quiet.
-	_, findings, err = m.Open(ctx, ws.ID, CheckOptions{})
+	_, findings, err = m.Open(ctx, "anuj", ws.ID, CheckOptions{})
 	require.NoError(t, err)
 	for _, f := range findings {
 		assert.Equal(t, LevelOK, f.Level, "%+v", f)
@@ -425,13 +426,13 @@ func TestCheck_ReportsProgressAndDoesNotWaitOnASlowRemote(t *testing.T) {
 	require.NoError(t, err)
 	for _, name := range []string{"loom", "cloud", "ui"} {
 		url, _ := remoteAndCheckout(t, name)
-		_, err := m.AddRepo(ctx, ws.ID, url, "")
+		_, err := m.AddRepo(ctx, "anuj", ws.ID, url, "")
 		require.NoError(t, err)
 	}
 
 	var mu sync.Mutex
 	var heard []CheckProgress
-	_, findings, err := m.Open(ctx, ws.ID, CheckOptions{Progress: func(p CheckProgress) {
+	_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{Progress: func(p CheckProgress) {
 		mu.Lock()
 		heard = append(heard, p)
 		mu.Unlock()
@@ -446,7 +447,7 @@ func TestCheck_ReportsProgressAndDoesNotWaitOnASlowRemote(t *testing.T) {
 	}
 
 	// A remote given no time to answer is reported as not answering.
-	_, findings, err = m.Open(ctx, ws.ID, CheckOptions{RemoteTimeout: time.Nanosecond})
+	_, findings, err = m.Open(ctx, "anuj", ws.ID, CheckOptions{RemoteTimeout: time.Nanosecond})
 	require.NoError(t, err)
 	slow := 0
 	for _, f := range findings {
@@ -466,7 +467,7 @@ func TestCheck_SaysWhatBlocksWork(t *testing.T) {
 	ws, err := m.Create(ctx, "anuj", "gone", KindSoftwareDelivery)
 	require.NoError(t, err)
 	require.NoError(t, os.RemoveAll(ws.RootPath))
-	_, findings, err := m.Open(ctx, ws.ID, CheckOptions{Offline: true})
+	_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{Offline: true})
 	require.NoError(t, err)
 	require.Len(t, findings, 1)
 	require.True(t, findings[0].Blocks, "a missing workspace does not block: %+v", findings[0])
@@ -481,12 +482,12 @@ func TestCheck_ReCloningIsReportedAndBounded(t *testing.T) {
 	ws, err := m.Create(ctx, "anuj", "tera", KindSoftwareDelivery)
 	require.NoError(t, err)
 	url, _ := remoteAndCheckout(t, "loom")
-	repo, err := m.AddRepo(ctx, ws.ID, url, "")
+	repo, err := m.AddRepo(ctx, "anuj", ws.ID, url, "")
 	require.NoError(t, err)
 	require.NoError(t, os.RemoveAll(m.Pool.ClonePath(repo.Name)))
 
 	var doings []string
-	_, findings, err := m.Open(ctx, ws.ID, CheckOptions{Offline: true, CloneTimeout: time.Nanosecond,
+	_, findings, err := m.Open(ctx, "anuj", ws.ID, CheckOptions{Offline: true, CloneTimeout: time.Nanosecond,
 		Progress: func(p CheckProgress) { doings = append(doings, p.Doing) }})
 	require.NoError(t, err)
 	require.Contains(t, doings, "re-cloning")

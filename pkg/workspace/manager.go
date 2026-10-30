@@ -117,8 +117,8 @@ func (m *Manager) EnsurePersonal(ctx context.Context, owner string) (*Workspace,
 // its worktree. Everything else is derived: a path yields its origin URL and
 // current branch and is then forgotten; a URL yields its name and, if no ref is
 // given, the remote's default branch.
-func (m *Manager) AddRepo(ctx context.Context, workspaceID, input, ref string) (*Repo, error) {
-	ws, err := m.Store.Get(ctx, workspaceID)
+func (m *Manager) AddRepo(ctx context.Context, owner, workspaceID, input, ref string) (*Repo, error) {
+	ws, err := m.Store.Get(ctx, owner, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +148,7 @@ func (m *Manager) AddRepo(ctx context.Context, workspaceID, input, ref string) (
 		return nil, fmt.Errorf("workspace: cannot derive a repo name from %q", input)
 	}
 
-	existing, err := m.Store.Repos(ctx, ws.ID)
+	existing, err := m.Store.Repos(ctx, ws.OwnerUserID, ws.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +177,7 @@ func (m *Manager) AddRepo(ctx context.Context, workspaceID, input, ref string) (
 	if err := m.Pool.AddWorktree(ctx, name, repo.WorktreePath, ref); err != nil {
 		return nil, err
 	}
-	if err := m.Store.AddRepo(ctx, repo); err != nil {
+	if err := m.Store.AddRepo(ctx, ws.OwnerUserID, repo); err != nil {
 		_ = m.Pool.RemoveWorktree(ctx, name, repo.WorktreePath)
 		return nil, err
 	}
@@ -186,8 +186,8 @@ func (m *Manager) AddRepo(ctx context.Context, workspaceID, input, ref string) (
 
 // RemoveRepo forgets a repo and removes its worktree. A dirty worktree refuses:
 // uncommitted work is never deleted by tera.
-func (m *Manager) RemoveRepo(ctx context.Context, workspaceID, name string) error {
-	repos, err := m.Store.Repos(ctx, workspaceID)
+func (m *Manager) RemoveRepo(ctx context.Context, owner, workspaceID, name string) error {
+	repos, err := m.Store.Repos(ctx, owner, workspaceID)
 	if err != nil {
 		return err
 	}
@@ -200,19 +200,19 @@ func (m *Manager) RemoveRepo(ctx context.Context, workspaceID, name string) erro
 				return fmt.Errorf("workspace: %s has uncommitted changes or could not be removed: %w", name, err)
 			}
 		}
-		return m.Store.RemoveRepo(ctx, workspaceID, name)
+		return m.Store.RemoveRepo(ctx, owner, workspaceID, name)
 	}
 	return ErrNotFound
 }
 
 // Archive hides a workspace and refuses new sessions. The directory stays.
-func (m *Manager) Archive(ctx context.Context, workspaceID string) error {
-	return m.Store.SetStatus(ctx, workspaceID, StatusArchived)
+func (m *Manager) Archive(ctx context.Context, owner, workspaceID string) error {
+	return m.Store.SetStatus(ctx, owner, workspaceID, StatusArchived)
 }
 
 // Open is what a session does before it binds: fetch the row and run the check.
-func (m *Manager) Open(ctx context.Context, workspaceID string, opts CheckOptions) (*Workspace, []Finding, error) {
-	ws, err := m.Store.Get(ctx, workspaceID)
+func (m *Manager) Open(ctx context.Context, owner, workspaceID string, opts CheckOptions) (*Workspace, []Finding, error) {
+	ws, err := m.Store.Get(ctx, owner, workspaceID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -224,15 +224,15 @@ func (m *Manager) Open(ctx context.Context, workspaceID string, opts CheckOption
 }
 
 // Bind sets a session's workspace, once.
-func (m *Manager) Bind(ctx context.Context, sessionID, workspaceID string) error {
-	ws, err := m.Store.Get(ctx, workspaceID)
+func (m *Manager) Bind(ctx context.Context, owner, sessionID, workspaceID string) error {
+	ws, err := m.Store.Get(ctx, owner, workspaceID)
 	if err != nil {
 		return err
 	}
 	if ws.Status != StatusActive {
 		return ErrArchived
 	}
-	return m.Store.BindSession(ctx, sessionID, workspaceID)
+	return m.Store.BindSession(ctx, owner, sessionID, workspaceID)
 }
 
 func (m *Manager) layout(root string) error {

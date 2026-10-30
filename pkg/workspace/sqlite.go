@@ -101,8 +101,8 @@ func (s *SQLiteStore) Create(ctx context.Context, ws *Workspace) error {
 
 const wsColumns = `id, owner_user_id, name, kind, root_path, is_personal, status, config_json, created_at, updated_at`
 
-func (s *SQLiteStore) Get(ctx context.Context, id string) (*Workspace, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+wsColumns+` FROM workspaces WHERE id = ? AND status != 'deleted'`, id)
+func (s *SQLiteStore) Get(ctx context.Context, owner, id string) (*Workspace, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+wsColumns+` FROM workspaces WHERE id = ? AND owner_user_id = ? AND status != 'deleted'`, id, owner)
 	return scanWorkspace(row)
 }
 
@@ -133,27 +133,30 @@ func (s *SQLiteStore) List(ctx context.Context, owner string) ([]*Workspace, err
 	return out, rows.Err()
 }
 
-func (s *SQLiteStore) SetStatus(ctx context.Context, id string, status Status) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE workspaces SET status = ?, updated_at = ? WHERE id = ?`, string(status), time.Now().Unix(), id)
+func (s *SQLiteStore) SetStatus(ctx context.Context, owner, id string, status Status) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE workspaces SET status = ?, updated_at = ? WHERE id = ? AND owner_user_id = ?`, string(status), time.Now().Unix(), id, owner)
 	if err != nil {
 		return fmt.Errorf("set status: %w", err)
 	}
 	return affectedOrNotFound(res)
 }
 
-func (s *SQLiteStore) UpdateConfig(ctx context.Context, id string, config map[string]any) error {
+func (s *SQLiteStore) UpdateConfig(ctx context.Context, owner, id string, config map[string]any) error {
 	cfg, err := marshalConfig(config)
 	if err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE workspaces SET config_json = ?, updated_at = ? WHERE id = ?`, cfg, time.Now().Unix(), id)
+	res, err := s.db.ExecContext(ctx, `UPDATE workspaces SET config_json = ?, updated_at = ? WHERE id = ? AND owner_user_id = ?`, cfg, time.Now().Unix(), id, owner)
 	if err != nil {
 		return fmt.Errorf("update config: %w", err)
 	}
 	return affectedOrNotFound(res)
 }
 
-func (s *SQLiteStore) AddRepo(ctx context.Context, r *Repo) error {
+func (s *SQLiteStore) AddRepo(ctx context.Context, owner string, r *Repo) error {
+	if err := s.ownWorkspace(ctx, owner, r.WorkspaceID); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO workspace_repos (workspace_id, name, url, ref, worktree_path) VALUES (?, ?, ?, ?, ?)`,
 		r.WorkspaceID, r.Name, r.URL, r.Ref, r.WorktreePath)
@@ -167,16 +170,16 @@ func (s *SQLiteStore) AddRepo(ctx context.Context, r *Repo) error {
 	return nil
 }
 
-func (s *SQLiteStore) RemoveRepo(ctx context.Context, workspaceID, name string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM workspace_repos WHERE workspace_id = ? AND name = ?`, workspaceID, name)
+func (s *SQLiteStore) RemoveRepo(ctx context.Context, owner, workspaceID, name string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM workspace_repos WHERE workspace_id = ? AND name = ? AND workspace_id IN (SELECT id FROM workspaces WHERE owner_user_id = ?)`, workspaceID, name, owner)
 	if err != nil {
 		return fmt.Errorf("remove repo: %w", err)
 	}
 	return affectedOrNotFound(res)
 }
 
-func (s *SQLiteStore) Repos(ctx context.Context, workspaceID string) ([]*Repo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT workspace_id, name, url, ref, worktree_path FROM workspace_repos WHERE workspace_id = ? ORDER BY name`, workspaceID)
+func (s *SQLiteStore) Repos(ctx context.Context, owner, workspaceID string) ([]*Repo, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT r.workspace_id, r.name, r.url, r.ref, r.worktree_path FROM workspace_repos r JOIN workspaces w ON w.id = r.workspace_id WHERE r.workspace_id = ? AND w.owner_user_id = ? ORDER BY r.name`, workspaceID, owner)
 	if err != nil {
 		return nil, fmt.Errorf("list repos: %w", err)
 	}
@@ -194,8 +197,11 @@ func (s *SQLiteStore) Repos(ctx context.Context, workspaceID string) ([]*Repo, e
 
 // BindSession is set-once by construction: the UPDATE only matches an unbound
 // row, so a second bind changes nothing and is reported as such.
-func (s *SQLiteStore) BindSession(ctx context.Context, sessionID, workspaceID string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET workspace_id = ? WHERE id = ? AND (workspace_id = '' OR workspace_id IS NULL)`, workspaceID, sessionID)
+func (s *SQLiteStore) BindSession(ctx context.Context, owner, sessionID, workspaceID string) error {
+	if err := s.ownWorkspace(ctx, owner, workspaceID); err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET workspace_id = ? WHERE id = ? AND user_id = ? AND (workspace_id = '' OR workspace_id IS NULL)`, workspaceID, sessionID, owner)
 	if err != nil {
 		return fmt.Errorf("bind session: %w", err)
 	}
@@ -204,7 +210,7 @@ func (s *SQLiteStore) BindSession(ctx context.Context, sessionID, workspaceID st
 		return nil
 	}
 	var existing sql.NullString
-	err = s.db.QueryRowContext(ctx, `SELECT workspace_id FROM sessions WHERE id = ?`, sessionID).Scan(&existing)
+	err = s.db.QueryRowContext(ctx, `SELECT workspace_id FROM sessions WHERE id = ? AND user_id = ?`, sessionID, owner).Scan(&existing)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrSessionNotFound
 	}
@@ -214,9 +220,9 @@ func (s *SQLiteStore) BindSession(ctx context.Context, sessionID, workspaceID st
 	return ErrAlreadyBound
 }
 
-func (s *SQLiteStore) SessionWorkspace(ctx context.Context, sessionID string) (string, error) {
+func (s *SQLiteStore) SessionWorkspace(ctx context.Context, owner, sessionID string) (string, error) {
 	var ws sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT workspace_id FROM sessions WHERE id = ?`, sessionID).Scan(&ws)
+	err := s.db.QueryRowContext(ctx, `SELECT workspace_id FROM sessions WHERE id = ? AND user_id = ?`, sessionID, owner).Scan(&ws)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrSessionNotFound
 	}
@@ -226,8 +232,8 @@ func (s *SQLiteStore) SessionWorkspace(ctx context.Context, sessionID string) (s
 	return ws.String, nil
 }
 
-func (s *SQLiteStore) Sessions(ctx context.Context, workspaceID string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM sessions WHERE workspace_id = ? ORDER BY updated_at DESC`, workspaceID)
+func (s *SQLiteStore) Sessions(ctx context.Context, owner, workspaceID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM sessions WHERE workspace_id = ? AND user_id = ? ORDER BY updated_at DESC`, workspaceID, owner)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
 	}
@@ -255,6 +261,17 @@ func (s *SQLiteStore) AdoptUnboundSessions(ctx context.Context, owner, workspace
 
 type rowScanner interface {
 	Scan(dest ...any) error
+}
+
+// ownWorkspace is ErrNotFound unless the workspace is owner's: nothing is
+// added to, or bound into, another owner's workspace.
+func (s *SQLiteStore) ownWorkspace(ctx context.Context, owner, id string) error {
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM workspaces WHERE id = ? AND owner_user_id = ? AND status != 'deleted'`, id, owner).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	return err
 }
 
 func scanWorkspace(r rowScanner) (*Workspace, error) {

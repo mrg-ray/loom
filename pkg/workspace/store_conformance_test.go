@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/teradata-labs/loom/pkg/agent"
+	"github.com/teradata-labs/loom/pkg/types"
 )
 
 // The store is the one piece with two implementations, so its behaviour is
@@ -49,7 +50,7 @@ func storeConformance(t *testing.T, store Store, newSession func(t *testing.T, i
 	})
 
 	t.Run("get by id and by name, and missing is not found", func(t *testing.T) {
-		got, err := store.Get(ctx, "c1")
+		got, err := store.Get(ctx, "ann", "c1")
 		require.NoError(t, err)
 		assert.Equal(t, "tera", got.Name)
 		assert.Equal(t, KindSoftwareDelivery, got.Kind)
@@ -58,7 +59,7 @@ func storeConformance(t *testing.T, store Store, newSession func(t *testing.T, i
 		require.NoError(t, err)
 		assert.Equal(t, "c1", got.ID)
 
-		_, err = store.Get(ctx, "nope")
+		_, err = store.Get(ctx, "ann", "nope")
 		assert.ErrorIs(t, err, ErrNotFound)
 		_, err = store.GetByName(ctx, "ann", "nope")
 		assert.ErrorIs(t, err, ErrNotFound)
@@ -77,11 +78,11 @@ func storeConformance(t *testing.T, store Store, newSession func(t *testing.T, i
 	})
 
 	t.Run("config round-trips as json", func(t *testing.T) {
-		require.NoError(t, store.UpdateConfig(ctx, "c1", map[string]any{
+		require.NoError(t, store.UpdateConfig(ctx, "ann", "c1", map[string]any{
 			"budget": map[string]any{"max_cost_usd": 12.5},
 			"envs":   []any{"dit", "sit"},
 		}))
-		got, err := store.Get(ctx, "c1")
+		got, err := store.Get(ctx, "ann", "c1")
 		require.NoError(t, err)
 		budget, ok := got.Config["budget"].(map[string]any)
 		require.True(t, ok, "config: %#v", got.Config)
@@ -90,49 +91,76 @@ func storeConformance(t *testing.T, store Store, newSession func(t *testing.T, i
 	})
 
 	t.Run("status changes and is readable", func(t *testing.T) {
-		require.NoError(t, store.SetStatus(ctx, "c3", StatusArchived))
-		got, err := store.Get(ctx, "c3")
+		require.NoError(t, store.SetStatus(ctx, "bob", "c3", StatusArchived))
+		got, err := store.Get(ctx, "bob", "c3")
 		require.NoError(t, err)
 		assert.Equal(t, StatusArchived, got.Status)
-		require.NoError(t, store.SetStatus(ctx, "c3", StatusActive))
+		require.NoError(t, store.SetStatus(ctx, "bob", "c3", StatusActive))
 	})
 
 	t.Run("repos are keyed by name within a workspace", func(t *testing.T) {
-		require.NoError(t, store.AddRepo(ctx, &Repo{WorkspaceID: "c1", Name: "loom", URL: "git@x:o/loom.git", Ref: "main", WorktreePath: "/w/c1/repos/loom"}))
-		require.NoError(t, store.AddRepo(ctx, &Repo{WorkspaceID: "c1", Name: "up", URL: "git@x:o/up.git", Ref: "dev", WorktreePath: "/w/c1/repos/up"}))
+		require.NoError(t, store.AddRepo(ctx, "ann", &Repo{WorkspaceID: "c1", Name: "loom", URL: "git@x:o/loom.git", Ref: "main", WorktreePath: "/w/c1/repos/loom"}))
+		require.NoError(t, store.AddRepo(ctx, "ann", &Repo{WorkspaceID: "c1", Name: "up", URL: "git@x:o/up.git", Ref: "dev", WorktreePath: "/w/c1/repos/up"}))
 		// The same repo name in another workspace is a different row.
-		require.NoError(t, store.AddRepo(ctx, &Repo{WorkspaceID: "c3", Name: "loom", URL: "git@x:o/loom.git", Ref: "main", WorktreePath: "/w/c3/repos/loom"}))
+		require.NoError(t, store.AddRepo(ctx, "bob", &Repo{WorkspaceID: "c3", Name: "loom", URL: "git@x:o/loom.git", Ref: "main", WorktreePath: "/w/c3/repos/loom"}))
 
-		repos, err := store.Repos(ctx, "c1")
+		repos, err := store.Repos(ctx, "ann", "c1")
 		require.NoError(t, err)
 		assert.Len(t, repos, 2)
 
-		require.NoError(t, store.RemoveRepo(ctx, "c1", "up"))
-		repos, err = store.Repos(ctx, "c1")
+		require.NoError(t, store.RemoveRepo(ctx, "ann", "c1", "up"))
+		repos, err = store.Repos(ctx, "ann", "c1")
 		require.NoError(t, err)
 		require.Len(t, repos, 1)
 		assert.Equal(t, "loom", repos[0].Name)
 		assert.Equal(t, "main", repos[0].Ref)
 
-		other, err := store.Repos(ctx, "c3")
+		other, err := store.Repos(ctx, "bob", "c3")
 		require.NoError(t, err)
 		assert.Len(t, other, 1, "removing c1's repo left c3's alone")
 	})
 
 	t.Run("a session binds once, for life", func(t *testing.T) {
 		newSession(t, "s-bind", "ann")
-		require.NoError(t, store.BindSession(ctx, "s-bind", "c1"))
-		assert.ErrorIs(t, store.BindSession(ctx, "s-bind", "p1"), ErrAlreadyBound)
-		assert.ErrorIs(t, store.BindSession(ctx, "s-bind", "c1"), ErrAlreadyBound, "even to the same one")
-		assert.ErrorIs(t, store.BindSession(ctx, "s-missing", "c1"), ErrSessionNotFound)
+		require.NoError(t, store.BindSession(ctx, "ann", "s-bind", "c1"))
+		assert.ErrorIs(t, store.BindSession(ctx, "ann", "s-bind", "p1"), ErrAlreadyBound)
+		assert.ErrorIs(t, store.BindSession(ctx, "ann", "s-bind", "c1"), ErrAlreadyBound, "even to the same one")
+		assert.ErrorIs(t, store.BindSession(ctx, "ann", "s-missing", "c1"), ErrSessionNotFound)
 
-		got, err := store.SessionWorkspace(ctx, "s-bind")
+		got, err := store.SessionWorkspace(ctx, "ann", "s-bind")
 		require.NoError(t, err)
 		assert.Equal(t, "c1", got)
 
-		ids, err := store.Sessions(ctx, "c1")
+		ids, err := store.Sessions(ctx, "ann", "c1")
 		require.NoError(t, err)
 		assert.Equal(t, []string{"s-bind"}, ids)
+	})
+
+	t.Run("another owner's workspace reads as missing and cannot be changed", func(t *testing.T) {
+		_, err := store.Get(ctx, "bob", "c1")
+		assert.ErrorIs(t, err, ErrNotFound, "bob read ann's workspace")
+		repos, err := store.Repos(ctx, "bob", "c1")
+		require.NoError(t, err)
+		assert.Empty(t, repos, "bob read ann's repos")
+		ids, err := store.Sessions(ctx, "bob", "c1")
+		require.NoError(t, err)
+		assert.Empty(t, ids, "bob read ann's sessions")
+		_, err = store.SessionWorkspace(ctx, "bob", "s-bind")
+		assert.ErrorIs(t, err, ErrSessionNotFound, "bob read where ann's session lives")
+
+		assert.ErrorIs(t, store.SetStatus(ctx, "bob", "c1", StatusDeleted), ErrNotFound)
+		assert.ErrorIs(t, store.UpdateConfig(ctx, "bob", "c1", map[string]any{"x": 1}), ErrNotFound)
+		assert.ErrorIs(t, store.RemoveRepo(ctx, "bob", "c1", "loom"), ErrNotFound)
+		assert.ErrorIs(t, store.AddRepo(ctx, "bob", &Repo{WorkspaceID: "c1", Name: "evil", URL: "u", Ref: "r", WorktreePath: "/w"}), ErrNotFound)
+		newSession(t, "s-bobs", "bob")
+		assert.ErrorIs(t, store.BindSession(ctx, "bob", "s-bobs", "c1"), ErrNotFound, "bob bound a session into ann's workspace")
+
+		got, err := store.Get(ctx, "ann", "c1")
+		require.NoError(t, err)
+		assert.Equal(t, StatusActive, got.Status, "ann's workspace is untouched")
+		repos, err = store.Repos(ctx, "ann", "c1")
+		require.NoError(t, err)
+		assert.Len(t, repos, 1, "ann's repos are untouched")
 	})
 
 	t.Run("adoption takes only this owner's unbound sessions", func(t *testing.T) {
@@ -145,11 +173,11 @@ func storeConformance(t *testing.T, store Store, newSession func(t *testing.T, i
 		assert.EqualValues(t, 2, n)
 
 		for _, id := range []string{"s-old-1", "s-old-2"} {
-			got, err := store.SessionWorkspace(ctx, id)
+			got, err := store.SessionWorkspace(ctx, "ann", id)
 			require.NoError(t, err)
 			assert.Equal(t, "p1", got)
 		}
-		got, _ := store.SessionWorkspace(ctx, "s-other")
+		got, _ := store.SessionWorkspace(ctx, "bob", "s-other")
 		assert.Empty(t, got, "another owner's session stays unbound")
 
 		again, err := store.AdoptUnboundSessions(ctx, "ann", "p1")
@@ -163,7 +191,7 @@ func TestStoreConformance_SQLite(t *testing.T) {
 	sess, store := openStores(t)
 	storeConformance(t, store, func(t *testing.T, id, owner string) {
 		t.Helper()
-		require.NoError(t, sess.SaveSession(context.Background(), &agent.Session{ID: id, UserID: owner}))
+		require.NoError(t, sess.SaveSession(types.ContextWithUserID(context.Background(), owner), &agent.Session{ID: id}))
 	})
 }
 

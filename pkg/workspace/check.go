@@ -97,7 +97,7 @@ func (m *Manager) Check(ctx context.Context, ws *Workspace, opts CheckOptions) (
 		}
 	}
 
-	repos, err := m.Store.Repos(ctx, ws.ID)
+	repos, err := m.Store.Repos(ctx, ws.OwnerUserID, ws.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +148,7 @@ func (m *Manager) adopt(ctx context.Context, ws *Workspace, name string) (*Repo,
 	if err != nil || url == "" {
 		return nil, false
 	}
-	if existing, err := m.Store.Repos(ctx, ws.ID); err == nil {
+	if existing, err := m.Store.Repos(ctx, ws.OwnerUserID, ws.ID); err == nil {
 		for _, r := range existing {
 			if NormalizeURL(r.URL) == NormalizeURL(url) {
 				return nil, false
@@ -160,7 +160,7 @@ func (m *Manager) adopt(ctx context.Context, ws *Workspace, name string) (*Repo,
 		return nil, false
 	}
 	repo := &Repo{WorkspaceID: ws.ID, Name: name, URL: url, Ref: ref, WorktreePath: path}
-	if err := m.Store.AddRepo(ctx, repo); err != nil {
+	if err := m.Store.AddRepo(ctx, ws.OwnerUserID, repo); err != nil {
 		return nil, false
 	}
 	return repo, true

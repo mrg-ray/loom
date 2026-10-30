@@ -112,10 +112,12 @@ var (
 
 // Store is the registry. One interface, two implementations — SQLite locally
 // and Postgres in cloud — following the session store's pattern, so the CLI
-// and cloud read and write identical rows.
+// and cloud read and write identical rows. A workspace is its owner's: every
+// call names the owner, and one that names a workspace or session the owner
+// does not have reads it as missing and changes nothing.
 type Store interface {
 	Create(ctx context.Context, ws *Workspace) error
-	Get(ctx context.Context, id string) (*Workspace, error)
+	Get(ctx context.Context, owner, id string) (*Workspace, error)
 	GetByName(ctx context.Context, owner, name string) (*Workspace, error)
 
 	// Personal returns the owner's personal workspace — the default, exactly
@@ -126,20 +128,20 @@ type Store interface {
 	// first. Deleted ones are never listed.
 	List(ctx context.Context, owner string) ([]*Workspace, error)
 
-	SetStatus(ctx context.Context, id string, status Status) error
-	UpdateConfig(ctx context.Context, id string, config map[string]any) error
+	SetStatus(ctx context.Context, owner, id string, status Status) error
+	UpdateConfig(ctx context.Context, owner, id string, config map[string]any) error
 
-	AddRepo(ctx context.Context, repo *Repo) error
-	RemoveRepo(ctx context.Context, workspaceID, name string) error
-	Repos(ctx context.Context, workspaceID string) ([]*Repo, error)
+	AddRepo(ctx context.Context, owner string, repo *Repo) error
+	RemoveRepo(ctx context.Context, owner, workspaceID, name string) error
+	Repos(ctx context.Context, owner, workspaceID string) ([]*Repo, error)
 
 	// BindSession sets a session's workspace once. A second call for the same
 	// session returns ErrAlreadyBound, whatever the workspace.
-	BindSession(ctx context.Context, sessionID, workspaceID string) error
-	SessionWorkspace(ctx context.Context, sessionID string) (string, error)
+	BindSession(ctx context.Context, owner, sessionID, workspaceID string) error
+	SessionWorkspace(ctx context.Context, owner, sessionID string) (string, error)
 
 	// Sessions lists the session ids bound to a workspace, newest first.
-	Sessions(ctx context.Context, workspaceID string) ([]string, error)
+	Sessions(ctx context.Context, owner, workspaceID string) ([]string, error)
 
 	// AdoptUnboundSessions binds every session of the owner that has no
 	// workspace yet. Used once, when the personal workspace is created, so
