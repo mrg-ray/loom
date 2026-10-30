@@ -15,51 +15,13 @@
 package orchestration
 
 import (
-	"context"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
-	"github.com/teradata-labs/loom/pkg/observability"
-	"github.com/teradata-labs/loom/pkg/shuttle"
-	"go.uber.org/zap/zaptest"
 )
-
-// saysTools answers each tool with the output it was told to, and keeps the
-// parameters every call was made with.
-type saysTools struct {
-	mu     sync.Mutex
-	says   map[string]string
-	params map[string][]map[string]interface{}
-}
-
-func (s *saysTools) Execute(_ context.Context, name string, params map[string]interface{}) (*shuttle.Result, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.params == nil {
-		s.params = map[string][]map[string]interface{}{}
-	}
-	s.params[name] = append(s.params[name], params)
-	return &shuttle.Result{Success: true, Data: s.says[name]}, nil
-}
-
-func runSays(t *testing.T, says map[string]string, sm *loomv1.StateMachinePattern) (*saysTools, *loomv1.WorkflowResult) {
-	t.Helper()
-	tools := &saysTools{says: says}
-	orch := NewOrchestrator(Config{
-		Logger:       zaptest.NewLogger(t),
-		Tracer:       observability.NewNoOpTracer(),
-		ToolExecutor: tools,
-	})
-	p := wrap(sm)
-	p.WorkflowId = "vars"
-	result, err := orch.ExecutePattern(context.Background(), p)
-	require.NoError(t, err)
-	return tools, result
-}
 
 // The engine keeps its own notes beside the run's variables. A state's output
 // writes the run's variables only: it cannot reach a note the engine keeps,
