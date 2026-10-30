@@ -87,6 +87,15 @@ type StopObserver interface {
 	Stopped(ctx context.Context, workflowID, state, signal string, cost float64)
 }
 
+// CheckpointObserver keeps the checkpoint an edge marked checkpoint writes, at
+// the moment it is written — before the move and before any dismissal on the
+// same edge, so it describes the sessions a run resumed from it will find. The
+// engine keeps no checkpoint itself; an observer that does not implement this
+// is not told, and the walk goes on.
+type CheckpointObserver interface {
+	Checkpointed(ctx context.Context, ckpt *loomv1.WorkflowCheckpoint)
+}
+
 // Orchestrator coordinates multiple agents using workflow patterns.
 // It provides a fluent API for building and executing multi-agent workflows
 // like debates, pipelines, and parallel execution.

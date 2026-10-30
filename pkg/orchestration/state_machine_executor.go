@@ -829,10 +829,24 @@ func (e *StateMachineExecutor) resolveTransition(ctx context.Context, state *mac
 	}
 
 	// Order matters: the checkpoint is written before any dismissal on the same
-	// edge, so a resumed run finds the sessions the checkpoint described.
+	// edge, so a resumed run finds the sessions the checkpoint described. It
+	// records the state the edge enters, so a run that dies after crossing it
+	// is taken up there rather than at the state it already finished. A
+	// destination a tool computes is not known yet; that checkpoint records
+	// the state being left, and the run is taken up there.
 	if tr.GetCheckpoint() {
-		if _, err := e.buildCheckpoint(ctx, state, loomv1.SuspendReason_SUSPEND_REASON_UNSPECIFIED, nil); err != nil {
+		// The record is of this walk standing where it will be taken up: a copy
+		// that differs only in that, sharing the walk's variables and results.
+		at := *state
+		if dest := tr.GetNextState(); dest != "" {
+			at.current = dest
+		}
+		ckpt, err := e.buildCheckpoint(ctx, &at, loomv1.SuspendReason_SUSPEND_REASON_UNSPECIFIED, nil)
+		if err != nil {
 			return "", fmt.Errorf("transition checkpoint failed: %w", err)
+		}
+		if keeper, ok := e.orchestrator.observer.(CheckpointObserver); ok {
+			keeper.Checkpointed(ctx, ckpt)
 		}
 	}
 
