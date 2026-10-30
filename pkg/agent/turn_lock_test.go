@@ -248,3 +248,43 @@ func TestAResumedTurnWaitsItsTurn(t *testing.T) {
 	_, err = a.ResumeChat(ctx, "s1", ParkDecision{RequestID: "r1", Approved: true}, nil)
 	require.ErrorIs(t, err, ErrSessionBusy)
 }
+
+// A brand-new session is held by its first turn like any other: a second
+// first turn, on another agent object, is refused rather than writing beside
+// it.
+func TestTheFirstTurnOfANewSessionHoldsIt(t *testing.T) {
+	store := turnStore(t)
+	a, llmA, b, _ := twoObjects(t, store)
+	ctx := context.Background()
+
+	entered, release := llmA.holdNext()
+	done := make(chan error, 1)
+	go func() { _, err := a.Chat(ctx, "fresh", "one"); done <- err }()
+	began(t, entered, done)
+	_, err := b.Chat(ctx, "fresh", "two")
+	require.ErrorIs(t, err, ErrSessionBusy, "a second first turn ran beside the first")
+	release()
+	require.NoError(t, <-done)
+}
+
+// What an agent keeps on its own copy of a session, outside the messages,
+// carries into its next turn: nothing else took a turn, so its copy is current
+// and is not thrown away and reloaded.
+func TestAnAgentsOwnCopySurvivesIntoItsNextTurn(t *testing.T) {
+	store := turnStore(t)
+	a := NewAgent(nil, &gatedLLM{}, WithName("solo"), WithMemory(NewMemoryWithStore(store)))
+	ctx := context.Background()
+
+	_, err := a.Chat(ctx, "kept", "one")
+	require.NoError(t, err)
+	first, ok := a.memory.GetSession("kept")
+	require.True(t, ok)
+	first.Tasks = types.NewTaskList()
+
+	_, err = a.Chat(ctx, "kept", "two")
+	require.NoError(t, err)
+	second, ok := a.memory.GetSession("kept")
+	require.True(t, ok)
+	require.Same(t, first, second, "the session was reloaded at turn two, losing what it held")
+	require.NotNil(t, second.Tasks, "the task list did not survive into turn two")
+}

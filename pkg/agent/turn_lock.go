@@ -84,8 +84,22 @@ func (a *Agent) takeTurn(ctx context.Context, sessionID string) (func(), error) 
 		}
 	}
 	if !claim.Exists {
-		// A first turn: the session has no row for anything else to be in.
-		return func() {}, nil
+		// A first turn: give the session its row, then claim it like any
+		// other. A second first turn racing this one finds the row and is
+		// refused, and this turn's count is recorded, so its own copy of the
+		// session is current at the next turn.
+		session := a.memory.GetOrCreateSessionWithAgent(ctx, sessionID, a.config.Name, "")
+		if err := a.memory.PersistSession(ctx, session); err != nil {
+			return nil, fmt.Errorf("create session %s for its first turn: %w", sessionID, err)
+		}
+		claim, err = store.TakeTurn(ctx, sessionID, holder, "", time.Now().Add(-turnStaleAfter))
+		if err != nil {
+			return nil, err
+		}
+		if !claim.Exists {
+			// The store did not keep the row — an owner it will not write for.
+			return nil, fmt.Errorf("session %s could not be created for its first turn", sessionID)
+		}
 	}
 	if !claim.Taken {
 		return nil, &SessionBusyError{SessionID: sessionID, Holder: claim.Holder}
