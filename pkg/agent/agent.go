@@ -2275,27 +2275,33 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	// Add assistant response to history. response.Usage is the final LLM
 	// call's Usage (last-turn); intermediate tool-use turns already wrote
 	// their own rows above, so SUM(messages.cost) over the session equals
-	// the whole conversation's cost.
-	_, replyPersisted := a.appendMessage(ctx, session, Message{
-		Role: "assistant",
-		// Turn-ending message: thinking text rides for persistence; blocks
-		// would be stripped by the next turn's compile, so none are carried.
-		Content:           response.Content,
-		Thinking:          response.Thinking,
-		AgentID:           a.GetID(), // Track which agent generated this response
-		Timestamp:         time.Now(),
-		TokenCount:        response.Usage.TotalTokens,
-		CostUSD:           response.Usage.CostUSD,
-		InputTokens:       response.Usage.InputTokens,
-		OutputTokens:      response.Usage.OutputTokens,
-		CacheReadTokens:   response.Usage.CacheReadInputTokens,
-		CacheCreateTokens: response.Usage.CacheCreationInputTokens,
+	// the whole conversation's cost. A turn a tool ended has no final call:
+	// its words were stored with the call that ended it, and that step was
+	// pruned when its rows proved durable, so the finished-turn prune waits
+	// for a turn with a reply row.
+	replyPersisted := false
+	if _, ended := response.Metadata["ended_by"]; !ended {
+		_, replyPersisted = a.appendMessage(ctx, session, Message{
+			Role: "assistant",
+			// Turn-ending message: thinking text rides for persistence; blocks
+			// would be stripped by the next turn's compile, so none are carried.
+			Content:           response.Content,
+			Thinking:          response.Thinking,
+			AgentID:           a.GetID(), // Track which agent generated this response
+			Timestamp:         time.Now(),
+			TokenCount:        response.Usage.TotalTokens,
+			CostUSD:           response.Usage.CostUSD,
+			InputTokens:       response.Usage.InputTokens,
+			OutputTokens:      response.Usage.OutputTokens,
+			CacheReadTokens:   response.Usage.CacheReadInputTokens,
+			CacheCreateTokens: response.Usage.CacheCreationInputTokens,
 
-		CacheCreate1hTokens: response.Usage.CacheCreation1hInputTokens,
-		CacheCreate5mTokens: response.Usage.CacheCreation5mInputTokens,
-		ThinkingTokens:      response.Usage.ThinkingTokens,
-		Effort:              response.Usage.Effort,
-	}, false)
+			CacheCreate1hTokens: response.Usage.CacheCreation1hInputTokens,
+			CacheCreate5mTokens: response.Usage.CacheCreation5mInputTokens,
+			ThinkingTokens:      response.Usage.ThinkingTokens,
+			Effort:              response.Usage.Effort,
+		}, false)
+	}
 	a.pruneFinishedTurn(ctx, session.ID, replyPersisted)
 
 	// Persist session
@@ -3571,6 +3577,20 @@ func (a *Agent) runConversationLoop(ctx Context) (resp *Response, err error) {
 		// failed to persist, a resume after a crash reads a session without
 		// them and must find this step's events to avoid re-running a call.
 		a.pruneStepIfResolved(ctx, session.ID, thisStep, assistantPersisted && !st.rowNotPersisted)
+		if st.endedBy != "" {
+			return &Response{
+				Content:        llmResp.Content,
+				Usage:          llmResp.Usage,
+				TurnUsage:      turnUsage,
+				ToolExecutions: allToolExecutions,
+				Thinking:       llmResp.Thinking,
+				Metadata: map[string]interface{}{
+					"turns":           turnCount,
+					"tool_executions": toolExecutionCount,
+					"ended_by":        st.endedBy,
+				},
+			}, nil
+		}
 	}
 
 	// If we hit max turns/executions, make one final LLM call to synthesize results
@@ -3596,6 +3616,9 @@ type batchState struct {
 	turnToolCount   int
 	turnDedup       map[string]*shuttle.Result
 	pendingSidecars []Message
+	// endedBy names a tool whose result ended the turn: the model is not
+	// asked for anything more once it is in place.
+	endedBy string
 
 	stepIndex int // the execution-event-log step this batch's calls are recorded under
 	// stepErr is set when stepIndex could not be resolved. No call may be
@@ -3628,6 +3651,12 @@ type batchState struct {
 	// dispatch attributes.
 	barrierReason string
 }
+
+// EndsTurnKey is the result metadata a tool sets to end the turn it ran in.
+// The turn's reply is then the words the model said alongside the call, and
+// nothing is generated after it: for a tool that hands something off, where
+// anything said afterwards would be said to nobody.
+const EndsTurnKey = "end_turn"
 
 // dispatchOneCall runs one call of a tool batch through the full per-call
 // ceremony — caps, dedup, progress emits, spans, execution with
@@ -4014,6 +4043,12 @@ func (a *Agent) commitToolRow(ctx Context, session *Session, toolCall ToolCall, 
 		})
 		st.recovery.setRepeatHint(strings.Join(strings.Fields(msg), " "))
 		span.AddEvent("recovery.repeat_hint", map[string]interface{}{"tool_name": toolCall.Name, "count": n})
+	}
+
+	if result != nil && result.Metadata != nil {
+		if ends, _ := result.Metadata[EndsTurnKey].(bool); ends {
+			st.endedBy = toolCall.Name
+		}
 	}
 
 	// Add tool result to conversation
