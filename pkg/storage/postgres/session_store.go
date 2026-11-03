@@ -1251,4 +1251,37 @@ func (s *SessionStore) MaxTurn(ctx context.Context, sessionID string) (int, erro
 	return *turn, nil
 }
 
-var _ agent.Rewinder = (*SessionStore)(nil)
+// Turns is how many turns the session has had; 0 for a session with no row.
+func (s *SessionStore) Turns(ctx context.Context, sessionID string) (int64, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "pg_session_store.turns")
+	defer s.tracer.EndSpan(span)
+
+	var turns int64
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		err := tx.QueryRow(ctx,
+			`SELECT turns FROM sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+			sessionID, UserIDFromContext(ctx)).Scan(&turns)
+		if errors.Is(err, pgx.ErrNoRows) {
+			turns = 0
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		span.RecordError(err)
+		return 0, fmt.Errorf("read the turn count of session %s: %w", sessionID, err)
+	}
+	return turns, nil
+}
+
+// CountTurn counts one more turn for the session.
+func (s *SessionStore) CountTurn(ctx context.Context, sessionID string) error {
+	return execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE sessions SET turns = turns + 1 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+			sessionID, UserIDFromContext(ctx))
+		return err
+	})
+}
+
+var _ agent.TurnCounter = (*SessionStore)(nil)

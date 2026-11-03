@@ -79,6 +79,7 @@ func TestLoadMigrations_SpecificVersions(t *testing.T) {
 		{26, "execution_events", "CREATE TABLE execution_events"},
 		{27, "decision_shadow", "CREATE TABLE IF NOT EXISTS decision_shadow"},
 		{28, "message_billing", "cache_create_1h_tokens"},
+		{29, "session_turns", "turns"},
 	}
 
 	for _, tt := range tests {

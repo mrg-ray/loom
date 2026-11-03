@@ -17,6 +17,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -197,6 +198,25 @@ func (s *EventLogStore) execLease(ctx context.Context, query, sessionID, holder 
 		return false, err
 	}
 	return n == 1, nil
+}
+
+// SessionLeaseHolder is who holds the session's unexpired lease, or "".
+func (s *EventLogStore) SessionLeaseHolder(ctx context.Context, sessionID string) (string, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "sqlite.event_log.session_lease_holder")
+	defer s.tracer.EndSpan(span)
+
+	var holder string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT holder FROM execution_leases
+		 WHERE user_id = ? AND session_id = ? AND expires_at >= julianday('now')`,
+		types.UserIDOrDefault(ctx), sessionID).Scan(&holder)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", recordSpanError(span, fmt.Errorf("read session lease holder: %w", err))
+	}
+	return holder, nil
 }
 
 func (s *EventLogStore) ReleaseSessionLease(ctx context.Context, sessionID, holder string) error {

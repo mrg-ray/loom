@@ -18,7 +18,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -86,25 +90,50 @@ func leaseLostError(ctx context.Context, err error) error {
 //
 // It returns a context that is cancelled with cause ErrSessionLeaseLost if the
 // lease is lost, and a release function the caller must defer. The lease is
-// renewed every TTL/3 while held. Without an event log it returns ctx
+// renewed every TTL/3 while held. Without a lease store it returns ctx
 // unchanged and a no-op release.
+//
+// The holder names this process, pid@host, so a lease left by a process that
+// died on this host is released and taken at once rather than after its TTL;
+// a holder elsewhere is waited out. Taking the lease also counts the turn
+// (TurnCounter): an agent object whose copy of the session is from fewer turns
+// than the session has had drops it and loads fresh.
 func (a *Agent) holdSessionLease(ctx context.Context, sessionID string) (context.Context, func(), error) {
-	if a.eventLog == nil {
+	leases := a.leaseStore()
+	if leases == nil {
 		return ctx, func() {}, nil
 	}
 	ttl := a.sessionLeaseTTL()
-	holder := uuid.NewString()
+	holder := thisProcess + "/" + uuid.NewString()
 
 	// The store stamps the expiry somewhere inside the acquire call, so the
 	// lease is vouched for from before the call, not after it returns.
 	acquireBegan := time.Now()
-	won, err := a.eventLog.AcquireSessionLease(ctx, sessionID, holder, ttl)
+	won, err := leases.AcquireSessionLease(ctx, sessionID, holder, ttl)
 	if err != nil {
 		return nil, nil, fmt.Errorf("taking the session lease: %w", err)
 	}
 	if !won {
-		return nil, nil, fmt.Errorf("session %s: %w", sessionID, ErrSessionBusy)
+		// A lease held by a process that died on this host would block the
+		// session until its TTL ran out; release it and take the lease now.
+		current, err := leases.SessionLeaseHolder(ctx, sessionID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("reading the session lease: %w", err)
+		}
+		if current != "" && deadHere(current) {
+			if err := leases.ReleaseSessionLease(ctx, sessionID, current); err != nil {
+				return nil, nil, fmt.Errorf("releasing a dead process's session lease: %w", err)
+			}
+			acquireBegan = time.Now()
+			if won, err = leases.AcquireSessionLease(ctx, sessionID, holder, ttl); err != nil {
+				return nil, nil, fmt.Errorf("taking the session lease: %w", err)
+			}
+		}
+		if !won {
+			return nil, nil, fmt.Errorf("session %s: %w", sessionID, ErrSessionBusy)
+		}
 	}
+	turns := a.beginTurnCount(ctx, sessionID)
 
 	leaseCtx, cancel := context.WithCancelCause(ctx)
 	// Renewal and release must outlive a cancelled turn, but keep its values
@@ -141,7 +170,7 @@ func (a *Agent) holdSessionLease(ctx context.Context, sessionID string) (context
 				return
 			}
 			renewCtx, cancelRenew := context.WithTimeout(storeCtx, budget)
-			held, err := a.eventLog.RenewSessionLease(renewCtx, sessionID, holder, ttl)
+			held, err := leases.RenewSessionLease(renewCtx, sessionID, holder, ttl)
 			cancelRenew()
 			switch {
 			case err == nil && held:
@@ -170,10 +199,55 @@ func (a *Agent) holdSessionLease(ctx context.Context, sessionID string) (context
 		// lease expires on its own if the release does not land.
 		releaseCtx, cancelRelease := context.WithTimeout(storeCtx, ttl/3)
 		defer cancelRelease()
-		if err := a.eventLog.ReleaseSessionLease(releaseCtx, sessionID, holder); err != nil {
+		// The turn is counted while the lease is still held, so the count
+		// and the history it stands for change under one lock.
+		a.endTurnCount(releaseCtx, sessionID, turns)
+		if err := leases.ReleaseSessionLease(releaseCtx, sessionID, holder); err != nil {
 			zap.L().Warn("failed to release session lease; it expires on its own",
 				zap.String("session_id", sessionID), zap.Duration("ttl", ttl), zap.Error(err))
 		}
 	}
 	return leaseCtx, release, nil
+}
+
+// thisProcess is this process as a lease holder names it: pid@host.
+var thisProcess = func() string {
+	host, _ := os.Hostname()
+	return fmt.Sprintf("%d@%s", os.Getpid(), host)
+}()
+
+// deadHere is a lease holder that names a process on this host which no
+// longer exists. A holder from another host, or one this code did not name
+// (no pid@host prefix), is never dead here.
+func deadHere(holder string) bool {
+	pidHost, _, _ := strings.Cut(holder, "/")
+	pidText, host, ok := strings.Cut(pidHost, "@")
+	if !ok {
+		return false
+	}
+	if here, _ := os.Hostname(); host != here {
+		return false
+	}
+	pid, err := strconv.Atoi(pidText)
+	if err != nil || pid <= 0 || pid == os.Getpid() {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return true
+	}
+	err = proc.Signal(syscall.Signal(0))
+	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH)
+}
+
+// leaseStore is where this agent holds session leases: the store attached for
+// that (WithSessionLeases), else the event log, which carries the lease too.
+func (a *Agent) leaseStore() eventlog.SessionLeaseStore {
+	if a.sessionLeases != nil {
+		return a.sessionLeases
+	}
+	if a.eventLog != nil {
+		return a.eventLog
+	}
+	return nil
 }

@@ -229,3 +229,31 @@ func TestEventLogStore_TenantIsolation(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, held, "user B released user A's lease")
 }
+
+// The holder of a live lease is readable; an expired lease has none, so a
+// dead process's lease can be told from a live one before it is released.
+func TestEventLogStore_SessionLeaseHolder(t *testing.T) {
+	db := migratedDB(t)
+	store := NewEventLogStore(db, nil)
+	ctx := context.Background()
+	sessionID := seedEventLogSessionSQLite(t, db)
+
+	holder, err := store.SessionLeaseHolder(ctx, sessionID)
+	require.NoError(t, err)
+	require.Empty(t, holder, "a session nobody holds has a holder")
+
+	won, err := store.AcquireSessionLease(ctx, sessionID, "h1", time.Minute)
+	require.NoError(t, err)
+	require.True(t, won)
+	holder, err = store.SessionLeaseHolder(ctx, sessionID)
+	require.NoError(t, err)
+	require.Equal(t, "h1", holder)
+
+	require.NoError(t, store.ReleaseSessionLease(ctx, sessionID, "h1"))
+	won, err = store.AcquireSessionLease(ctx, sessionID, "h2", -time.Second)
+	require.NoError(t, err)
+	require.True(t, won)
+	holder, err = store.SessionLeaseHolder(ctx, sessionID)
+	require.NoError(t, err)
+	require.Empty(t, holder, "an expired lease still names its holder")
+}

@@ -106,6 +106,11 @@ func (r *recordingEventLog) ReleaseSessionLease(ctx context.Context, sessionID, 
 	}
 	return nil
 }
+func (r *recordingEventLog) SessionLeaseHolder(ctx context.Context, sessionID string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.claims[sessionID], nil
+}
 func (r *recordingEventLog) PruneStepsBefore(ctx context.Context, sessionID string, stepIndex int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

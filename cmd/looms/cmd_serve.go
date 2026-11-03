@@ -1336,13 +1336,18 @@ func runServe(cmd *cobra.Command, args []string) {
 	// below records it, so `loom sessions resume` can finish a turn a crash
 	// interrupted. Enabled on a backend without support is a startup error,
 	// not a silent no-op: resume would then refuse every turn.
+	// The session lease is the log's lock and holds on every backend that has
+	// the log's tables, recording on or off: one turn at a time per session.
 	var executionLog eventlog.EventLogStore
+	var sessionLeases eventlog.SessionLeaseStore
+	if elp, ok := storageBackend.(backend.EventLogProvider); ok && elp.EventLogStore() != nil {
+		sessionLeases = elp.EventLogStore()
+	}
 	if config.ExecutionLog.Enabled {
-		elp, ok := storageBackend.(backend.EventLogProvider)
-		if !ok || elp.EventLogStore() == nil {
+		if sessionLeases == nil {
 			logger.Fatal("execution_log.enabled is set, but the storage backend does not provide an execution log")
 		}
-		executionLog = elp.EventLogStore()
+		executionLog = sessionLeases.(eventlog.EventLogStore)
 		logger.Info("Execution log enabled: agents record write-ahead events for crash resume")
 	}
 
@@ -1857,6 +1862,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		AdmissionChain:    admissionChain,
 		IdentityResolver:  postgres.UserIDFromContext,
 		EventLogStore:     executionLog,
+		SessionLeaseStore: sessionLeases,
 	})
 	if err != nil {
 		logger.Warn("Failed to create agent registry", zap.Error(err))
@@ -2067,7 +2073,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				// deployment. A nil chain leaves tool execution a pass-through.
 				agentOpts = append(agentOpts, agent.WithAdmissionHooks(admissionChain))
 				agentOpts = append(agentOpts, agent.WithIdentityResolver(postgres.UserIDFromContext))
-				agentOpts = append(agentOpts, agent.WithEventLog(executionLog))
+				agentOpts = append(agentOpts, agent.WithEventLog(executionLog), agent.WithSessionLeases(sessionLeases))
 
 				// Determine LLM provider for this agent
 				// If agent has specific LLM config, use it; otherwise use server default
@@ -3386,7 +3392,7 @@ func runServe(cmd *cobra.Command, args []string) {
 			// deployment. A nil chain leaves tool execution a pass-through.
 			agentOpts = append(agentOpts, agent.WithAdmissionHooks(admissionChain))
 			agentOpts = append(agentOpts, agent.WithIdentityResolver(postgres.UserIDFromContext))
-			agentOpts = append(agentOpts, agent.WithEventLog(executionLog))
+			agentOpts = append(agentOpts, agent.WithEventLog(executionLog), agent.WithSessionLeases(sessionLeases))
 
 			// Wrap LLM provider with instrumentation for observability
 			if tracer != nil {

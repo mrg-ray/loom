@@ -401,6 +401,10 @@ func (s *SessionStore) initSchema() error {
 		// so a task's timeline can be reconstructed from the rows that already
 		// record the work. NULL for ordinary chat.
 		"task_id": "ALTER TABLE messages ADD COLUMN task_id TEXT",
+		// turns is how many turns the session has had (session_turns.go): an
+		// agent object whose copy is from fewer turns reloads it. 0 is every
+		// existing row.
+		"turns": "ALTER TABLE sessions ADD COLUMN turns INTEGER NOT NULL DEFAULT 0",
 	}
 
 	for columnName, migration := range agentMemoryMigrations {

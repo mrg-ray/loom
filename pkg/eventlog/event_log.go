@@ -74,6 +74,33 @@ type ExecutionEvent struct {
 //
 // Every method acts as the caller identity in ctx (types.UserIDFromContext):
 // a caller reads and writes only its own sessions' events and leases.
+// SessionLeaseStore holds one session's lease: the lock that lets one process
+// at a time drive a session's conversation loop. It is the event log's lock,
+// and it holds whether or not the agent records events: two turns writing one
+// session's history at once interleave it, recorded or not.
+type SessionLeaseStore interface {
+	// AcquireSessionLease makes holder the only process driving sessionID's
+	// conversation loop for ttl. It succeeds when no lease exists, the
+	// existing lease has expired, or holder already holds it. Expiry uses the
+	// database clock, so replicas with skewed clocks agree.
+	AcquireSessionLease(ctx context.Context, sessionID, holder string, ttl time.Duration) (bool, error)
+
+	// RenewSessionLease extends holder's lease to now+ttl. It returns false
+	// when holder no longer holds the lease (another holder took it after it
+	// expired); the caller must then stop dispatching calls.
+	RenewSessionLease(ctx context.Context, sessionID, holder string, ttl time.Duration) (bool, error)
+
+	// ReleaseSessionLease removes holder's lease. A lease held by someone
+	// else, or no lease, is a no-op.
+	ReleaseSessionLease(ctx context.Context, sessionID, holder string) error
+
+	// SessionLeaseHolder is who holds sessionID's lease now, or "" when nobody
+	// does or the lease has expired. A holder on this host that no longer
+	// runs is released by the caller and the lease taken at once, instead of
+	// waiting out its TTL.
+	SessionLeaseHolder(ctx context.Context, sessionID string) (string, error)
+}
+
 type EventLogStore interface {
 	// RecordIntent durably writes an *_intent event before the corresponding
 	// LLM or tool call executes. The caller must treat a failure as a
@@ -97,20 +124,7 @@ type EventLogStore interface {
 	// events are recorded.
 	NextStepIndex(ctx context.Context, sessionID string) (int, error)
 
-	// AcquireSessionLease makes holder the only process driving sessionID's
-	// conversation loop for ttl. It succeeds when no lease exists, the
-	// existing lease has expired, or holder already holds it. Expiry uses the
-	// database clock, so replicas with skewed clocks agree.
-	AcquireSessionLease(ctx context.Context, sessionID, holder string, ttl time.Duration) (bool, error)
-
-	// RenewSessionLease extends holder's lease to now+ttl. It returns false
-	// when holder no longer holds the lease (another holder took it after it
-	// expired); the caller must then stop dispatching calls.
-	RenewSessionLease(ctx context.Context, sessionID, holder string, ttl time.Duration) (bool, error)
-
-	// ReleaseSessionLease removes holder's lease. A lease held by someone
-	// else, or no lease, is a no-op.
-	ReleaseSessionLease(ctx context.Context, sessionID, holder string) error
+	SessionLeaseStore
 
 	// PruneResolvedStep deletes every event for one (sessionID, stepIndex),
 	// once every call in that step is confirmed complete.

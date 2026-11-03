@@ -250,3 +250,28 @@ func TestEventLogStore_TenantIsolation(t *testing.T) {
 	}))
 	require.Zero(t, visible, "row-level security let user B see user A's events")
 }
+
+// The holder of a live lease is readable; an expired lease has none.
+func TestEventLogStore_SessionLeaseHolder(t *testing.T) {
+	f := newEventLogFixture(t)
+	ctx, sessionID := f.session(t)
+
+	holder, err := f.store.SessionLeaseHolder(ctx, sessionID)
+	require.NoError(t, err)
+	require.Empty(t, holder, "a session nobody holds has a holder")
+
+	won, err := f.store.AcquireSessionLease(ctx, sessionID, "h1", time.Minute)
+	require.NoError(t, err)
+	require.True(t, won)
+	holder, err = f.store.SessionLeaseHolder(ctx, sessionID)
+	require.NoError(t, err)
+	require.Equal(t, "h1", holder)
+
+	require.NoError(t, f.store.ReleaseSessionLease(ctx, sessionID, "h1"))
+	won, err = f.store.AcquireSessionLease(ctx, sessionID, "h2", -time.Second)
+	require.NoError(t, err)
+	require.True(t, won)
+	holder, err = f.store.SessionLeaseHolder(ctx, sessionID)
+	require.NoError(t, err)
+	require.Empty(t, holder, "an expired lease still names its holder")
+}

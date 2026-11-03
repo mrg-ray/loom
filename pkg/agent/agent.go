@@ -773,12 +773,28 @@ func WithSkillTaskEmitter(e *skilltasks.Emitter) Option {
 }
 
 // WithEventLog enables the durable, tool-call-granularity execution log
-// (issue #229) for crash-resumable conversation loops. A nil store leaves
-// recording disabled — every write-ahead call becomes a no-op, and
-// ResumeSession is unavailable (returns ErrEventLogDisabled).
+// (issue #229) for crash-resumable conversation loops, and holds the session
+// lease on that store. A nil store leaves recording disabled — every
+// write-ahead call becomes a no-op, and ResumeSession is unavailable (returns
+// ErrEventLogDisabled).
 func WithEventLog(store eventlog.EventLogStore) Option {
 	return func(a *Agent) {
 		a.eventLog = store
+		if store != nil {
+			a.sessionLeases = store
+		}
+	}
+}
+
+// WithSessionLeases holds the session lease on store without recording
+// events: one turn at a time per session, whichever process or agent object
+// runs it. The lease is the lock the event log uses; a backend that has the
+// log's tables has the lock, whether or not recording is on.
+func WithSessionLeases(store eventlog.SessionLeaseStore) Option {
+	return func(a *Agent) {
+		if store != nil {
+			a.sessionLeases = store
+		}
 	}
 }
 
@@ -2079,6 +2095,10 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	}
 	defer releaseLease()
 	defer func() { retErr = leaseLostError(ctx, retErr) }()
+	// Taking the lease drops this object's copy of the session when another
+	// turn has made it stale (session_turns.go), so the copy is read again
+	// here, under the lease; a copy that was current is the same object.
+	session = a.memory.GetOrCreateSessionWithAgent(ctx, sessionID, a.config.Name, "")
 
 	// A session holding backend leases from a previous turn starts this turn
 	// in the RESOURCE_HOLDER class — the previous turn's SlotInfo died with

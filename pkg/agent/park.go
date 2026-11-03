@@ -1003,6 +1003,7 @@ func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkD
 	if a.hitlPark == nil {
 		return nil, ErrParkDisabled
 	}
+
 	ctx = session.WithSessionID(ctx, sessionID)
 
 	// One resume at a time per session, PER AGENT INSTANCE. The tail walk
