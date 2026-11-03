@@ -89,3 +89,16 @@ func TestOnlyALocalDeadProcessIsDead(t *testing.T) {
 	require.False(t, deadHere(fmt.Sprintf("%d@%s/abcd", os.Getpid(), host)), "this process was judged dead")
 	require.True(t, deadHere(fmt.Sprintf("%d@%s/abcd", 1<<22-1, host)), "a dead local process was not judged dead")
 }
+
+// A rewind of a session with no row does nothing and creates nothing.
+func TestARewindOfASessionWithNoRowDoesNothing(t *testing.T) {
+	store := turnStore(t)
+	a, _, _, _ := twoObjects(t, store, &recordingEventLog{})
+	ctx := context.Background()
+	n, err := a.RewindSession(ctx, "never-existed", 1)
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+	ok, err := store.SessionExists(ctx, "never-existed")
+	require.NoError(t, err)
+	require.False(t, ok, "a rewind created a session row")
+}

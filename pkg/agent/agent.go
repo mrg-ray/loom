@@ -5654,6 +5654,15 @@ func (a *Agent) RewindSession(ctx context.Context, sessionID string, turns int) 
 	if !ok {
 		return 0, ErrRewindUnsupported
 	}
+	// A session with no row has no history to undo, and must get none from
+	// this: the lease row would reference a session that does not exist.
+	exists, err := a.memory.GetStore().SessionExists(ctx, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, nil
+	}
 	// A rewind is a turn in the session's history like any other: it takes
 	// the session lease, so it never cuts under a running turn and is refused
 	// as busy while one runs, and it counts as a turn, so every other object
