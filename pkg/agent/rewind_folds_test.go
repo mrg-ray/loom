@@ -140,7 +140,7 @@ func TestARewindAcrossAnUnplacedFoldIsRefused(t *testing.T) {
 // shown the rows the fold had folded.
 func TestTheModelDoesNotSeeAFoldOfAnUndoneTurn(t *testing.T) {
 	store := turnStore(t)
-	a, llmA, _, _ := twoObjects(t, store)
+	a, llmA, _, _ := twoObjects(t, store, &recordingEventLog{})
 	ctx := context.Background()
 	_, err := a.Chat(ctx, "s1", "one-KEPT")
 	require.NoError(t, err)

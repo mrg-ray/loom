@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1903,12 +1904,7 @@ func (s *MultiAgentServer) spawnWorkflowSubAgents(ctx context.Context, coordinat
 						zap.String("from_agent", queueMsg.FromAgent),
 						zap.String("message_id", queueMsg.ID),
 						zap.Error(err))
-					if reqErr := s.messageQueue.Requeue(turnIdentityCtx, queueMsg.ID); reqErr != nil { // #nosec -- intentional: background worker goroutine that must outlive request context
-						s.logger.Error("Sub-agent response could not be requeued and is lost",
-							zap.String("coordinator", coordinatorID),
-							zap.String("message_id", queueMsg.ID),
-							zap.Error(reqErr))
-					}
+					returnUndelivered(turnIdentityCtx, s.messageQueue, s.logger, queueMsg.ID, err) // #nosec -- intentional: background worker goroutine that must outlive request context
 					continue
 				}
 				if err != nil {
@@ -2280,6 +2276,26 @@ func (s *MultiAgentServer) processCoordinatorBroadcastMessages(
 				zap.String("from_agent", msg.FromAgent),
 				zap.String("topic", busMsg.topic))
 		}
+	}
+}
+
+// returnUndelivered puts a queued message the session did not hear back for
+// the queue monitor to offer again. A session busy with another turn has not
+// heard it: it is deferred, without counting against its retries, since a
+// busy session is not a failed attempt; a busy session never uses up a
+// message's retries. Any other reason the prompt never arrived counts as a
+// delivery, and the queue's retry limit bounds how often that happens.
+func returnUndelivered(ctx context.Context, q *communication.MessageQueue, logger *zap.Logger, id string, cause error) {
+	if errors.Is(cause, agent.ErrSessionBusy) {
+		if err := q.Defer(ctx, id); err != nil {
+			logger.Error("Session busy and the message could not be deferred; it is lost",
+				zap.String("message_id", id), zap.Error(err))
+		}
+		return
+	}
+	if err := q.Requeue(ctx, id); err != nil {
+		logger.Error("Message could not be requeued and is lost",
+			zap.String("message_id", id), zap.Error(err))
 	}
 }
 
@@ -2804,12 +2820,7 @@ func (s *MultiAgentServer) runWorkflowSubAgent(ctx context.Context, ag *agent.Ag
 						// queue monitor to offer again.
 						requeueCtx := turnIdentityContext(ctx)
 						for _, msgID := range messageIDs {
-							if reqErr := s.messageQueue.Requeue(requeueCtx, msgID); reqErr != nil {
-								s.logger.Error("Message could not be requeued and is lost",
-									zap.String("agent", agentID),
-									zap.String("message_id", msgID),
-									zap.Error(reqErr))
-							}
+							returnUndelivered(requeueCtx, s.messageQueue, s.logger, msgID, err)
 						}
 						s.logger.Warn("Sub-agent session unavailable; left messages for redelivery",
 							zap.String("agent", agentID),
