@@ -5634,6 +5634,15 @@ func (a *Agent) RewindSession(ctx context.Context, sessionID string, turns int) 
 	if !ok {
 		return 0, ErrRewindUnsupported
 	}
+	// A rewind is a turn in the session's history like any other: it takes
+	// the session lease, so it never cuts under a running turn and is refused
+	// as busy while one runs, and it counts as a turn, so every other object
+	// holding the session reloads it.
+	ctx, releaseLease, err := a.holdSessionLease(ctx, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	defer releaseLease()
 
 	maxTurn, err := store.MaxTurn(ctx, sessionID)
 	if err != nil {
