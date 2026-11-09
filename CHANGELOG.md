@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Config.** `llm.max_model_context_tokens`: the window a model is served with when a server caps it below the model's listing (vLLM `--max-model-len`, TGI `--max-total-tokens`); the step in flight is fitted to it before the send. `memory_compression.protected_recent_turns`: the recent turns of either role a fold keeps (default 16). `CostStorage.SessionCost` on both stores: a session's cost from its billed rows.
 
+#### Turn and session control for multi-caller sessions
+- **One turn at a time per session, on the session lease.** The lease the execution log holds (#492) is the lock, and it now holds whether or not the agent records events: `looms serve` attaches the lease store to every agent on a backend that has the log's tables, and `execution_log.enabled` gates recording only. A Go build holds it through `agent.WithSessionLeases`, or `WithEventLog` as before. The holder names its process, `pid@host`, so a lease a process left when it died on this host is released and taken at once (`SessionLeaseStore.SessionLeaseHolder`, both stores); a holder elsewhere is waited out. The session row counts its turns (Postgres migration 000029, the SQLite `turns` column): an agent object whose copy of a session is from fewer turns than the session has had drops it and loads fresh, so a turn never writes over history another turn made.
+- **Undo the last turns of a session.** `Agent.RewindSession(ctx, sessionID, n)` removes the last n turns' rows (`SessionStorage` gains `MaxTurn` and `TruncateFrom`), takes the folds of those turns with it (a fold records the turn and rows it covers, `EncodeFoldRecord` / `DecodeFoldRecord`; a rewind across a fold loom cannot place is refused), rebuilds the session's active skills from the history that remains, and is refused as busy while a turn runs. A rewind counts as a turn, so every other object holding the session reloads it. Postgres migration 000030 indexes messages by `(session_id, turn)`.
+- **A tool can end the turn it ran in.** A tool result carrying `agent.EndsTurnKey` ends the turn after its batch: the turn's words are stored with the call that ended it, the response reports the tool as its stop reason, and the resume path ends the turn the same way. An ended turn reads its own batch on resume and runs no hygiene.
+- **Tools work in the turn's own directory.** `shuttle.ContextWithWorkDir` sets the directory every path tool, and workflow visualization, resolves relative paths against for that turn; a relative directory is made absolute.
+- **A turn's input carries its origin**, and the rows it writes inherit it.
+- **A failed turn reports what it spent.** `agent.TurnFailed` wraps the error with the turn's usage.
+- **Background work detaches from the caller's progress stream.** `agent.ContextWithoutProgressCallback` drops only the callback; `ChatWithProgressAs` runs a turn under a named session context.
+
 #### Models and providers
 - **Catalog**: Claude Opus 5 and Sonnet 5 direct; on Bedrock, Opus 5, Sonnet 5 and Fable 5 (`us.` and `global.` routes) and the non-Anthropic Converse families (GLM-5, GLM-4.7, GLM-4.7 Flash, DeepSeek V3.2, V3.1, R1) at Anthropic's published rates for the Claude 5 entries, which the AWS Price List does not carry, and the AWS us-west-2 on-demand rates for the rest.
 - **Bedrock stamps the effort a call was made at** on the usage record: the effort sent, or nothing when none was (the model's own default then applies).
@@ -63,6 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`agent.Config.GraphMemoryAgentID` keys graph memory instead of the agent name.** Graph memory reads and writes were keyed by `Config.Name`, so renaming an agent orphaned its memories. Set `GraphMemoryAgentID` to an ID that survives renames; empty keeps the name (unchanged behaviour). The agent's own ID is not a fallback: it is a fresh UUID per instance. Rows written under an earlier name are not re-keyed; re-key them in the embedder's own data migration. Go-only (no YAML or proto field): set it with `agent.WithGraphMemoryAgentID(id)` or via `WithConfig`; two agents given the same ID share one graph. The `graph_memory.recall` span carries the key as `graph_memory.agent_key`.
 
 ### Fixed
+
+#### Server: a busy session never uses up a queued message's retries
+- A queued message the session could not take because it was busy with another turn is deferred (`MessageQueue.Defer`): back to the queue without counting against its retries, offered again by the monitor. A busy session is not a failed attempt. Any other reason the prompt never arrived is requeued as before, bounded by the queue's retry limit. Both queued paths, coordinator and sub-agent, settle this way.
 
 #### LLM transport
 - **The Bedrock Anthropic-SDK client sends a tool schema with no `type` as `object`**, as the raw-HTTP path already did; the top level of a tool's input is an object.
