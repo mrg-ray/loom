@@ -17,6 +17,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"go.uber.org/zap/zaptest"
@@ -123,5 +124,28 @@ func TestABusyRefusalThroughInjectionIsDeferred(t *testing.T) {
 	}
 	if again.DequeueCount != 1 {
 		t.Fatalf("a busy refusal was charged as a delivery: count %d, want 1", again.DequeueCount)
+	}
+}
+
+// A broadcast a busy session could not take within the wait is queued for it
+// and comes out of the queue for that agent with its topic and its sender,
+// instead of being dropped.
+func TestABroadcastThatOutlastsTheWaitIsQueued(t *testing.T) {
+	q, err := communication.NewMessageQueue(":memory:", nil, zaptest.NewLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = q.Close() }()
+	ctx := context.Background()
+	if err := queueBroadcast(ctx, q, "coord", "worker-2", "progress", "half done"); err != nil {
+		t.Fatal(err)
+	}
+	m, err := q.Dequeue(ctx, "coord")
+	if err != nil || m == nil {
+		t.Fatalf("the queued broadcast did not come out for its agent: %v %v", m, err)
+	}
+	text := string(m.Payload.GetValue())
+	if m.FromAgent != "worker-2" || m.Metadata["topic"] != "progress" || !strings.Contains(text, "progress") || !strings.Contains(text, "half done") {
+		t.Fatalf("the broadcast lost its sender, topic or words: from=%q meta=%v text=%q", m.FromAgent, m.Metadata, text)
 	}
 }

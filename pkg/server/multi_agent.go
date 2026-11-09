@@ -2260,6 +2260,19 @@ func (s *MultiAgentServer) processCoordinatorBroadcastMessages(
 				return
 			}
 			// A broadcast has no queue behind it to redeliver from.
+			if errors.Is(err, agent.ErrSessionBusy) && s.messageQueue != nil {
+				// Busy past the wait: queued, delivered when the session is
+				// free, never charged a delivery for the busy refusals.
+				if qErr := queueBroadcast(turnIdentityContext(ctx), s.messageQueue, coordinatorID, msg.FromAgent, busMsg.topic, content); qErr == nil {
+					s.logger.Info("Broadcast queued: the coordinator's session is busy past the wait",
+						zap.String("coordinator", coordinatorID),
+						zap.String("from_agent", msg.FromAgent),
+						zap.String("topic", busMsg.topic))
+					continue
+				} else {
+					err = fmt.Errorf("%w; queueing it: %w", err, qErr)
+				}
+			}
 			s.logger.Error("Broadcast message dropped: the coordinator's session stayed unavailable",
 				zap.String("coordinator", coordinatorID),
 				zap.String("from_agent", msg.FromAgent),
@@ -2288,6 +2301,24 @@ func (s *MultiAgentServer) processCoordinatorBroadcastMessages(
 // busy session is not a failed attempt; a busy session never uses up a
 // message's retries. Any other reason the prompt never arrived counts as a
 // delivery, and the queue's retry limit bounds how often that happens.
+// queueBroadcast hands a broadcast the session could not take now to the
+// durable queue, so it is delivered when the session is free. A bus message,
+// once read, cannot be put back on the bus, and a session busy with a long
+// turn outlasts the inject policy's wait; dropping the broadcast then would
+// lose it, so it joins the queue, where a busy session never uses up a
+// message. The queued path renders it as a message from its sender; the
+// topic rides in the text and the metadata.
+func queueBroadcast(ctx context.Context, q *communication.MessageQueue, toAgent, fromAgent, topic, content string) error {
+	return q.Enqueue(ctx, &communication.QueueMessage{
+		ToAgent:     toAgent,
+		FromAgent:   fromAgent,
+		MessageType: "broadcast",
+		Payload: &loomv1.MessagePayload{Data: &loomv1.MessagePayload_Value{
+			Value: []byte(fmt.Sprintf("[BROADCAST on topic '%s']:\n\n%s", topic, content))}},
+		Metadata: map[string]string{"topic": topic},
+	})
+}
+
 func returnUndelivered(ctx context.Context, q *communication.MessageQueue, logger *zap.Logger, id string, cause error) {
 	if errors.Is(cause, agent.ErrSessionBusy) {
 		if err := q.Defer(ctx, id); err != nil {
@@ -2411,6 +2442,17 @@ done:
 				s.logger.Info("Context canceled while delivering broadcast injection",
 					zap.String("sub_agent", subAgentID))
 				return
+			}
+			if errors.Is(err, agent.ErrSessionBusy) && s.messageQueue != nil {
+				if qErr := queueBroadcast(turnIdentityContext(ctx), s.messageQueue, subAgentID, msg.FromAgent, sub.Topic, content); qErr == nil {
+					s.logger.Info("Broadcast queued: the sub-agent's session is busy past the wait",
+						zap.String("sub_agent", subAgentID),
+						zap.String("from_agent", msg.FromAgent),
+						zap.String("topic", sub.Topic))
+					continue
+				} else {
+					err = fmt.Errorf("%w; queueing it: %w", err, qErr)
+				}
 			}
 			s.logger.Error("Broadcast message dropped: the sub-agent's session stayed unavailable",
 				zap.String("sub_agent", subAgentID),
