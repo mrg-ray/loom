@@ -41,7 +41,7 @@ type TurnCounter interface {
 	CountTurn(ctx context.Context, sessionID string) error
 }
 
-// beginTurnCount reads the session's turn count under the lease and drops
+// beginTurnCount reads the session's turn count as a turn begins and drops
 // this object's copy of the session when it is from another count. It
 // returns the count the turn began at.
 func (a *Agent) beginTurnCount(ctx context.Context, sessionID string) int64 {

@@ -47,7 +47,7 @@ func TestARewindIsSeenByEveryObject(t *testing.T) {
 
 // A rewind is refused while a turn runs in the session, and the turn's
 // history is left whole.
-func TestARewindWaitsForTheRunningTurn(t *testing.T) {
+func TestARewindIsRefusedWhileATurnRuns(t *testing.T) {
 	store := turnStore(t)
 	a, llmA, b, _ := twoObjects(t, store, &recordingEventLog{})
 	ctx := context.Background()

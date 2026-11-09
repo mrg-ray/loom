@@ -2283,7 +2283,7 @@ func convertToFTS5Query(query string) string {
 // than relieving it.
 //
 // Turn is the right unit because turn is derived at insert (SaveMessage) as
-// MAX(turn) + 1 on a user message and MAX(turn) otherwise, so one turn already
+// MAX(turn) + 1 on the row that starts a turn and MAX(turn) otherwise, so one turn already
 // groups a user message with every assistant message and tool call it caused.
 // Deleting a turn therefore cannot leave a tool call without its result, or an
 // assistant message answering a prompt that no longer exists — states the

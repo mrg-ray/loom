@@ -1356,3 +1356,4 @@ func (s *SessionStore) CountTurn(ctx context.Context, sessionID string) error {
 }
 
 var _ agent.TurnCounter = (*SessionStore)(nil)
+var _ agent.Rewinder = (*SessionStore)(nil)

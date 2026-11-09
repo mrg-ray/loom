@@ -31,9 +31,10 @@ import (
 	"github.com/teradata-labs/loom/pkg/eventlog"
 )
 
-// ErrSessionBusy is returned by Chat, ResumeChat and ResumeSession on an agent
-// with an event log when another process holds the session's lease: a live
-// turn or a resume is already driving that session's conversation loop.
+// ErrSessionBusy is returned by Chat, ResumeChat, ResumeSession and
+// RewindSession on an agent with a session lease store when another holder,
+// in this process or another, has the session's lease: a live turn, a resume
+// or a rewind is already driving that session's conversation loop.
 var ErrSessionBusy = errors.New("session is being driven by another process")
 
 // ErrSessionLeaseLost is the cancellation cause of a turn's context when its
@@ -95,9 +96,10 @@ func leaseLostError(ctx context.Context, err error) error {
 //
 // The holder names this process, pid@host, so a lease left by a process that
 // died on this host is released and taken at once rather than after its TTL;
-// a holder elsewhere is waited out. Taking the lease also counts the turn
-// (TurnCounter): an agent object whose copy of the session is from fewer turns
-// than the session has had drops it and loads fresh.
+// a holder elsewhere is waited out. Taking the lease reads the session's turn
+// count (TurnCounter) and releasing it counts the turn: an agent object whose
+// copy of the session is from fewer turns than the session has had drops it
+// and loads fresh.
 func (a *Agent) holdSessionLease(ctx context.Context, sessionID string) (context.Context, func(), error) {
 	leases := a.leaseStore()
 	if leases == nil {

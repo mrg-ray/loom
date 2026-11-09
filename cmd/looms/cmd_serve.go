@@ -1336,19 +1336,21 @@ func runServe(cmd *cobra.Command, args []string) {
 	// below records it, so `loom sessions resume` can finish a turn a crash
 	// interrupted. Enabled on a backend without support is a startup error,
 	// not a silent no-op: resume would then refuse every turn.
-	// The session lease is the log's lock and holds on every backend that has
-	// the log's tables, recording on or off: one turn at a time per session.
+	// The session lease is the log's lock and holds on every backend whose
+	// database has the log's tables, recording on or off: one turn at a time
+	// per session. A database the migrations have not reached runs turns
+	// unlocked, and says so once; with recording asked for it is a startup
+	// error, since resume would then refuse every turn.
 	var executionLog eventlog.EventLogStore
-	var sessionLeases eventlog.SessionLeaseStore
-	if elp, ok := storageBackend.(backend.EventLogProvider); ok && elp.EventLogStore() != nil {
-		sessionLeases = elp.EventLogStore()
-	}
+	sessionLeases, leaseErr := backend.SessionLeases(context.Background(), storageBackend)
 	if config.ExecutionLog.Enabled {
-		if sessionLeases == nil {
-			logger.Fatal("execution_log.enabled is set, but the storage backend does not provide an execution log")
+		if leaseErr != nil {
+			logger.Fatal("execution_log.enabled is set, but the execution log is not available", zap.Error(leaseErr))
 		}
 		executionLog = sessionLeases.(eventlog.EventLogStore)
 		logger.Info("Execution log enabled: agents record write-ahead events for crash resume")
+	} else if leaseErr != nil {
+		logger.Warn("Session lease unavailable; turns run unlocked. Run the storage migrations to hold one turn at a time per session", zap.Error(leaseErr))
 	}
 
 	// Extract graph memory store if available (optional interface)

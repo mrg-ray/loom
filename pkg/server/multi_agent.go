@@ -1897,8 +1897,9 @@ func (s *MultiAgentServer) spawnWorkflowSubAgents(ctx context.Context, coordinat
 				if injectNotDelivered(err) {
 					// The prompt never reached the session. Acknowledging would
 					// lose the sub-agent's reply for good; put it back so the
-					// queue monitor offers it again. The queue's retry limit
-					// bounds how often that happens.
+					// queue monitor offers it again: deferred without counting
+					// when the session was busy, requeued under the queue's
+					// retry limit otherwise.
 					s.logger.Warn("Coordinator session unavailable; leaving sub-agent response for redelivery",
 						zap.String("coordinator", coordinatorID),
 						zap.String("from_agent", queueMsg.FromAgent),

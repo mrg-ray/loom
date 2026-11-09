@@ -66,14 +66,6 @@ type ExecutionEvent struct {
 	CreatedAt time.Time
 }
 
-// EventLogStore is the optional-capability interface for the durable,
-// tool-call-granularity execution log. A StorageBackend implements it once
-// its execution_events migration has run; callers type-assert
-// backend.StorageBackend.(backend.EventLogProvider) to reach it, like
-// TaskStoreProvider and GraphMemoryProvider.
-//
-// Every method acts as the caller identity in ctx (types.UserIDFromContext):
-// a caller reads and writes only its own sessions' events and leases.
 // SessionLeaseStore holds one session's lease: the lock that lets one process
 // at a time drive a session's conversation loop. It is the event log's lock,
 // and it holds whether or not the agent records events: two turns writing one
@@ -101,6 +93,14 @@ type SessionLeaseStore interface {
 	SessionLeaseHolder(ctx context.Context, sessionID string) (string, error)
 }
 
+// EventLogStore is the optional-capability interface for the durable,
+// tool-call-granularity execution log. A StorageBackend implements it once
+// its execution_events migration has run; callers type-assert
+// backend.StorageBackend.(backend.EventLogProvider) to reach it, like
+// TaskStoreProvider and GraphMemoryProvider.
+//
+// Every method acts as the caller identity in ctx (types.UserIDFromContext):
+// a caller reads and writes only its own sessions' events and leases.
 type EventLogStore interface {
 	// RecordIntent durably writes an *_intent event before the corresponding
 	// LLM or tool call executes. The caller must treat a failure as a

@@ -307,14 +307,20 @@ func (a *Agent) finishResumedTurn(ctx context.Context, agentCtx *agentContext, s
 	// runConversationLoop never appends its own final assistant message, so
 	// every caller must (as Chat and ResumeChat do). Without it the batch
 	// never reaches a terminal state and a second resume would re-run the loop.
-	_, replyPersisted := a.appendMessage(ctx, sess, Message{
-		Role:       "assistant",
-		Content:    response.Content,
-		AgentID:    a.id,
-		Timestamp:  time.Now(),
-		TokenCount: response.Usage.TotalTokens,
-		CostUSD:    response.Usage.CostUSD,
-	}, false)
+	// A turn a tool ended is the exception on every path: it has no final
+	// call, its words were stored with the call that ended it, and that step
+	// was pruned when its rows proved durable.
+	replyPersisted := false
+	if _, ended := response.Metadata["ended_by"]; !ended {
+		_, replyPersisted = a.appendMessage(ctx, sess, Message{
+			Role:       "assistant",
+			Content:    response.Content,
+			AgentID:    a.id,
+			Timestamp:  time.Now(),
+			TokenCount: response.Usage.TotalTokens,
+			CostUSD:    response.Usage.CostUSD,
+		}, false)
+	}
 	a.pruneFinishedTurn(ctx, sess.ID, replyPersisted)
 
 	if perr := a.memory.PersistSession(ctx, sess); perr != nil {

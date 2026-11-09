@@ -52,7 +52,7 @@ type Memory struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	// turnsSeen is, per session held in sessions, how many turns it had when
-	// this object's copy was last current (turn_lock.go).
+	// this object's copy was last current (session_turns.go).
 	turnsSeen            map[string]int64
 	store                SessionStorage             // Optional persistent storage (SQLite, PostgreSQL, etc.)
 	sharedMemory         *storage.SharedMemoryStore // Optional shared memory for large data

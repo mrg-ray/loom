@@ -2102,10 +2102,11 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	// Get or create session with agent metadata for proper ReferenceStore namespacing
 	session := a.memory.GetOrCreateSessionWithAgent(ctx, sessionID, a.config.Name, "")
 
-	// With an event log, one process at a time drives a session's loop
-	// (session_lease.go): a concurrent turn or crash resume would otherwise
-	// record events and dispatch calls at the same steps. Taken after the
-	// session exists, because the lease row references it.
+	// With a session lease store, one holder at a time drives a session's
+	// loop (session_lease.go): a concurrent turn, rewind or crash resume
+	// would otherwise write the same history, and record events and dispatch
+	// calls at the same steps. Taken after the session exists, because the
+	// lease row references it.
 	ctx, releaseLease, err := a.holdSessionLease(ctx, sessionID)
 	if err != nil {
 		return nil, err
@@ -5657,9 +5658,10 @@ var ErrRewindUnsupported = errors.New("session storage does not support rewind")
 // to remove. Doing both means the reload sees the truncated history, which is
 // why the memory eviction is not an optimisation here but the point.
 //
-// Rewinding is only meaningful between turns. A caller must not run this while
-// a turn is in flight: that turn holds the session and would write its result
-// back on top of the rewind.
+// A rewind holds the session lease like a turn: while a turn runs in the
+// session it is refused with ErrSessionBusy, so it never cuts under a turn
+// that would write its result back on top of the rewind. It counts as a
+// turn, so every other agent object holding the session reloads it.
 func (a *Agent) RewindSession(ctx context.Context, sessionID string, turns int) (int, error) {
 	if turns <= 0 {
 		return 0, fmt.Errorf("turns must be positive, got %d", turns)
