@@ -91,7 +91,7 @@ func leaseLostError(ctx context.Context, err error) error {
 // It returns a context that is cancelled with cause ErrSessionLeaseLost if the
 // lease is lost, and a release function the caller must defer. The lease is
 // renewed every TTL/3 while held. Without a lease store it returns ctx
-// unchanged and a no-op release.
+// unchanged and a release that only counts the turn.
 //
 // The holder names this process, pid@host, so a lease left by a process that
 // died on this host is released and taken at once rather than after its TTL;
@@ -101,7 +101,11 @@ func leaseLostError(ctx context.Context, err error) error {
 func (a *Agent) holdSessionLease(ctx context.Context, sessionID string) (context.Context, func(), error) {
 	leases := a.leaseStore()
 	if leases == nil {
-		return ctx, func() {}, nil
+		// No lock to hold; the turn is still counted, so this object's copy
+		// of the session is dropped when another object or process has taken
+		// a turn in it since.
+		turns := a.beginTurnCount(ctx, sessionID)
+		return ctx, func() { a.endTurnCount(context.WithoutCancel(ctx), sessionID, turns) }, nil
 	}
 	ttl := a.sessionLeaseTTL()
 	holder := thisProcess + "/" + uuid.NewString()
