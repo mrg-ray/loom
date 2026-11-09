@@ -931,10 +931,23 @@ func (a *Agent) resetSessionSkills(sessionID string) {
 		return
 	}
 	for _, as := range a.skillOrchestrator.GetActiveSkills(sessionID) {
-		if as != nil && as.Skill != nil {
+		if as != nil && as.Skill != nil && historyBackedActivation(as.TriggerType) {
 			a.deactivateSkillForFold(sessionID, as.Skill.Name)
 		}
 	}
+}
+
+// historyBackedActivation is whether a skill activation has a manage_skills
+// load row in the session's history behind it, so a reload re-fires it from
+// that row: a load the model made, a slash command, or an earlier replay. An
+// activation from elsewhere — the MCP bridge's API, a keyword or an
+// always-on rule — has no row, and a reload leaves it in place.
+func historyBackedActivation(triggerType string) bool {
+	switch triggerType {
+	case "manual_load", "slash_command", "restore_replay":
+		return true
+	}
+	return false
 }
 
 // deactivateSkillForFold is fold's skill-deactivation path (HLD §4.5): when a

@@ -194,32 +194,88 @@ func TestEveryWayOutOfATurnReleasesTheSession(t *testing.T) {
 	require.NoError(t, err, "a cancelled turn left the session leased")
 }
 
-// A lease left by a process that no longer exists on this host is released
-// and taken at once, not after its TTL; one held elsewhere is respected.
-func TestALeaseLeftByADeadProcessIsTakenOverAtOnce(t *testing.T) {
+// A lease left by a process that no longer exists on this host, and not
+// renewed within a renewal interval, is released and taken; one renewed
+// recently is respected even when its pid is absent here, since another
+// machine may report this hostname; one held elsewhere is respected. And
+// the leases this code leaves name their process, so they can be judged.
+func TestALeaseLeftByADeadProcessIsTakenOver(t *testing.T) {
 	store := turnStore(t)
 	leases := &recordingEventLog{}
-	a, _, _, _ := twoObjects(t, store, leases)
+	a, llmA, _, _ := twoObjects(t, store, leases)
 	ctx := context.Background()
 	host, _ := os.Hostname()
 
-	// A pid no process on this host has.
+	entered, release := llmA.holdNext()
+	done := make(chan error, 1)
+	go func() { _, err := a.Chat(ctx, "s0", "one"); done <- err }()
+	began(t, entered, done)
+	holder, _, err := leases.SessionLeaseHolder(ctx, "s0")
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(holder, thisProcess+"/"), "a lease this code holds does not name its process: %q", holder)
+	release()
+	require.NoError(t, <-done)
+
+	// A pid no process on this host has, whose lease was not renewed within
+	// an interval (it has less than ttl-ttl/3 left).
 	dead := fmt.Sprintf("%d@%s/left-behind", 1<<22-1, host)
-	won, err := leases.AcquireSessionLease(ctx, "s1", dead, time.Hour)
+	won, err := leases.AcquireSessionLease(ctx, "s1", dead, a.sessionLeaseTTL()/2)
 	require.NoError(t, err)
 	require.True(t, won)
 	_, err = a.Chat(ctx, "s1", "one")
-	require.NoError(t, err, "a dead process's lease blocked the session")
-	holder, err := leases.SessionLeaseHolder(ctx, "s1")
+	require.NoError(t, err, "a dead process's unrenewed lease blocked the session")
+	holder, _, err = leases.SessionLeaseHolder(ctx, "s1")
 	require.NoError(t, err)
 	require.Empty(t, holder, "the turn did not release its own lease")
 
-	elsewhere := fmt.Sprintf("%d@%s/other-host", os.Getpid(), host+".elsewhere")
-	won, err = leases.AcquireSessionLease(ctx, "s1", elsewhere, time.Hour)
+	// The same dead pid, but renewed just now: a live holder on another
+	// machine that reports this hostname looks exactly like this.
+	won, err = leases.AcquireSessionLease(ctx, "s2", dead, time.Hour)
 	require.NoError(t, err)
 	require.True(t, won)
-	_, err = a.Chat(ctx, "s1", "two")
+	_, err = a.Chat(ctx, "s2", "one")
+	require.ErrorIs(t, err, ErrSessionBusy, "a lease renewed within the interval was taken")
+
+	elsewhere := fmt.Sprintf("%d@%s/other-host", os.Getpid(), host+".elsewhere")
+	won, err = leases.AcquireSessionLease(ctx, "s3", elsewhere, time.Second)
+	require.NoError(t, err)
+	require.True(t, won)
+	_, err = a.Chat(ctx, "s3", "one")
 	require.ErrorIs(t, err, ErrSessionBusy, "a lease held on another host was taken")
+}
+
+// orderedLeases checks, as a lease is released, what the release expects to
+// have happened already.
+type orderedLeases struct {
+	recordingEventLog
+	onRelease func(sessionID string)
+}
+
+func (o *orderedLeases) ReleaseSessionLease(ctx context.Context, sessionID, holder string) error {
+	if o.onRelease != nil {
+		o.onRelease(sessionID)
+	}
+	return o.recordingEventLog.ReleaseSessionLease(ctx, sessionID, holder)
+}
+
+// The turn is counted while the lease is still held, so the count and the
+// history it stands for change under one lock.
+func TestTheTurnIsCountedBeforeTheLeaseIsReleased(t *testing.T) {
+	store := turnStore(t)
+	ctx := context.Background()
+	leases := &orderedLeases{}
+	var countedAtRelease []int64
+	leases.onRelease = func(sessionID string) {
+		n, err := store.Turns(ctx, sessionID)
+		require.NoError(t, err)
+		countedAtRelease = append(countedAtRelease, n)
+	}
+	a := NewAgent(nil, &gatedLLM{}, WithName("solo"), WithMemory(NewMemoryWithStore(store)), WithSessionLeases(leases))
+	_, err := a.Chat(ctx, "s1", "one")
+	require.NoError(t, err)
+	_, err = a.Chat(ctx, "s1", "two")
+	require.NoError(t, err)
+	require.Equal(t, []int64{1, 2}, countedAtRelease, "the lease was released before the turn was counted")
 }
 
 // An object's own copy of a session is kept across its own turns: only a

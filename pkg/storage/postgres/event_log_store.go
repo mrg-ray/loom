@@ -205,27 +205,29 @@ func (s *EventLogStore) execLease(ctx context.Context, query, sessionID, holder 
 	return changed, err
 }
 
-// SessionLeaseHolder is who holds the session's unexpired lease, or "".
-func (s *EventLogStore) SessionLeaseHolder(ctx context.Context, sessionID string) (string, error) {
+// SessionLeaseHolder is who holds the session's unexpired lease and how long
+// it has left by the database clock, or "" and 0.
+func (s *EventLogStore) SessionLeaseHolder(ctx context.Context, sessionID string) (string, time.Duration, error) {
 	ctx, span := s.tracer.StartSpan(ctx, "pg.event_log.session_lease_holder")
 	defer s.tracer.EndSpan(span)
 
 	var holder string
+	var remainingSeconds float64
 	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
 		err := tx.QueryRow(ctx,
-			`SELECT holder FROM execution_leases
+			`SELECT holder, EXTRACT(EPOCH FROM (expires_at - now())) FROM execution_leases
 			 WHERE user_id = $1 AND session_id = $2 AND expires_at >= now()`,
-			UserIDFromContext(ctx), sessionID).Scan(&holder)
+			UserIDFromContext(ctx), sessionID).Scan(&holder, &remainingSeconds)
 		if errors.Is(err, pgx.ErrNoRows) {
-			holder = ""
+			holder, remainingSeconds = "", 0
 			return nil
 		}
 		return err
 	})
 	if err != nil {
-		return "", recordSpanError(span, fmt.Errorf("read session lease holder: %w", err))
+		return "", 0, recordSpanError(span, fmt.Errorf("read session lease holder: %w", err))
 	}
-	return holder, nil
+	return holder, time.Duration(remainingSeconds * float64(time.Second)), nil
 }
 
 func (s *EventLogStore) ReleaseSessionLease(ctx context.Context, sessionID, holder string) error {

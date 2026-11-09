@@ -1022,6 +1022,18 @@ func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkD
 	unlock := a.lockSession(sessionID)
 	defer unlock()
 
+	// A session with no row has nothing parked, and must get no row from
+	// this: the lease row would reference a session that does not exist.
+	if store := a.memory.GetStore(); store != nil {
+		exists, err := store.SessionExists(ctx, sessionID)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, ErrUnknownRequest
+		}
+	}
+
 	// Across processes and agents, the session lease is what keeps a live
 	// turn, a rewind or a crash resume from running alongside this one.
 	ctx, releaseLease, err := a.holdSessionLease(ctx, sessionID)

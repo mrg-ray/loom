@@ -108,3 +108,25 @@ func TestARewindTakesTheSkillFromEveryObject(t *testing.T) {
 	assert.NotContains(t, activeNames(orchA, "s"), "tooled-skill",
 		"the object that loaded the skill kept it after another undid the turn")
 }
+
+// A skill activated outside the session's history — through the MCP bridge's
+// API — has no load row for a reload to re-fire, so a reload leaves it in
+// place; only history-backed activations are rebuilt from history.
+func TestAnAPIActivatedSkillSurvivesAReload(t *testing.T) {
+	store, dir, ctx := skillStore(t), writeSkillFixtures(t), context.Background()
+	a, orchA := skillAgent(t, store, dir, finalTurn(), finalTurn())
+	b, _ := skillAgent(t, store, dir, finalTurn())
+	_, err := a.Chat(ctx, "s", "hello")
+	require.NoError(t, err)
+	skill, err := orchA.GetLibrary().Load("tooled-skill")
+	require.NoError(t, err)
+	orchA.ActivateSkill("s", skill, "api", "tooled-skill", 1.0)
+	require.Contains(t, activeNames(orchA, "s"), "tooled-skill")
+
+	// Another object takes a turn, so a's copy is stale and reloads.
+	_, err = b.Chat(ctx, "s", "from b")
+	require.NoError(t, err)
+	_, err = a.Chat(ctx, "s", "next")
+	require.NoError(t, err)
+	assert.Contains(t, activeNames(orchA, "s"), "tooled-skill", "a reload dropped a skill the API activated")
+}

@@ -104,8 +104,8 @@ func leaseLostError(ctx context.Context, err error) error {
 // unchanged and a release that only counts the turn.
 //
 // The holder names this process, pid@host, so a lease left by a process that
-// died on this host is released and taken at once rather than after its TTL;
-// a holder elsewhere is waited out. Taking the lease reads the session's turn
+// died on this host is released and taken within one renewal interval rather
+// than after its TTL; a holder elsewhere is waited out. Taking the lease reads the session's turn
 // count (TurnCounter) and releasing it counts the turn: an agent object whose
 // copy of the session is from fewer turns than the session has had drops it
 // and loads fresh.
@@ -130,15 +130,25 @@ func (a *Agent) holdSessionLease(ctx context.Context, sessionID string) (context
 	}
 	if !won {
 		// A lease held by a process that died on this host would block the
-		// session until its TTL ran out; release it and take the lease now.
-		current, err := leases.SessionLeaseHolder(ctx, sessionID)
+		// session until its TTL ran out. The holder names its process; when
+		// that process is gone from this host AND the lease has not been
+		// renewed within one renewal interval (a live holder renews every
+		// ttl/3, so its lease always has more than ttl-ttl/3 left), it is
+		// dead: release it and take the lease now. The second condition
+		// guards another machine that reports this hostname, where a live
+		// holder's pid may well be absent here. A lease that expired between
+		// the acquire and the read has no holder: taken on a second acquire.
+		current, remaining, err := leases.SessionLeaseHolder(ctx, sessionID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("reading the session lease: %w", err)
 		}
-		if current != "" && deadHere(current) {
+		if current != "" && deadHere(current) && remaining < ttl-ttl/3 {
 			if err := leases.ReleaseSessionLease(ctx, sessionID, current); err != nil {
 				return nil, nil, fmt.Errorf("releasing a dead process's session lease: %w", err)
 			}
+			current = ""
+		}
+		if current == "" {
 			acquireBegan = time.Now()
 			if won, err = leases.AcquireSessionLease(ctx, sessionID, holder, ttl); err != nil {
 				return nil, nil, fmt.Errorf("taking the session lease: %w", err)

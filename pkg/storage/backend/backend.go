@@ -125,7 +125,7 @@ func SessionLeases(ctx context.Context, sb StorageBackend) (eventlog.SessionLeas
 		return nil, fmt.Errorf("the storage backend has no execution log")
 	}
 	store := elp.EventLogStore()
-	if _, err := store.SessionLeaseHolder(ctx, ""); err != nil {
+	if _, _, err := store.SessionLeaseHolder(ctx, ""); err != nil {
 		return nil, fmt.Errorf("the execution log's lease table is not available: %w", err)
 	}
 	return store, nil

@@ -55,6 +55,12 @@ func (a *Agent) beginTurnCount(ctx context.Context, sessionID string) int64 {
 			zap.String("session_id", sessionID), zap.Error(err))
 		return 0
 	}
+	if turns == 0 {
+		// No turn has run in the session, so no copy of it can be behind:
+		// a session this object just created is current as it stands.
+		a.memory.sawTurns(sessionID, 0)
+		return 0
+	}
 	if a.memory.staleCopy(sessionID, turns) {
 		a.memory.DeleteSession(sessionID)
 	}

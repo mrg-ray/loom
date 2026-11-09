@@ -195,8 +195,9 @@ minutes), on every backend whose database has the execution log's tables. A
 second request on the same session while the lease is held fails with
 `session is being driven by another process` instead of running alongside it.
 The holder names its process: a lease left by a server that crashed on the
-same host is released and taken at once; one left on another host blocks the
-session until the lease expires. A database the migrations have not reached
+same host is released and taken once it has gone one renewal interval without
+renewal (40 seconds by default); one left on another host blocks the session
+until the lease expires. A database the migrations have not reached
 runs turns unlocked, and `looms serve` says so at startup.
 
 ## Behavior Changes When Enabled
@@ -288,7 +289,8 @@ continue with a new message.
 
 Another turn, resume or rewind holds the session's lease. Wait for it to
 finish, then retry. If its server crashed on the same host the lease is
-released on the next request; on another host it expires after 2 minutes.
+released on the first request after a renewal interval (40 seconds) has
+passed without renewal; on another host it expires after 2 minutes.
 Over gRPC this is `ABORTED`.
 
 ### `session lease lost`

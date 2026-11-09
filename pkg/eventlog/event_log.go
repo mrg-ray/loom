@@ -86,11 +86,12 @@ type SessionLeaseStore interface {
 	// else, or no lease, is a no-op.
 	ReleaseSessionLease(ctx context.Context, sessionID, holder string) error
 
-	// SessionLeaseHolder is who holds sessionID's lease now, or "" when nobody
-	// does or the lease has expired. A holder on this host that no longer
-	// runs is released by the caller and the lease taken at once, instead of
-	// waiting out its TTL.
-	SessionLeaseHolder(ctx context.Context, sessionID string) (string, error)
+	// SessionLeaseHolder is who holds sessionID's lease now and how long it
+	// has left by the database clock, or "" when nobody does or the lease has
+	// expired. A holder that names a process on this host which no longer
+	// runs, and has not renewed within a renewal interval, is released by the
+	// caller and the lease taken, instead of waiting out its TTL.
+	SessionLeaseHolder(ctx context.Context, sessionID string) (holder string, remaining time.Duration, err error)
 }
 
 // EventLogStore is the optional-capability interface for the durable,

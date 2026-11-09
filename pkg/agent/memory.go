@@ -797,6 +797,7 @@ func (m *Memory) ClearAll() {
 	defer m.mu.Unlock()
 
 	m.sessions = make(map[string]*Session)
+	m.turnsSeen = nil
 	m.turnPayloads = nil
 }
 

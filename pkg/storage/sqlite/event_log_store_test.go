@@ -238,22 +238,25 @@ func TestEventLogStore_SessionLeaseHolder(t *testing.T) {
 	ctx := context.Background()
 	sessionID := seedEventLogSessionSQLite(t, db)
 
-	holder, err := store.SessionLeaseHolder(ctx, sessionID)
+	holder, remaining, err := store.SessionLeaseHolder(ctx, sessionID)
 	require.NoError(t, err)
 	require.Empty(t, holder, "a session nobody holds has a holder")
+	require.Zero(t, remaining)
 
 	won, err := store.AcquireSessionLease(ctx, sessionID, "h1", time.Minute)
 	require.NoError(t, err)
 	require.True(t, won)
-	holder, err = store.SessionLeaseHolder(ctx, sessionID)
+	holder, remaining, err = store.SessionLeaseHolder(ctx, sessionID)
 	require.NoError(t, err)
 	require.Equal(t, "h1", holder)
+	require.Greater(t, remaining, 50*time.Second, "a lease taken for a minute reports less than most of it left")
+	require.LessOrEqual(t, remaining, time.Minute)
 
 	require.NoError(t, store.ReleaseSessionLease(ctx, sessionID, "h1"))
 	won, err = store.AcquireSessionLease(ctx, sessionID, "h2", -time.Second)
 	require.NoError(t, err)
 	require.True(t, won)
-	holder, err = store.SessionLeaseHolder(ctx, sessionID)
+	holder, remaining, err = store.SessionLeaseHolder(ctx, sessionID)
 	require.NoError(t, err)
 	require.Empty(t, holder, "an expired lease still names its holder")
 }
