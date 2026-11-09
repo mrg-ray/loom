@@ -1022,15 +1022,17 @@ func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkD
 	unlock := a.lockSession(sessionID)
 	defer unlock()
 
-	// A session with no row has nothing parked, and must get no row from
-	// this: the lease row would reference a session that does not exist.
+	// A session with no row has nothing parked in it, and must get no row
+	// from this: the lease row would reference a session that does not
+	// exist. The refusal is read-only, as every refusal here is: it proves
+	// nothing about the parked request's own row, which is left as it is.
 	if store := a.memory.GetStore(); store != nil {
 		exists, err := store.SessionExists(ctx, sessionID)
 		if err != nil {
 			return nil, err
 		}
 		if !exists {
-			return nil, ErrUnknownRequest
+			return nil, ErrNothingParked
 		}
 	}
 

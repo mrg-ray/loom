@@ -127,14 +127,14 @@ func TestTheLeaseHoldsOnTheRealStores(t *testing.T) {
 	require.EqualValues(t, 3, turns)
 }
 
-// A resume for a session that has no row is refused as an unknown request,
-// not failed by the lease row's reference to a session that does not exist.
+// A resume for a session that has no row is refused as nothing parked, not
+// failed by the lease row's reference to a session that does not exist.
 func TestAResumeOfAnUnknownSessionIsRefusedNotFailed(t *testing.T) {
 	store, sb := realStores(t)
 	a := agent.NewAgent(nil, &holdingLLM{}, agent.WithName("manager"), agent.WithMemory(agent.NewMemoryWithStore(store)),
 		agent.WithSessionLeases(sb.EventLogStore()), agent.WithHITLPark(shuttle.NewInMemoryHumanRequestStore(), 0, nil))
 	_, err := a.ResumeChat(context.Background(), "never-existed", agent.ParkDecision{RequestID: "bogus", Approved: true}, nil)
-	require.ErrorIs(t, err, agent.ErrUnknownRequest, "a resume of an unknown session failed on the lease instead of being refused")
+	require.ErrorIs(t, err, agent.ErrNothingParked, "a resume of an unknown session failed on the lease instead of being refused")
 	ok, err := store.SessionExists(context.Background(), "never-existed")
 	require.NoError(t, err)
 	require.False(t, ok)

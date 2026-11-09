@@ -277,4 +277,5 @@ func TestEventLogStore_SessionLeaseHolder(t *testing.T) {
 	holder, remaining, err = f.store.SessionLeaseHolder(ctx, sessionID)
 	require.NoError(t, err)
 	require.Empty(t, holder, "an expired lease still names its holder")
+	require.Zero(t, remaining, "an expired lease still has time left")
 }
