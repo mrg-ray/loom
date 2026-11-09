@@ -118,12 +118,19 @@ func TestShellGuardAllowsTheTurnsDirectory(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("pwd")
 	}
-	data, err := filepath.EvalSymlinks(t.TempDir())
+	// Under the package directory, not the OS temp dir: the guard allows the
+	// temp dir on its own, which would let the refusal half prove nothing.
+	base, err := os.MkdirTemp(".", "workdir-guard-*")
 	require.NoError(t, err)
-	turn, err := filepath.EvalSymlinks(t.TempDir())
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	base, err = filepath.Abs(base)
 	require.NoError(t, err)
-	other, err := filepath.EvalSymlinks(t.TempDir())
+	base, err = filepath.EvalSymlinks(base)
 	require.NoError(t, err)
+	data, turn, other := filepath.Join(base, "data"), filepath.Join(base, "turn"), filepath.Join(base, "other")
+	for _, d := range []string{data, turn, other} {
+		require.NoError(t, os.MkdirAll(d, 0o750))
+	}
 	t.Setenv("LOOM_SANDBOX_DIR", data)
 
 	shell := NewShellExecuteTool(data)

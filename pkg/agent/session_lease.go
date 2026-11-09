@@ -72,15 +72,24 @@ func (a *Agent) sessionLeaseTTL() time.Duration {
 // it. That is intended: the agent's own readers of those errors run before
 // this wrap, and the server maps the ResumeSession and ResolveExecutionGap
 // RPCs' errors through resumeSessionResponse and resumeStatus, which check for
-// a lease error first. A caller that does need the structured error from a
-// lease-lost turn should change this deliberately, keeping context.Canceled
+// a lease error first. The one structured error kept is TurnFailed, so what
+// the turn spent before the lease was lost is still reported; its chain is
+// the same flat one. A caller that does need another structured error from
+// a lease-lost turn should change this deliberately, keeping context.Canceled
 // out of the chain, not wrap err with a second %w.
 func leaseLostError(ctx context.Context, err error) error {
 	if err == nil || errors.Is(err, ErrSessionLeaseLost) {
 		return err
 	}
 	if cause := sessionLeaseLost(ctx); cause != nil {
-		return fmt.Errorf("%w: %s", cause, err.Error())
+		flat := fmt.Errorf("%w: %s", cause, err.Error())
+		// What the turn spent before the lease was lost is kept: the same
+		// flat chain under the cause, inside the TurnFailed that carried it.
+		var failed *TurnFailed
+		if errors.As(err, &failed) {
+			return &TurnFailed{Err: flat, Spent: failed.Spent}
+		}
+		return flat
 	}
 	return err
 }

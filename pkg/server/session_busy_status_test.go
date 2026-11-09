@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"go.uber.org/zap/zaptest"
@@ -91,5 +92,36 @@ func TestABusySessionNeverUsesUpAMessagesRetries(t *testing.T) {
 	}
 	if m.DequeueCount != 1 {
 		t.Fatalf("after a restart the message counts %d deliveries, want 1 (busy refusals are not counted)", m.DequeueCount)
+	}
+}
+
+// A busy refusal reaches the queue the way chatInjected reports it, wrapped
+// under "not delivered": it is still deferred, not charged a delivery.
+func TestABusyRefusalThroughInjectionIsDeferred(t *testing.T) {
+	q, err := communication.NewMessageQueue(":memory:", nil, zaptest.NewLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = q.Close() }()
+	ctx := context.Background()
+	if err := q.Enqueue(ctx, &communication.QueueMessage{ToAgent: "coord", FromAgent: "sub", MessageType: "result",
+		Payload: &loomv1.MessagePayload{Data: &loomv1.MessagePayload_Value{Value: []byte("done")}}, MaxRetries: 3}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := q.Dequeue(ctx, "coord")
+	if err != nil || first == nil {
+		t.Fatalf("dequeue: %v %v", first, err)
+	}
+	asInjected := fmt.Errorf("%w: %w", errInjectNotDelivered, fmt.Errorf("session coord: %w", agent.ErrSessionBusy))
+	if !injectNotDelivered(asInjected) {
+		t.Fatal("the test's error is not what chatInjected reports")
+	}
+	returnUndelivered(ctx, q, zaptest.NewLogger(t), first.ID, asInjected)
+	again, err := q.Dequeue(ctx, "coord")
+	if err != nil || again == nil {
+		t.Fatalf("the message was lost: %v %v", again, err)
+	}
+	if again.DequeueCount != 1 {
+		t.Fatalf("a busy refusal was charged as a delivery: count %d, want 1", again.DequeueCount)
 	}
 }

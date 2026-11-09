@@ -1886,7 +1886,9 @@ func (s *MultiAgentServer) spawnWorkflowSubAgents(ctx context.Context, coordinat
 				// This triggers the coordinator to process the sub-agent's response and generate a synthesis.
 				// chatInjected holds an LLM slot only while Chat runs, and waits
 				// out a session another turn is driving (the user's own turn on
-				// the coordinator, or a lease left by a crashed process).
+				// the coordinator, or a lease left by a crashed process) for the
+				// inject policy's total; a session still busy after that has
+				// the message deferred below, not charged a delivery.
 				s.logger.Info("Coordinator calling Chat() for sub-agent response",
 					zap.String("coordinator", coordinatorID))
 				err = s.chatInjected(coordinatorCtx, turnIdentityCtx, coordinatorAgent, sessionID, injectedPrompt, 0) // #nosec -- intentional: background worker goroutine that must outlive request context; carries tenant identity only

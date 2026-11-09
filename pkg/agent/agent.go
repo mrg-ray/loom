@@ -3708,9 +3708,9 @@ func addHygieneMeta(meta map[string]interface{}, o *hygiene.EnforcementOutcome) 
 }
 
 // EndsTurnKey is the result metadata a tool sets to end the turn it ran in.
-// The turn's reply is then the words the model said alongside the call, and
-// nothing is generated after it: for a tool that hands something off, where
-// anything said afterwards would be said to nobody.
+// The turn's reply is then the words the model said alongside the call, which
+// may be none, and nothing is generated after it: for a tool that hands
+// something off, where anything said afterwards would be said to nobody.
 const EndsTurnKey = "end_turn"
 
 // dispatchOneCall runs one call of a tool batch through the full per-call

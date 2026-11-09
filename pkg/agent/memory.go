@@ -601,9 +601,9 @@ func (m *Memory) loadSummary(ctx context.Context, store SessionStorage, sessionI
 	}
 }
 
-// newestFold is a session's newest summary version: rows are {"n","text"}
-// JSON under snapshot_type='fold', and the newest is max(n). n is 0 when the
-// session never folded.
+// newestFold is a session's newest summary version: rows are FoldRecord JSON
+// (fold_record.go) under snapshot_type='fold', and the newest is max(n). n is
+// 0 when the session never folded.
 func newestFold(ctx context.Context, store SessionStorage, sessionID string) (int, string, error) {
 	snapshots, err := store.LoadMemorySnapshots(ctx, sessionID, "fold", 0)
 	if err != nil {

@@ -17,6 +17,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -90,5 +92,32 @@ func TestTurnFailedOnlyWhenSomethingWasSpent(t *testing.T) {
 	var tf *TurnFailed
 	if errors.As(err, &tf) {
 		t.Fatalf("a turn that spent nothing was wrapped: %+v", tf.Spent)
+	}
+}
+
+// A turn that lost its lease after a call had cost something still reports
+// what it spent: the lease-lost cause leads the chain, context.Canceled is
+// kept out of it, and the TurnFailed around the spend survives the wrap.
+func TestALostLeaseKeepsWhatTheTurnSpent(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(ErrSessionLeaseLost)
+	spent := Usage{CostUSD: 0.5, TotalTokens: 900}
+	err := leaseLostError(ctx, fmt.Errorf("conversation loop: %w", &TurnFailed{Err: errors.New("provider: connection reset"), Spent: spent}))
+
+	var failed *TurnFailed
+	if !errors.As(err, &failed) {
+		t.Fatalf("the spend was dropped with the lease: %v", err)
+	}
+	if failed.Spent != spent {
+		t.Fatalf("spent %+v, want %+v", failed.Spent, spent)
+	}
+	if !errors.Is(err, ErrSessionLeaseLost) {
+		t.Fatalf("the lease-lost cause does not lead the chain: %v", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("context.Canceled outranks the cause: %v", err)
+	}
+	if !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("the provider's error text was lost: %v", err)
 	}
 }
