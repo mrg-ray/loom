@@ -33,6 +33,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/llm/anthropic"
 	"github.com/teradata-labs/loom/pkg/llm/azureopenai"
 	"github.com/teradata-labs/loom/pkg/llm/bedrock"
+	"github.com/teradata-labs/loom/pkg/llm/bedrockmantle"
 	"github.com/teradata-labs/loom/pkg/llm/gemini"
 	"github.com/teradata-labs/loom/pkg/llm/huggingface"
 	"github.com/teradata-labs/loom/pkg/llm/mistral"
@@ -1060,6 +1061,11 @@ func (rt *workflowRuntime) startOrchestrator(pattern *loomv1.WorkflowPattern, pr
 		logger.Warn("Storage backend unavailable; turns run unlocked and decision shadow rows will not be persisted", zap.Error(sbErr))
 	} else {
 		rt.closers = append(rt.closers, func() { _ = storageBackend.Close() })
+		// Migrate as `looms serve` does: a schema behind this binary makes
+		// every shadow insert fail, and the recorder only counts that.
+		if mErr := storageBackend.Migrate(context.Background()); mErr != nil {
+			logger.Warn("Storage migration failed; decision shadow rows may not be persisted", zap.Error(mErr))
+		}
 		var leaseErr error
 		if sessionLeases, leaseErr = backend.SessionLeases(context.Background(), storageBackend); leaseErr != nil {
 			logger.Warn("Session lease unavailable; turns run unlocked. Run the storage migrations to hold one turn at a time per session", zap.Error(leaseErr))
@@ -1432,6 +1438,12 @@ func createLLMProvider() (agent.LLMProvider, string) {
 				return client, "AWS Bedrock (config)"
 			}
 
+		case bedrockmantle.ProviderName:
+			client, err := bedrockmantle.NewClientForModel(mantleConfigFrom(config.LLM))
+			if err == nil {
+				return client, "AWS Bedrock Mantle (config)"
+			}
+
 		case "ollama":
 			client := ollama.NewClient(ollama.Config{
 				Endpoint:    config.LLM.OllamaEndpoint,
@@ -1545,6 +1557,7 @@ Option 3: AWS Bedrock (env var)
 Supported providers:
   - anthropic    (Anthropic Claude API)
   - bedrock      (AWS Bedrock)
+  - bedrock-mantle (AWS Bedrock Mantle endpoint)
   - ollama       (Local Ollama)
   - openai       (OpenAI GPT models)
   - azure-openai (Azure OpenAI Service)

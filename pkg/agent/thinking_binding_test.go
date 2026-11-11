@@ -232,3 +232,25 @@ func TestThinkingBinding_ADroppedBlockNoLongerCountsTowardTheWindow(t *testing.T
 
 	assert.Less(t, estimate(), before)
 }
+
+// flakyLLM fails its first failures calls with err, then answers.
+type flakyLLM struct {
+	calls    int
+	failures int
+	err      error
+}
+
+func (f *flakyLLM) Chat(_ context.Context, _ []Message, _ []shuttle.Tool) (*LLMResponse, error) {
+	f.calls++
+	if f.calls <= f.failures {
+		return nil, f.err
+	}
+	return &LLMResponse{Content: "ok"}, nil
+}
+func (f *flakyLLM) Name() string  { return "flaky" }
+func (f *flakyLLM) Model() string { return "flaky-model" }
+
+// retryTestContext is a call with no session behind it.
+func retryTestContext() *agentContext {
+	return &agentContext{Context: context.Background(), tracer: observability.NewNoOpTracer()}
+}

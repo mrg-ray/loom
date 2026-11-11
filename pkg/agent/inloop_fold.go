@@ -341,9 +341,9 @@ func (sm *SegmentedMemory) InFlightResults() int {
 // under ceiling the send certainly fits and that count is returned. Over it,
 // the memory is counted with the tokenizer and extraBytes at tokenFigure, so
 // a step is replaced only when it really does not fit. Both tiers are scaled
-// by the provider calibration, or by unsampledStepCalibration until the
-// provider's first count has been observed.
-func (sm *SegmentedMemory) StepSendCount(extraBytes, ceiling int) int {
+// by the provider calibration, or by unsampled (unsampledStepCalibration for
+// the provider and model) until the provider's first count has been observed.
+func (sm *SegmentedMemory) StepSendCount(extraBytes, ceiling int, unsampled float64) int {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	lastAssistant := -1
@@ -359,8 +359,8 @@ func (sm *SegmentedMemory) StepSendCount(extraBytes, ceiling int) int {
 		}
 	}
 	f := sm.calibrationLocked()
-	if sm.estimateCalibration == 0 {
-		f = unsampledStepCalibration
+	if sm.estimateCalibration == 0 && unsampled > f {
+		f = unsampled
 	}
 	cheap := sm.estimateLocked() + int(float64(bytes)/cheapBytesPerToken*f)
 	if ceiling <= 0 || cheap <= ceiling {
@@ -376,14 +376,6 @@ func (sm *SegmentedMemory) ReservedOutputTokens() int {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	return sm.tokenBudget.ReservedTokens
-}
-
-// ContextWindowTokens is the window this memory was set with, max_context_tokens
-// as the agent's builder resolved it.
-func (sm *SegmentedMemory) ContextWindowTokens() int {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	return sm.tokenBudget.MaxTokens
 }
 
 // ReplaceInFlightResults replaces the results of the step in flight — every

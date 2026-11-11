@@ -348,20 +348,40 @@ func (c *Client) callAPI(ctx context.Context, req *openai.ChatCompletionRequest)
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
+	// Positive identification of the provider's context-too-long refusal —
+	// the relief trigger.
+	if llm.IsOpenAIContextTooLong(httpResp.StatusCode, respBody) {
+		return nil, llm.AsContextTooLong(llm.WrapHTTPStatus(httpResp.StatusCode,
+			fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))))
+	}
+
 	// Parse response
 	var resp openai.ChatCompletionResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
+		if httpResp.StatusCode != http.StatusOK {
+			return nil, llm.WrapHTTPStatus(httpResp.StatusCode,
+				fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody)))
+		}
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
 	// Check for API errors
 	if resp.Error != nil {
-		return nil, fmt.Errorf("azure OpenAI API error: %s (type: %s)", resp.Error.Message, resp.Error.Type)
+		statusCode := httpResp.StatusCode
+		if statusCode == http.StatusOK {
+			statusCode = llm.HTTPStatusForErrorType(resp.Error.Type)
+			if statusCode == 0 {
+				statusCode = http.StatusBadRequest
+			}
+		}
+		return nil, llm.WrapHTTPStatus(statusCode,
+			fmt.Errorf("azure OpenAI API error: %s (type: %s)", resp.Error.Message, resp.Error.Type))
 	}
 
 	// Check status code
 	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
+		return nil, llm.WrapHTTPStatus(httpResp.StatusCode,
+			fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody)))
 	}
 
 	return &resp, nil
@@ -769,7 +789,11 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	// Check status code before streaming
 	if httpResp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(httpResp.Body)
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
+		err := fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
+		if llm.IsOpenAIContextTooLong(httpResp.StatusCode, respBody) {
+			return nil, llm.AsContextTooLong(err)
+		}
+		return nil, err
 	}
 
 	// Process SSE stream (same logic as OpenAI)

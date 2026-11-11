@@ -196,7 +196,12 @@ func (c *Client) callAPI(ctx context.Context, req *GenerateContentRequest) (*Gen
 
 	// Check status code
 	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
+		err := llm.WrapHTTPStatus(httpResp.StatusCode,
+			fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody)))
+		if llm.IsGeminiContextTooLong(httpResp.StatusCode, string(respBody)) {
+			return nil, llm.AsContextTooLong(err)
+		}
+		return nil, err
 	}
 
 	// Parse response
@@ -207,7 +212,12 @@ func (c *Client) callAPI(ctx context.Context, req *GenerateContentRequest) (*Gen
 
 	// Check for API errors
 	if resp.Error != nil {
-		return nil, fmt.Errorf("gemini API error: %s (code: %d)", resp.Error.Message, resp.Error.Code)
+		err := llm.WrapHTTPStatus(geminiErrorHTTPStatus(resp.Error.Code),
+			fmt.Errorf("gemini API error: %s (code: %d)", resp.Error.Message, resp.Error.Code))
+		if llm.IsGeminiContextTooLong(geminiErrorHTTPStatus(resp.Error.Code), resp.Error.Message) {
+			return nil, llm.AsContextTooLong(err)
+		}
+		return nil, err
 	}
 
 	return &resp, nil
@@ -712,7 +722,12 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	// Check status code before streaming
 	if httpResp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(httpResp.Body)
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
+		err := llm.WrapHTTPStatus(httpResp.StatusCode,
+			fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody)))
+		if llm.IsGeminiContextTooLong(httpResp.StatusCode, string(respBody)) {
+			return nil, llm.AsContextTooLong(err)
+		}
+		return nil, err
 	}
 
 	// 3. Process Server-Sent Events stream
@@ -749,7 +764,12 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 
 		// Check for API errors
 		if chunk.Error != nil {
-			return nil, fmt.Errorf("gemini API error: %s (code: %d)", chunk.Error.Message, chunk.Error.Code)
+			err := llm.WrapHTTPStatus(geminiErrorHTTPStatus(chunk.Error.Code),
+				fmt.Errorf("gemini API error: %s (code: %d)", chunk.Error.Message, chunk.Error.Code))
+			if llm.IsGeminiContextTooLong(geminiErrorHTTPStatus(chunk.Error.Code), chunk.Error.Message) {
+				return nil, llm.AsContextTooLong(err)
+			}
+			return nil, err
 		}
 
 		if len(chunk.Candidates) > 0 {
@@ -875,3 +895,10 @@ var _ llmtypes.LLMProvider = (*Client)(nil)
 
 // Ensure Client implements StreamingLLMProvider interface.
 var _ llmtypes.StreamingLLMProvider = (*Client)(nil)
+
+func geminiErrorHTTPStatus(code int) int {
+	if code >= 100 && code < 600 {
+		return code
+	}
+	return 0
+}

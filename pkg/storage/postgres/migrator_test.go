@@ -25,16 +25,20 @@ func TestLoadMigrations(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, migrations, "should have embedded migrations")
 
-	// The set has to be contiguous from 1, which is the invariant that matters: a
-	// gap means a migration was embedded under the wrong number or lost, and the
-	// migrator would apply the rest anyway.
-	//
-	// Asserted as a shape rather than a count. A hand-maintained number goes stale
-	// the first time somebody adds a migration without editing this line, and then
-	// says nothing about the set at all.
-	for i, m := range migrations {
-		assert.Equal(t, i+1, m.Version, "migration %d is numbered %d — the set has a gap", i+1, m.Version)
-	}
+	// Verify we have all 30 migrations.
+	// Bumped from 11 by 000012_skill_index and 000013_task_idempotency
+	// (skills overhaul Phases 4 and 8), then 000014_analytics_views,
+	// 000015_rls_infrastructure_tables, 000016_rls_honor_jwt_sub,
+	// 000017_graph_rls_honor_jwt, 000018_tool_outcomes_policy_denied,
+	// 000019_context_compilation, 000020_tool_exec_admission_decision,
+	// 000021_human_request_kind_summary, 000022_human_request_params,
+	// 000023_tool_outcomes_admission_decision, 000024_task_attribution,
+	// 000025_workflow_checkpoints, 000026_execution_events,
+	// 000027_decision_shadow (typed decision layer, pkg/decision),
+	// 000028_decision_shadow_error and 000029_decision_shadow_subject, then
+	// 000030_message_billing, then 000031_session_turns and
+	// 000032_messages_session_turn.
+	assert.Len(t, migrations, 32, "should have 32 migration versions")
 
 	// Verify ordering
 	for i := 1; i < len(migrations); i++ {
@@ -78,9 +82,11 @@ func TestLoadMigrations_SpecificVersions(t *testing.T) {
 		{25, "workflow_checkpoints", "CREATE TABLE IF NOT EXISTS workflow_checkpoints"},
 		{26, "execution_events", "CREATE TABLE execution_events"},
 		{27, "decision_shadow", "CREATE TABLE IF NOT EXISTS decision_shadow"},
-		{28, "message_billing", "cache_create_1h_tokens"},
-		{29, "session_turns", "turns"},
-		{30, "messages_session_turn", "idx_messages_session_turn"},
+		{28, "decision_shadow_error", "ADD COLUMN IF NOT EXISTS error"},
+		{29, "decision_shadow_subject", "ADD COLUMN IF NOT EXISTS subject"},
+		{30, "message_billing", "cache_create_1h_tokens"},
+		{31, "session_turns", "turns"},
+		{32, "messages_session_turn", "idx_messages_session_turn"},
 	}
 
 	for _, tt := range tests {
